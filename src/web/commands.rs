@@ -1183,7 +1183,23 @@ pub async fn pull_ambercore_model(
         download_to_file(&client, &model_url, &dest, "model", &emit).await?;
     }
 
-    // 2. Tokenizer — AmberCore looks for `<stem>.tokenizer.json` (or a
+    // 2. Architecture check — read the GGUF header and reject architectures
+    //    AmberCore can't run, BEFORE spending time on the tokenizer or
+    //    registering an unloadable model. (Learned the hard way: a Qwen3.5
+    //    hybrid `qwen35` GGUF pulls fine and then dies at load time deep inside
+    //    the qwen3 builder with a missing-tensor error.)
+    let arch = ambercore::model::gguf::probe_arch(&dest)
+        .map_err(|e| format!("downloaded file is not a loadable GGUF: {e}"))?;
+    if !ambercore::model::registry::is_supported(&arch) {
+        return Err(format!(
+            "AmberCore can't run the `{arch}` architecture yet (supported: {}). \
+             The model was kept at {} — it will work here if support is added later.",
+            ambercore::model::registry::SUPPORTED_ARCHS.join(", "),
+            dest.display(),
+        ));
+    }
+
+    // 3. Tokenizer — AmberCore looks for `<stem>.tokenizer.json` (or a
     //    generic `tokenizer.json`) next to the GGUF. The model-specific name
     //    lets models with different vocabularies share one directory.
     let stem = dest
@@ -1410,6 +1426,17 @@ pub async fn get_ambercore_status(state: State<'_, WebState>) -> Result<AmberCor
         remote: c.ambercore_remote,
         url: c.ambercore_url.clone(),
     })
+}
+
+/// Hardware check-up for the Telemetry tab (Main Menu → Telemetry). The CPU /
+/// cores / RAM / OS baseline is captured once at engine boot (= app launch);
+/// the GPU reading (name + live VRAM) refreshes on every call. CPU-only
+/// builds report `backend: "cpu"` and no GPU.
+#[tauri::command]
+pub async fn get_hardware_status(
+    state: State<'_, WebState>,
+) -> Result<ambercore::server::telemetry::HardwareStatus, String> {
+    Ok(state.provider.embedded().state().hardware_status())
 }
 
 /// An Ollama model row (yellow box). Real Ollama exposes `modified_at`; AmberCore

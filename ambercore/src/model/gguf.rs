@@ -37,6 +37,24 @@ pub struct LoadedModel {
     pub meta: HashMap<String, String>,
 }
 
+/// Read only a GGUF's header and return its `general.architecture` string.
+///
+/// Cheap regardless of model size (the header + metadata table is a few MB;
+/// tensor data is never read). Used to validate a freshly downloaded model
+/// against the registry's supported set before it's registered.
+pub fn probe_arch(path: &Path) -> Result<String> {
+    let mut file = File::open(path)
+        .map_err(|e| Error::Model(format!("open {}: {e}", path.display())))?;
+    let content = Content::read(&mut file)
+        .map_err(|e| Error::Model(format!("gguf read {}: {e}", path.display())))?;
+    content
+        .metadata
+        .get("general.architecture")
+        .and_then(|v| v.to_string().ok())
+        .map(|s| s.to_string())
+        .ok_or_else(|| Error::Model("GGUF missing general.architecture".into()))
+}
+
 impl LoadedModel {
     /// Open and parse a GGUF file.
     ///

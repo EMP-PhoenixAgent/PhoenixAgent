@@ -74,6 +74,7 @@ pub fn run(config: Config, paths: Paths, workdir: std::path::PathBuf) -> Result<
             commands::connect_ambercore_remote,
             commands::use_local_ambercore,
             commands::get_ambercore_status,
+            commands::get_hardware_status,
             commands::list_ollama_models,
             commands::pull_ollama_model,
             commands::install_ollama,

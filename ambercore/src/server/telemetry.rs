@@ -63,6 +63,25 @@ pub struct Hardware {
     pub driver: Option<String>,
 }
 
+/// Hardware check-up for the UI's Telemetry tab: the boot-time CPU/RAM/OS
+/// snapshot merged with the active compute backend and a live GPU reading
+/// when a GPU backend is in use.
+#[derive(Debug, Clone, Serialize)]
+pub struct HardwareStatus {
+    /// Active compute backend name ("cpu" / "cuda").
+    pub backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_cores: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ram_total_mb: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<crate::backend::GpuInfo>,
+}
+
 /// Capture the hardware snapshot once. Cheap to clone thereafter.
 ///
 /// `backend` is the AmberCore backend name ("cpu" / "cuda"). VRAM/driver are

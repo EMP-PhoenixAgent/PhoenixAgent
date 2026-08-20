@@ -271,6 +271,8 @@ async function doUnlock() {
     currentModel = result.model;
     modelSelect.value = result.model;
 
+    // Hardware check-up at launch — preloads the Telemetry tab baseline.
+    refreshTelemetryTab();
     // Switch screens.
     unlockScreen.classList.remove("active");
     chatScreen.classList.add("active");
@@ -2120,6 +2122,32 @@ function switchConfigTab(tab) {
   $("config-tab-security").hidden = tab !== "security";
   $("config-tab-telemetry").hidden = tab !== "telemetry";
   $("config-tab-about").hidden = tab !== "about";
+  if (tab === "telemetry") refreshTelemetryTab();
+}
+
+/**
+ * Populate the Telemetry tab's environment baseline from the launch hardware
+ * check-up (CPU/cores/RAM/OS snapshot + active compute backend + live GPU
+ * reading when one is in use).
+ */
+async function refreshTelemetryTab() {
+  const $set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  try {
+    const hw = await invoke("get_hardware_status");
+    const gpu = hw.gpu;
+    $set("tele-hardware", gpu?.name || "CPU only (no GPU backend)");
+    $set("tele-vram", gpu?.vram_total_mb
+      ? `${((gpu.vram_used_mb ?? 0) / 1024).toFixed(1)} / ${(gpu.vram_total_mb / 1024).toFixed(1)} GB`
+      : "—");
+    $set("tele-cpu", hw.cpu
+      ? `${String(hw.cpu).trim()} · ${hw.cpu_cores ?? "?"} cores`
+      : "—");
+    $set("tele-ram", hw.ram_total_mb ? `${(hw.ram_total_mb / 1024).toFixed(1)} GB` : "—");
+    $set("tele-backend", hw.backend === "cuda" ? "CUDA (GPU)" : "CPU");
+    $set("tele-quant", currentModel || "—");
+  } catch (e) {
+    $set("tele-backend", "unavailable");
+  }
 }
 
 /** Refresh the 2FA card: show enabled vs disabled view. */

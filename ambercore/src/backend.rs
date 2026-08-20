@@ -29,6 +29,17 @@
 use crate::error::Result;
 use candle_core::Device;
 
+/// Live GPU status reported by a GPU backend. `None` on CPU.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GpuInfo {
+    /// Device name, e.g. `"NVIDIA GeForce RTX 3050"`.
+    pub name: String,
+    /// Total VRAM in MB.
+    pub vram_total_mb: Option<u64>,
+    /// Used VRAM in MB (live reading at call time).
+    pub vram_used_mb: Option<u64>,
+}
+
 /// A compute target. Implementations hand out the candle [`Device`] that models
 /// and tensors live on, and own any device-specific resources or limits.
 pub trait Backend: Send + Sync {
@@ -37,6 +48,13 @@ pub trait Backend: Send + Sync {
 
     /// The candle device tensors should be placed on for this backend.
     fn device(&self) -> Result<Device>;
+
+    /// Live GPU status where the backend can report one (CUDA: device name +
+    /// VRAM). `None` on CPU, or when the driver query fails — purely
+    /// informational, never load-bearing.
+    fn gpu_info(&self) -> Option<GpuInfo> {
+        None
+    }
 }
 
 /// CPU compute backend. Always available.
@@ -232,6 +250,36 @@ mod cuda {
             // candle::Device is cheaply cloneable (it's an enum wrapping an
             // Arc for the CUDA handle).
             Ok(self.device.clone())
+        }
+
+        fn gpu_info(&self) -> Option<super::GpuInfo> {
+            // Only query the driver when a CUDA device is actually up (candle
+            // has run cuInit by then). Uses candle's own cudarc re-export so
+            // the driver API is the exact instance candle links against.
+            let Device::Cuda(_) = &self.device else {
+                return None;
+            };
+            use candle_core::cuda_backend::cudarc;
+            let dev = cudarc::driver::result::device::get(self.ordinal as i32).ok()?;
+            let name = cudarc::driver::result::device::get_name(dev)
+                .unwrap_or_else(|_| "CUDA device".to_string());
+            // Device-level queries (no CUDA context needed). SAFETY: `dev` is
+            // a live CUdevice handle returned by cuDeviceGet above.
+            let vram_total_mb = unsafe {
+                cudarc::driver::result::device::total_mem(dev)
+            }
+            .ok()
+            .map(|b| b as u64 / (1024 * 1024));
+            // Used VRAM needs a *current* context; UI threads don't have one,
+            // so this is best-effort and may read as "—".
+            let vram_used_mb = cudarc::driver::result::mem_get_info()
+                .ok()
+                .map(|(free, total)| (total - free) as u64 / (1024 * 1024));
+            Some(super::GpuInfo {
+                name,
+                vram_total_mb,
+                vram_used_mb,
+            })
         }
     }
 

@@ -120,6 +120,21 @@ impl ServerState {
         self.inner.backend.name()
     }
 
+    /// Hardware check-up for the UI: the boot-time CPU/RAM/OS snapshot merged
+    /// with the active backend name and a live GPU reading (name + VRAM) when
+    /// a GPU backend is in use.
+    pub fn hardware_status(&self) -> telemetry::HardwareStatus {
+        let hw = &self.inner.hardware;
+        telemetry::HardwareStatus {
+            backend: self.inner.backend.name().to_string(),
+            cpu: hw.cpu.clone(),
+            cpu_cores: hw.cpu_cores,
+            ram_total_mb: hw.ram_total_mb,
+            os: hw.os.clone(),
+            gpu: self.inner.backend.gpu_info(),
+        }
+    }
+
     /// Record the throughput from the most recent generation (called at the end
     /// of each `/api/chat` request). Powers `GET /api/stats`.
     pub async fn record_tokens_per_sec(&self, tps: f64) {

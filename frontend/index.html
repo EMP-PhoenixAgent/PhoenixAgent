@@ -608,14 +608,15 @@
           <p class="security-note small">
             Phoenix Agent's telemetry follows the <strong>Chronos protocol</strong>: each inference run emits a
             microsecond-resolution timeline of pipeline events plus derived metrics. The runner captures the
-            data; nothing is transmitted off your machine. Live collection is pending implementation — the
-            schema below is what this tab will display once wired.
+            data; nothing is transmitted off your machine. The <strong>environment baseline below is a live
+            reading from this machine</strong>, captured at launch; the run timeline populates once Chronos
+            tests are wired.
           </p>
 
           <!-- Section 1: Environment baseline (captured before every run) -->
           <div class="config-security-card">
             <div class="config-card-title">Environment baseline</div>
-            <p class="security-note small">Reported by the runner before each test run.</p>
+            <p class="security-note small">Hardware check-up from this machine, captured at launch (VRAM is a live reading).</p>
             <div class="tele-grid">
               <div class="tele-field"><span class="tele-key">Hardware</span><span class="tele-val" id="tele-hardware">—</span></div>
               <div class="tele-field"><span class="tele-key">VRAM</span><span class="tele-val" id="tele-vram">—</span></div>

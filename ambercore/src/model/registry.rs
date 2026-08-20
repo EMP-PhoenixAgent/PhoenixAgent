@@ -43,6 +43,17 @@ pub trait DynModel: Send {
     fn clear_kv_cache(&mut self) {}
 }
 
+/// Architectures [`build`] can construct — the single source of truth shared
+/// by load-time dispatch and pull-time validation (Phoenix rejects a download
+/// whose architecture isn't in this list before registering it).
+pub const SUPPORTED_ARCHS: &[&str] = &["qwen2", "qwen2_v2", "qwen3", "llama"];
+
+/// Whether an architecture string (a GGUF's `general.architecture`) can be
+/// built by this registry.
+pub fn is_supported(arch: &str) -> bool {
+    SUPPORTED_ARCHS.contains(&arch)
+}
+
 /// Build a runnable model from a loaded GGUF, dispatching on its architecture.
 ///
 /// Consumes the parsed GGUF [`Content`](candle_core::quantized::gguf_file::Content)
@@ -50,8 +61,11 @@ pub trait DynModel: Send {
 pub fn build(loaded: &mut LoadedModel, device: &Device) -> Result<Box<dyn DynModel>> {
     match loaded.arch.as_str() {
         "qwen2" | "qwen2_v2" => crate::model::qwen2::build(loaded, device),
-        // Qwen3 + Qwen3.5 share the qwen3 architecture.
-        "qwen3" | "qwen35" => crate::model::qwen3::build(loaded, device),
+        // NOTE: `qwen35` (Qwen3.5 hybrid SSM) is NOT qwen3-compatible — its
+        // tensor layout (`ssm_*`, fused `attn_qkv`, `post_attention_norm`, no
+        // `ffn_norm`) needs kernels candle doesn't have. It must fail as
+        // "unsupported architecture", not crash inside the qwen3 builder.
+        "qwen3" => crate::model::qwen3::build(loaded, device),
         "llama" => crate::model::llama::build(loaded, device),
         other => Err(Error::Model(format!(
             "unsupported architecture: {other} (register it in src/model/registry.rs)"
@@ -81,5 +95,39 @@ mod tests {
     fn clear_kv_cache_default_is_callable_noop() {
         let mut m = StubModel;
         m.clear_kv_cache();
+    }
+
+    #[test]
+    fn supported_archs_match_build_arms() {
+        for arch in SUPPORTED_ARCHS {
+            assert!(is_supported(arch), "{arch} should be supported");
+        }
+        // Qwen3.5 hybrid — deliberately NOT supported (see build's NOTE).
+        assert!(!is_supported("qwen35"));
+        assert!(!is_supported(""));
+    }
+
+    /// `probe_arch` must read a real GGUF header. This hand-crafts the smallest
+    /// valid one: magic, version 2, 0 tensors, a single string KV
+    /// `general.architecture = "qwen3"`.
+    #[test]
+    fn probe_arch_reads_minimal_gguf_header() {
+        let mut buf = b"GGUF".to_vec();
+        buf.extend(2u32.to_le_bytes()); // version
+        buf.extend(0u64.to_le_bytes()); // tensor count
+        buf.extend(1u64.to_le_bytes()); // metadata kv count
+        put_gguf_str(&mut buf, "general.architecture");
+        buf.extend(8u32.to_le_bytes()); // value type 8 = string
+        put_gguf_str(&mut buf, "qwen3");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("probe.gguf");
+        std::fs::write(&path, &buf).expect("write");
+        assert_eq!(crate::model::gguf::probe_arch(&path).unwrap(), "qwen3");
+    }
+
+    fn put_gguf_str(buf: &mut Vec<u8>, s: &str) {
+        buf.extend((s.len() as u64).to_le_bytes());
+        buf.extend(s.as_bytes());
     }
 }

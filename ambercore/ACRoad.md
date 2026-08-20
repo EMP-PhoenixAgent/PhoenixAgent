@@ -839,3 +839,34 @@ driver (591.86 / CUDA 13.1) was updated to clear a `CUDA_ERROR_UNSUPPORTED_PTX_V
 rebuild). Quantized GGUF kernels ship in candle's `quantized/cuda.rs`, so Q4_K_M models run on GPU.
 VRAM watch: the 8B Q4_K_M (~5 GB)
 is tight on 8 GB — test the 0.5B/1.5B/3B first if the 8B OOMs.
+
+---
+
+### 2026-08-20 — `qwen35` mapping removed + pull-time architecture validation
+
+**Bug found:** the `"qwen3" | "qwen35"` registry mapping added 2026-08-12 was
+wrong. A real `qwen35` GGUF (Qwen3.5 hybrid SSM — block tensors are `ssm_*`,
+fused `attn_qkv`, `attn_gate`, `post_attention_norm`; there is no `ffn_norm`
+and no separate q/k/v) is NOT qwen3-layout compatible and crashed inside
+`qwen3::from_gguf` with `cannot find tensor info for blk.0.ffn_norm.weight`.
+It had never actually been exercised until Phoenix pulled `Qwen3.8-9B-Q4_K_M`.
+
+**Fixes:**
+1. `model/registry.rs`: removed `"qwen35"` from the qwen3 arm → clean
+   `unsupported architecture: qwen35` failure again (hybrid SSM support stays
+   deferred — candle lacks the kernels; see the earlier qwen35 note).
+2. `model/registry.rs`: new `SUPPORTED_ARCHS` const + `is_supported()` — the
+   single source of truth, kept beside `build()` so pull-time validation and
+   load-time dispatch can never drift apart.
+3. `model/gguf.rs`: new `probe_arch(path)` — reads only the GGUF header and
+   returns `general.architecture` (cheap at any model size; tensor data is
+   never touched).
+4. Phoenix's `pull_ambercore_model` probes the architecture right after the
+   GGUF download and rejects unsupported ones with a plain-language error
+   BEFORE the tokenizer fetch + registration. The file is kept on disk
+   (usable if support lands later) but never registered, so it never shows a
+   broken Run button.
+
+Tests: `supported_archs_match_build_arms` + `probe_arch_reads_minimal_gguf_header`
+(hand-crafts the smallest valid GGUF: magic + version 2 + 0 tensors + one
+string KV).
