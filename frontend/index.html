@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Phoenix Agent</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="lib/github-dark.min.css" />
+  <script src="lib/marked.min.js"></script>
+  <script src="lib/highlight.min.js"></script>
+</head>
+<body>
+
+  <!-- ============ SETUP SCREEN (first run) ============ -->
+  <div id="setup-screen" class="screen">
+    <form class="glass unlock-card" id="setup-form" autocomplete="on">
+      <!-- Hidden username hint so Proton Pass / Bitwarden / 1Password group the credential. -->
+      <input class="sr-only" type="text" name="username" autocomplete="username" aria-label="username" value="phoenix-agent" tabindex="-1" />
+      <div class="logo">🔥</div>
+      <h1>Welcome to Phoenix Agent</h1>
+      <p class="subtitle">Choose a <b>launch password</b> to protect your data. The database key is wrapped under it, so your memory is unreadable until you type it. A separate internal password (<code>PhoenixAgent</code>) encrypts the database — the app manages it automatically.</p>
+      <input type="password" id="setup-passphrase" name="password" placeholder="Launch password (min 8 chars)" autocomplete="new-password" />
+      <input type="password" id="setup-confirm" name="password" placeholder="Confirm launch password" autocomplete="new-password" />
+      <div id="setup-error" class="error-text"></div>
+      <button type="button" id="setup-btn" class="btn-primary">Create & Launch</button>
+    </form>
+  </div>
+
+  <!-- ============ UNLOCK SCREEN (returning user) ============ -->
+  <div id="unlock-screen" class="screen">
+    <form class="glass unlock-card" id="unlock-form" autocomplete="on">
+      <!-- Hidden username hint so Proton Pass / Bitwarden / 1Password group the credential. -->
+      <input class="sr-only" type="text" name="username" autocomplete="username" aria-label="username" value="phoenix-agent" tabindex="-1" />
+      <div class="logo">🔥</div>
+      <h1>Phoenix Agent</h1>
+      <p class="subtitle">Enter your launch password to unlock your encrypted memory</p>
+      <input type="password" id="passphrase-input" name="password" placeholder="Launch password" autocomplete="current-password" />
+      <div id="unlock-error" class="error-text"></div>
+      <button type="button" id="unlock-btn" class="btn-primary">Unlock</button>
+      <button type="button" id="recover-btn" class="btn-link" hidden>Forgot launch password? Recover with 2FA</button>
+    </form>
+  </div>
+
+  <!-- ============ CHAT SCREEN ============ -->
+  <div id="chat-screen" class="screen">
+    <div id="app-root">
+      <!-- App body: sidebar + main column side by side -->
+      <div id="app-body">
+        <!-- ---------- Sidebar ---------- -->
+        <aside id="sidebar" class="glass">
+          <!-- Sidebar header: app name -->
+          <div class="sidebar-header">
+            <span class="sidebar-brand">🔥 Phoenix Agent</span>
+          </div>
+
+          <div class="sidebar-section sidebar-nav">
+            <div class="nav-item active" data-panel="models" title="Models">
+              <span class="status-dot" id="dot-models"></span>
+              <span class="nav-label">Models</span>
+            </div>
+            <div class="nav-item active" data-panel="skills" title="Skills">
+              <span class="status-dot" id="dot-skills"></span>
+              <span class="nav-label">Skills</span>
+            </div>
+            <div class="nav-item active" data-panel="tools" title="Tools">
+              <span class="status-dot" id="dot-tools"></span>
+              <span class="nav-label">Tools</span>
+            </div>
+            <div class="nav-item active" data-panel="context" title="Context">
+              <span class="status-dot" id="dot-context"></span>
+              <span class="nav-label">Context</span>
+            </div>
+            <div class="nav-item active" data-panel="memory" title="Memory — MCP connections">
+              <span class="status-dot" id="dot-memory"></span>
+              <span class="nav-label">Memory</span>
+            </div>
+            <div class="nav-item active" data-panel="subagents" title="Sub-Agents — specialist delegates">
+              <span class="status-dot" id="dot-subagents"></span>
+              <span class="nav-label">Sub-Agents</span>
+            </div>
+          </div>
+
+          <!-- Working directory selector -->
+          <div class="sidebar-section sidebar-workdir">
+            <div class="sidebar-label">📁 Workdir</div>
+            <div id="workdir-row">
+              <span id="workdir-display" class="workdir-display" title="">—</span>
+              <button id="workdir-change-btn" class="btn-icon" title="Change working directory">✎</button>
+            </div>
+          </div>
+
+          <!-- Profile selector -->
+          <div class="sidebar-section sidebar-profile">
+            <div class="sidebar-label">Profile</div>
+            <div id="profile-row">
+              <select id="profile-select" title="Active profile"></select>
+              <button id="profile-new-btn" class="btn-icon" title="New profile">＋</button>
+            </div>
+          </div>
+        </aside>
+
+        <!-- Resize handle between sidebar and main column -->
+        <div id="sidebar-resizer" title="Drag to resize"></div>
+
+        <!-- ---------- Main column ---------- -->
+        <div id="main-column">
+          <!-- Title bar (app name moved to sidebar; menu now on the health-bar lock icon) -->
+          <div id="title-bar" class="glass">
+            <span class="title-text">&nbsp;</span>
+          </div>
+
+          <!-- Chat messages -->
+          <div id="chat-messages"></div>
+
+          <!-- Live phase indicator (shown while the agent is working) -->
+          <div id="agent-phase" class="agent-phase" hidden></div>
+
+          <!-- Reasoning mode selector (Plan/Think/Auto) — sits above the send button -->
+          <div id="mode-bar">
+            <button class="mode-btn" data-mode="plan" title="Read-only: investigate + plan, no edits">🧭 Plan</button>
+            <button class="mode-btn" data-mode="think" title="Discuss the task with the agent, no execution">💬 Think</button>
+            <button class="mode-btn" data-mode="auto" title="Autonomous: full access, act directly">⚡ Auto</button>
+          </div>
+
+          <!-- Input area: textarea (left) + controls column (right) -->
+          <div id="input-row" class="glass">
+            <textarea id="message-input" placeholder="Type a message... (Enter to send, Shift+Enter for newline)" rows="3"></textarea>
+            <div id="input-controls">
+              <button id="send-btn" class="btn-primary">Send ▶</button>
+              <div id="model-picker" class="model-picker">
+                <button id="model-picker-btn" class="model-picker-btn" title="Switch model">Model ▾</button>
+                <div id="model-popup" class="model-popup" hidden></div>
+              </div>
+              <!-- Hidden native select kept for any code that reads .value; the
+                   custom picker is the real UI now. -->
+              <select id="model-select" title="Model" hidden></select>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Health bar (full width, very bottom — spans sidebar + main) -->
+      <div id="health-bar" class="glass">
+        <span class="health-item" id="health-ollama">
+          <span class="health-dot unknown"></span> Ollama
+        </span>
+        <span class="health-item" id="health-model">
+          <span class="health-dot unknown"></span> Model
+        </span>
+        <span class="health-item" id="health-database">
+          <span class="health-dot unknown"></span> DB
+        </span>
+        <span class="health-item" id="health-ripgrep">
+          <span class="health-dot unknown"></span> ripgrep
+        </span>
+        <span class="health-item" id="health-shell">
+          <span class="health-dot unknown"></span> shell
+        </span>
+        <span class="health-summary" id="health-summary">0/5</span>
+        <button id="config-menu-btn" class="btn-icon lock-menu-btn" title="Security & settings (password manager)">🔒</button>
+      </div>
+    </div>
+
+    <!-- Models panel overlay (over the chat area) -->
+    <div id="models-panel" class="panel-overlay" hidden>
+      <div class="panel glass panel-wide">
+        <div class="panel-header">
+          <span class="panel-title">Models</span>
+          <button id="models-close-btn" class="btn-icon" title="Close">✕</button>
+        </div>
+
+        <div id="models-tab-main" class="panel-body">
+          <p class="models-intro">
+            Phoenix Agent is capable of running models more efficiently by itself using
+            AmberCore, but you can also run it with Ollama or any other cloud models by
+            entering your API key's.
+          </p>
+
+          <!-- Top row: AmberCore + Ollama, centered in the available height -->
+          <div class="models-grid">
+            <!-- Blue side: AmberCore -->
+            <section class="provider-box" id="ambercore-box" data-kind="ambercore">
+              <h3 class="provider-box-title">AmberCore</h3>
+              <p class="provider-box-note">
+                If you are running Phoenix Agent on your personal computer, please select if
+                needed, a directory path for your models.
+              </p>
+              <div class="mp-dir-row">
+                <input type="text" id="ic-dir" placeholder="Path to your models directory (optional)…" autocomplete="off" />
+                <button id="ic-dir-clear" class="btn-secondary" title="Use AmberCore's native folder">Default</button>
+              </div>
+              <p class="provider-box-note">
+                If no custom path for models is added, AmberCore will use its native folder.
+                You can pull models by entering the URL of the model here:
+              </p>
+              <div class="mp-pull-row">
+                <input type="text" id="ic-url" placeholder="https://…/model.gguf" autocomplete="off" />
+                <button id="ic-pull-btn" class="btn-secondary">Pull</button>
+              </div>
+              <input type="text" id="ic-tokenizer-url" class="mp-tokenizer-input" placeholder="Tokenizer URL (optional — auto-detected for Hugging Face links)" autocomplete="off" />
+              <div id="ic-progress" class="mp-progress" hidden><div class="mp-progress-bar"></div><span class="mp-progress-text"></span></div>
+              <ul class="mp-list" id="ic-list">
+                <li class="panel-loading">Loading AmberCore models…</li>
+              </ul>
+              <hr class="mp-divider" />
+              <p class="provider-box-note">
+                Or link a <b>remote AmberCore server</b> (e.g. an AmberCore-Server
+                you installed on a private machine) instead of running one locally:
+              </p>
+              <div class="mp-pull-row">
+                <input type="text" id="ic-remote-url" placeholder="http://your-server:42069" autocomplete="off" />
+                <button id="ic-remote-btn" class="btn-secondary">Connect</button>
+              </div>
+              <button id="ic-local-btn" class="btn-secondary mp-remote-back" hidden>← Use local AmberCore</button>
+            </section>
+
+            <!-- Yellow side: Ollama -->
+            <section class="provider-box" id="ollama-box" data-kind="ollama">
+              <h3 class="provider-box-title">Ollama</h3>
+              <p class="provider-box-note">
+                If you already used Ollama to run models locally you can select the model you
+                want Ollama to run. If you don't have Ollama you can auto install it by clicking
+                on "Install Ollama".
+              </p>
+              <button id="ol-install-btn" class="btn-secondary mp-install">Install Ollama</button>
+              <div class="mp-pull-row">
+                <input type="text" id="ol-pull" placeholder="e.g. qwen2.5-coder:7b" autocomplete="off" />
+                <button id="ol-pull-btn" class="btn-secondary">Pull model</button>
+              </div>
+              <div id="ol-progress" class="mp-progress" hidden><span class="mp-progress-text"></span></div>
+              <ul class="mp-list" id="ol-list">
+                <li class="panel-loading">Loading Ollama models…</li>
+              </ul>
+            </section>
+          </div>
+
+          <!-- Red side: Provider API, pinned to the bottom of the panel -->
+          <section class="provider-box provider-box-wide" id="provider-box" data-kind="provider">
+            <h3 class="provider-box-title">Provider API</h3>
+            <div class="mp-register-row">
+              <input type="text" id="pr-name" placeholder="Provider name (e.g. OpenAI)" autocomplete="off" />
+              <input type="password" id="pr-key" placeholder="API key" autocomplete="off" />
+              <input type="text" id="pr-url" placeholder="https://api.openai.com" autocomplete="off" />
+              <button id="pr-register-btn" class="btn-secondary">Register</button>
+            </div>
+            <ul class="mp-list" id="pr-list">
+              <li class="panel-loading">Loading providers…</li>
+            </ul>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <!-- Skills panel overlay (over the chat area) -->
+    <div id="skills-panel" class="panel-overlay" hidden>
+      <div class="panel glass panel-wide">
+        <div class="panel-header panel-header-stacked">
+          <span class="panel-title">Skills</span>
+          <p class="provider-box-note panel-intro">The Skills of Phoenix Agent are more or less a detailed memory for your agent to work with, you can modify them or create new, activate them or not for your context.</p>
+          <div class="panel-header-row">
+            <button id="skill-new-btn" class="btn-secondary">＋ New skill</button>
+            <div class="panel-tabs">
+              <button class="tab-btn active" data-skills-tab="mine">My Skills</button>
+              <button class="tab-btn" data-skills-tab="search">Search</button>
+            </div>
+            <button id="skills-close-btn" class="btn-icon" title="Close">✕</button>
+          </div>
+        </div>
+
+        <!-- Tab: My Skills -->
+        <div id="skills-tab-mine" class="panel-body skills-tab">
+          <div id="skills-list" class="skills-list">
+            <div class="panel-loading">Loading skills…</div>
+          </div>
+        </div>
+
+        <!-- Tab: Search (GitHub) -->
+        <div id="skills-tab-search" class="panel-body skills-tab" hidden>
+          <div class="skill-search-row">
+            <input type="text" id="skill-search-input" placeholder="Search GitHub for skills (e.g. rust code review)…" />
+            <button id="skill-search-btn" class="btn-secondary">Search</button>
+          </div>
+          <div class="skill-search-note">Unauthenticated GitHub search (~10/min). Click a result to install it as a skill.</div>
+          <div id="skill-search-results" class="skills-list"></div>
+        </div>
+
+      </div>
+
+      <!-- New/Edit skill form — a centered modal over the Skills panel -->
+      <div id="skill-form-overlay" class="panel-overlay tool-form-overlay" hidden>
+        <div id="skill-form" class="panel glass form-modal">
+          <div class="panel-header">
+            <span class="panel-title" id="skill-form-title">New skill</span>
+            <button id="skill-form-cancel" class="btn-icon" title="Close">✕</button>
+          </div>
+          <div class="panel-body">
+            <input type="text" id="skill-form-name" placeholder="Name" autocomplete="off" />
+            <input type="text" id="skill-form-desc" placeholder="Short description" autocomplete="off" />
+            <textarea id="skill-form-body" placeholder="Markdown body (injected into the prompt)…" rows="10"></textarea>
+            <div class="skill-form-actions">
+              <button id="skill-form-save" class="btn-primary">Save</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tools panel overlay (over the chat area) -->
+    <div id="tools-panel" class="panel-overlay" hidden>
+      <div class="panel glass panel-wide">
+        <div class="panel-header panel-header-stacked">
+          <span class="panel-title">Tools</span>
+          <p class="provider-box-note panel-intro">Phoenix Agent tools are scripts it can interact with. Once again you can modify them or even add some from github !</p>
+          <div class="panel-header-row">
+            <button id="tool-new-btn" class="btn-secondary">＋ New tool</button>
+            <div class="panel-tabs">
+              <button class="tab-btn active" data-tools-tab="mine">My Tools</button>
+              <button class="tab-btn" data-tools-tab="search">Search</button>
+            </div>
+            <button id="tools-close-btn" class="btn-icon" title="Close">✕</button>
+          </div>
+        </div>
+
+        <!-- Tab: My Tools -->
+        <div id="tools-tab-mine" class="panel-body tools-tab">
+          <div id="tools-list" class="skills-list">
+            <div class="panel-loading">Loading tools…</div>
+          </div>
+        </div>
+
+        <!-- Tab: Search (GitHub) -->
+        <div id="tools-tab-search" class="panel-body tools-tab" hidden>
+          <div class="skill-search-row">
+            <input type="text" id="tool-search-input" placeholder="Search GitHub for scripts (python/node/sh)…" />
+            <button id="tool-search-btn" class="btn-secondary">Search</button>
+          </div>
+          <div class="skill-search-note">Unauthenticated GitHub search (~10/min). Click a result to load its body into a new tool (you fill in the metadata).</div>
+          <div id="tool-search-results" class="skills-list"></div>
+        </div>
+
+      </div>
+
+      <!-- New/Edit tool form — a centered modal over the Tools panel -->
+      <div id="tool-form-overlay" class="panel-overlay tool-form-overlay" hidden>
+        <div id="tool-form" class="panel glass form-modal">
+          <div class="panel-header">
+            <span class="panel-title" id="tool-form-title">New tool</span>
+            <button id="tool-form-cancel" class="btn-icon" title="Close">✕</button>
+          </div>
+          <div class="panel-body">
+            <input type="text" id="tool-form-name" placeholder="Tool name (e.g. word_count)" autocomplete="off" />
+            <input type="text" id="tool-form-desc" placeholder="Description (what it does — shown to the model)" autocomplete="off" />
+            <div class="tool-form-row">
+              <label class="tool-field-label">Interpreter
+                <select id="tool-form-interpreter">
+                  <option value="python">python</option>
+                  <option value="node">node</option>
+                  <option value="sh" selected>sh</option>
+                  <option value="powershell">powershell</option>
+                </select>
+              </label>
+              <label class="tool-field-label">Kind
+                <select id="tool-form-kind">
+                  <option value="write" selected>write (approval)</option>
+                  <option value="read">read (no approval)</option>
+                </select>
+              </label>
+            </div>
+            <label class="tool-field-label">Parameters schema (JSON)
+              <textarea id="tool-form-schema" placeholder='{"type":"object","properties":{},"required":[]}' rows="4"></textarea>
+            </label>
+            <label class="tool-field-label">Script body (args arrive as JSON on stdin)
+              <textarea id="tool-form-body" placeholder="#!/bin/sh&#10;cat  # echo the JSON args back" rows="8"></textarea>
+            </label>
+            <div class="skill-form-actions">
+              <button id="tool-form-save" class="btn-primary">Save</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Context panel overlay (over the chat area) -->
+    <div id="context-panel" class="panel-overlay" hidden>
+      <div class="panel glass panel-wide">
+        <div class="panel-header panel-header-stacked">
+          <span class="panel-title">Context</span>
+          <p class="provider-box-note panel-intro">Phoenix Agent Context is separated from the Memory for a good reason, the agent WILL modify those contexts, so please don't use it to store long therm data, instead feel free to use it like an orchestrator for your project !</p>
+          <div class="panel-header-row">
+            <button id="context-new-btn" class="btn-secondary">＋ New context</button>
+            <button id="context-close-btn" class="btn-icon" title="Close">✕</button>
+          </div>
+        </div>
+        <div id="context-list-wrap" class="panel-body skills-tab">
+          <div id="context-list" class="skills-list">
+            <div class="panel-loading">Loading context…</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- New/Edit context form — a centered modal over the Context panel -->
+      <div id="context-form-overlay" class="panel-overlay tool-form-overlay" hidden>
+        <div id="context-form" class="panel glass form-modal">
+          <div class="panel-header">
+            <span class="panel-title" id="context-form-title">New context</span>
+            <button id="context-form-cancel" class="btn-icon" title="Close">✕</button>
+          </div>
+          <div class="panel-body">
+            <input type="text" id="context-form-name" placeholder="Name (e.g. database)" autocomplete="off" />
+            <input type="text" id="context-form-desc" placeholder="Short description" autocomplete="off" />
+            <textarea id="context-form-body" placeholder="Markdown body — facts about the project the model must respect…" rows="10"></textarea>
+            <div class="skill-form-actions">
+              <button id="context-form-save" class="btn-primary">Save</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Memory panel overlay (MCP connections) -->
+    <div id="memory-panel" class="panel-overlay" hidden>
+      <div class="panel glass panel-wide">
+        <div class="panel-header panel-header-stacked">
+          <span class="panel-title">Memory — MCP Connections</span>
+          <p class="provider-box-note panel-intro">This is the core memory of Phoenix Agent, use it's MCP server to stock long therm data for your project, you can also link an Obsidian Vault and deactivate the connections when not needed.</p>
+          <div class="panel-header-row">
+            <button id="memory-new-btn" class="btn-secondary">＋ New connection</button>
+            <button id="memory-close-btn" class="btn-icon" title="Close">✕</button>
+          </div>
+        </div>
+        <div id="memory-list-wrap" class="panel-body skills-tab">
+          <div id="memory-list" class="skills-list">
+            <div class="panel-loading">Loading connections…</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- New/Edit connection form — a centered modal over the Memory panel -->
+      <div id="memory-form-overlay" class="panel-overlay tool-form-overlay" hidden>
+        <div id="memory-form" class="panel glass form-modal">
+          <div class="panel-header">
+            <span class="panel-title" id="memory-form-title">New connection</span>
+            <button id="memory-form-cancel" class="btn-icon" title="Close">✕</button>
+          </div>
+          <div class="panel-body">
+            <input type="text" id="memory-form-name" placeholder="Name (e.g. filesystem-server)" autocomplete="off" />
+            <input type="text" id="memory-form-desc" placeholder="Short description" autocomplete="off" />
+            <label class="tool-field-label">Transport
+              <select id="memory-form-transport">
+                <option value="stdio">stdio (spawn a local process)</option>
+                <option value="http">http (POST JSON-RPC to a URL)</option>
+              </select>
+            </label>
+            <input type="text" id="memory-form-command" placeholder="stdio: executable path · http: base URL" autocomplete="off" />
+            <label class="tool-field-label">Arguments (JSON)
+              <textarea id="memory-form-args" placeholder='stdio: JSON array of args, e.g. ["--port", "8080"]' rows="3"></textarea>
+            </label>
+            <div class="skill-form-actions">
+              <button id="memory-form-test" class="btn-secondary" title="Connect + list tools without saving">Test</button>
+              <button id="memory-form-save" class="btn-primary">Save</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Sub-Agents panel overlay (Panel 6) -->
+    <div id="subagents-panel" class="panel-overlay" hidden>
+      <div class="panel glass panel-wide">
+        <div class="panel-header panel-header-stacked">
+          <span class="panel-title">Sub-Agents</span>
+          <p class="provider-box-note panel-intro">Define specialist sub-agents the main agent can delegate sub-tasks to. Each runs on its own model (via AmberCore) with its own persona. (Delegation wiring arrives in Stage 2.)</p>
+          <div class="panel-header-row">
+            <button id="subagent-new-btn" class="btn-secondary">＋ New sub-agent</button>
+            <button id="subagents-close-btn" class="btn-icon" title="Close">✕</button>
+          </div>
+        </div>
+        <div class="panel-body skills-tab">
+          <div id="subagents-list" class="skills-list">
+            <div class="panel-loading">Loading sub-agents…</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- New/Edit sub-agent form — centered modal over the panel -->
+      <div id="subagent-form-overlay" class="panel-overlay tool-form-overlay" hidden>
+        <div id="subagent-form" class="panel glass form-modal">
+          <div class="panel-header">
+            <span class="panel-title" id="subagent-form-title">New sub-agent</span>
+            <button id="subagent-form-cancel" class="btn-icon" title="Close">✕</button>
+          </div>
+          <div class="panel-body">
+            <input type="text" id="subagent-form-name" placeholder="Name (e.g. Mathematician)" autocomplete="off" />
+            <input type="text" id="subagent-form-desc" placeholder="Short specialty (shown to the main agent)" autocomplete="off" />
+            <input type="text" id="subagent-form-model" placeholder="Model tag (e.g. qwen3:8b) — blank = active model" autocomplete="off" />
+            <textarea id="subagent-form-persona" placeholder="Persona / system prompt for the sub-agent…" rows="10"></textarea>
+            <div class="skill-form-actions">
+              <button id="subagent-form-save" class="btn-primary">Save</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Seven: alpha-test invitation pop-up (shown once after login, until dismissed) -->
+    <div id="alpha-popup" class="panel-overlay" hidden>
+      <div class="panel glass form-modal alpha-card">
+        <div class="panel-header">
+          <span class="panel-title">🔥 Welcome to the Phoenix Agent Alpha</span>
+          <button id="alpha-close-btn" class="btn-icon" title="Close">✕</button>
+        </div>
+        <div class="panel-body">
+          <p class="security-note">Thanks for joining the alpha! To measure how Phoenix Agent and AmberCore perform across different hardware, you can run a one-time <b>Chronos test</b>. It benchmarks the local models and — once the collection site is live — contributes anonymous results to help tune the agent for everyone.</p>
+          <p class="security-note small">You can also run it any time from <b>Main Menu → Telemetry → Chronos Tests</b>. Nothing is sent without your action.</p>
+          <div class="skill-form-actions">
+            <button id="alpha-run-btn" class="btn-primary">Run Chronos test</button>
+            <button id="alpha-later-btn" class="btn-secondary">Remind me later</button>
+            <button id="alpha-never-btn" class="btn-link">Don't show again</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main menu / configuration window -->
+    <div id="config-modal" class="panel-overlay" hidden>
+      <div class="panel glass panel-wide">
+        <div class="panel-header panel-header-stacked">
+          <span class="panel-title">Main Menu</span>
+          <div class="panel-header-row">
+            <div class="panel-tabs">
+              <button class="tab-btn active" data-config-tab="security">Security</button>
+              <button class="tab-btn" data-config-tab="telemetry">Telemetry</button>
+              <button class="tab-btn" data-config-tab="about">About</button>
+            </div>
+            <button id="config-close-btn" class="btn-icon" title="Close">✕</button>
+          </div>
+        </div>
+
+        <!-- Tab: Security (two passwords + 2FA) -->
+        <div id="config-tab-security" class="panel-body security-tab">
+
+          <!-- Card 1: Launch password -->
+          <div class="config-security-card">
+            <div class="config-card-title">Launch password</div>
+            <p class="security-note small">Protects your data at startup — the database key is wrapped under it, so nothing is readable until you type it. Recoverable via 2FA if forgotten.</p>
+            <form id="launch-pass-form" autocomplete="on" class="security-form">
+              <input class="sr-only" type="text" name="username" autocomplete="username" aria-label="username" value="phoenix-agent" tabindex="-1" />
+              <input type="password" id="lp-old" name="password" placeholder="Current launch password" autocomplete="current-password" />
+              <input type="password" id="lp-new" name="new-password" placeholder="New launch password (min 8 chars)" autocomplete="new-password" />
+              <input type="password" id="lp-confirm" name="new-password" placeholder="Confirm new launch password" autocomplete="new-password" />
+              <div id="lp-status" class="error-text"></div>
+              <button type="submit" id="lp-submit" class="btn-primary">Change launch password</button>
+            </form>
+          </div>
+
+          <!-- Card 2: Database access password -->
+          <div class="config-security-card">
+            <div class="config-card-title">Database access password</div>
+            <p class="security-note small">The encryption key for your memory. Default is <code>PhoenixAgent</code>. Set once; the agent uses it autonomously thereafter. Changing it re-encrypts the entire database. Requires your launch password to re-wrap the key.</p>
+            <form id="change-passphrase-form" autocomplete="on" class="security-form">
+              <input class="sr-only" type="text" name="username" autocomplete="username" aria-label="username" value="phoenix-agent" tabindex="-1" />
+              <input type="password" id="cp-old" name="password" placeholder="Current database password" autocomplete="current-password" />
+              <input type="password" id="cp-new" name="new-password" placeholder="New database password (min 8 chars)" autocomplete="new-password" />
+              <input type="password" id="cp-confirm" name="new-password" placeholder="Confirm new database password" autocomplete="new-password" />
+              <input type="password" id="cp-launch" name="password" placeholder="Your launch password (to re-wrap the key)" autocomplete="current-password" />
+              <div id="cp-status" class="error-text"></div>
+              <button type="submit" id="cp-submit" class="btn-primary">Change database password</button>
+            </form>
+          </div>
+
+          <!-- Card 3: Two-factor authentication -->
+          <div class="config-security-card">
+            <div class="config-card-title">Two-factor authentication</div>
+            <div id="totp-status-area">
+              <div id="totp-enabled-view" hidden>
+                <p class="security-note">✅ Two-factor authentication is <b>enabled</b>.</p>
+                <p class="security-note small">If you forget your launch password, a current 6-digit code lets you back in.</p>
+                <button id="totp-disable-btn" class="btn-secondary">Disable 2FA</button>
+              </div>
+              <div id="totp-disabled-view">
+                <p class="security-note">Two-factor authentication is <b>not</b> enabled.</p>
+                <p class="security-note small">Adds a time-based 6-digit code (RFC 6238) as a recovery factor for a forgotten launch password. Compatible with Google Authenticator, Proton Pass, 2FAS, Aegis.</p>
+                <div class="totp-account-row">
+                  <input type="text" id="totp-account" placeholder="Label (e.g. your email)" autocomplete="off" />
+                  <button id="totp-enable-btn" class="btn-primary">Enable 2FA</button>
+                </div>
+              </div>
+            </div>
+            <div id="totp-setup-view" class="totp-setup" hidden>
+              <p class="security-note">Scan this with your authenticator app, or enter the secret manually:</p>
+              <div id="totp-qr"></div>
+              <div class="totp-secret-row">
+                <span class="totp-secret-label">Secret:</span>
+                <code id="totp-secret-display"></code>
+              </div>
+              <input type="text" id="totp-confirm-code" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="Enter the 6-digit code from your app" autocomplete="one-time-code" />
+              <div id="totp-setup-status" class="error-text"></div>
+              <div class="totp-setup-actions">
+                <button id="totp-confirm-btn" class="btn-primary">Confirm & enable</button>
+                <button id="totp-cancel-btn" class="btn-secondary">Cancel</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab: Telemetry (Chronos protocol display) -->
+        <div id="config-tab-telemetry" class="panel-body security-tab" hidden>
+          <p class="security-note small">
+            Phoenix Agent's telemetry follows the <strong>Chronos protocol</strong>: each inference run emits a
+            microsecond-resolution timeline of pipeline events plus derived metrics. The runner captures the
+            data; nothing is transmitted off your machine. Live collection is pending implementation — the
+            schema below is what this tab will display once wired.
+          </p>
+
+          <!-- Section 1: Environment baseline (captured before every run) -->
+          <div class="config-security-card">
+            <div class="config-card-title">Environment baseline</div>
+            <p class="security-note small">Reported by the runner before each test run.</p>
+            <div class="tele-grid">
+              <div class="tele-field"><span class="tele-key">Hardware</span><span class="tele-val" id="tele-hardware">—</span></div>
+              <div class="tele-field"><span class="tele-key">VRAM</span><span class="tele-val" id="tele-vram">—</span></div>
+              <div class="tele-field"><span class="tele-key">CPU cores</span><span class="tele-val" id="tele-cpu">—</span></div>
+              <div class="tele-field"><span class="tele-key">RAM</span><span class="tele-val" id="tele-ram">—</span></div>
+              <div class="tele-field"><span class="tele-key">Compute backend</span><span class="tele-val" id="tele-backend">—</span></div>
+              <div class="tele-field"><span class="tele-key">Quantization</span><span class="tele-val" id="tele-quant">—</span></div>
+            </div>
+          </div>
+
+          <!-- Section 2: Last run timeline (the core telemetry data) -->
+          <div class="config-security-card">
+            <div class="config-card-title">Last run timeline</div>
+            <p class="security-note small">
+              A sequence of microsecond-timestamped events across the inference pipeline. Each run records:
+            </p>
+            <table class="tele-table">
+              <thead><tr><th>Event</th><th>Stage</th><th>Last</th></tr></thead>
+              <tbody>
+                <tr><td><code>REQ_REC</code></td><td>Request received</td><td id="tele-req-rec">—</td></tr>
+                <tr><td><code>PREP_START</code></td><td>Context preprocessing (tokenize, format)</td><td id="tele-prep">—</td></tr>
+                <tr><td><code>KV_CACHE_ALLOC</code></td><td>KV cache memory reservation</td><td id="tele-kv">—</td></tr>
+                <tr><td><code>PROMPT_PROC</code></td><td>Prefill (process input tokens)</td><td id="tele-prompt">—</td></tr>
+                <tr><td><code>TTFT</code></td><td>Time to first token</td><td id="tele-ttft">—</td></tr>
+                <tr><td><code>GEN_STEP</code></td><td>Generation step (TBT sampling)</td><td id="tele-gen">—</td></tr>
+                <tr><td><code>RES_FIN</code></td><td>Result finished</td><td id="tele-fin">—</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Section 3: Derived metrics (the headline numbers) -->
+          <div class="config-security-card">
+            <div class="config-card-title">Derived metrics</div>
+            <div class="tele-metrics">
+              <div class="tele-metric">
+                <div class="tele-metric-val" id="tele-m-ttft">—</div>
+                <div class="tele-metric-label">Time to first token</div>
+              </div>
+              <div class="tele-metric">
+                <div class="tele-metric-val" id="tele-m-tbt">—</div>
+                <div class="tele-metric-label">Avg time between tokens</div>
+              </div>
+              <div class="tele-metric">
+                <div class="tele-metric-val" id="tele-m-tps">—</div>
+                <div class="tele-metric-label">Tokens / second</div>
+              </div>
+            </div>
+            <p class="security-note small">
+              The Prometheus test matrix will compare these across quantization levels
+              (Q4_K_M, Q6_K, Q8_0) for models up to 12B — surfacing the "quality per bit" trade-off
+              and memory-peak behavior during prompt processing.
+            </p>
+          </div>
+
+          <!-- Launch the Chronos test protocol -->
+          <div class="config-security-card tele-launch-card">
+            <button id="chronos-run-btn" class="btn-primary tele-launch-btn">Chronos Tests</button>
+          </div>
+        </div>
+
+        <!-- Chronos warning modal -->
+        <div id="chronos-modal" class="panel-overlay tool-form-overlay" hidden>
+          <div class="panel glass form-modal chronos-modal-card">
+            <div class="panel-header">
+              <span class="panel-title">Prometheus Test Protocol</span>
+            </div>
+            <div class="panel-body">
+              <p class="security-note small">
+                The Prometheus Test Protocol is an alpha tool for the dev of Phoenix Agent, if you run
+                this protocol, Phoenix Agent will fulfill this protocol and send the results into our
+                main web-site. What informations are send ? First you hardware info, then the telemetry
+                of the protocol using different models. The Prometheus protocol can take time but if you
+                allow Phoenix Agent to run it at least once, you will contribute to the population of
+                the data of the efficiency of Phoenix Agent !
+              </p>
+              <div class="skill-form-actions chronos-actions">
+                <button id="chronos-run-confirm" class="btn-primary">Run Protocol</button>
+                <button id="chronos-cancel" class="btn-secondary">Cancel</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab: About — Wiki (Phoenix Agent + AmberCore) -->
+        <div id="config-tab-about" class="panel-body security-tab" hidden>
+
+          <!-- Inner Wiki sub-navigation -->
+          <div class="wiki-subnav">
+            <button class="wiki-tab-btn active" data-wiki-tab="phoenix">Phoenix Agent</button>
+            <button class="wiki-tab-btn" data-wiki-tab="features">Features</button>
+            <button class="wiki-tab-btn" data-wiki-tab="security">Security</button>
+            <button class="wiki-tab-btn" data-wiki-tab="amber">AmberCore</button>
+          </div>
+
+          <!-- ============ Sub-tab: Phoenix Agent ============ -->
+          <div class="wiki-sub" id="wiki-sub-phoenix">
+            <div class="wiki-hero">
+              <div class="wiki-logo">🔥</div>
+              <div class="wiki-hero-text">
+                <div class="wiki-title">Phoenix Agent<span class="wiki-ver">v0.3.0</span></div>
+                <div class="wiki-tagline">A fully-local, encrypted, autonomous coding &amp; research agent.</div>
+              </div>
+            </div>
+            <div class="wiki-pills">
+              <span class="wiki-pill">100% local</span>
+              <span class="wiki-pill">AES-256 at rest</span>
+              <span class="wiki-pill">Argon2id + TOTP 2FA</span>
+              <span class="wiki-pill">Rust + Tauri 2.0</span>
+            </div>
+
+            <div class="config-security-card">
+              <div class="config-card-title">Overview</div>
+              <p class="security-note">Phoenix Agent is a desktop coding &amp; research agent that runs entirely on your machine. Conversations, memory and tool output are stored in an encrypted SQLite database (SQLCipher) whose key is wrapped under a launch password you choose. Nothing leaves your computer unless you explicitly connect a cloud provider.</p>
+              <p class="security-note small">The agent can read and write files, search code, and run scripts — but every destructive action passes through an approval gate that you control.</p>
+            </div>
+
+            <div class="config-security-card">
+              <div class="config-card-title">The interface</div>
+              <p class="security-note small">The sidebar organizes everything the agent can reach — five panels, each with a clear job:</p>
+              <div class="tele-grid">
+                <div class="tele-field"><span class="tele-key">Models</span><span class="tele-val">local + cloud backends</span></div>
+                <div class="tele-field"><span class="tele-key">Skills</span><span class="tele-val">reusable detailed memory</span></div>
+                <div class="tele-field"><span class="tele-key">Tools</span><span class="tele-val">scripts the agent can call</span></div>
+                <div class="tele-field"><span class="tele-key">Context</span><span class="tele-val">per-project orchestrator</span></div>
+                <div class="tele-field"><span class="tele-key">Memory</span><span class="tele-val">long-term via MCP</span></div>
+              </div>
+              <p class="security-note small" style="margin-top:10px">The health bar across the bottom reports live status for Ollama/AmberCore, the active model, the database, ripgrep and the shell.</p>
+            </div>
+          </div>
+
+          <!-- ============ Sub-tab: Features ============ -->
+          <div class="wiki-sub" id="wiki-sub-features" hidden>
+            <div class="config-card-title wiki-section-title">Core capabilities</div>
+            <p class="security-note small" style="margin-bottom:10px">What Phoenix Agent can do, under the hood.</p>
+            <div class="wiki-cap-grid">
+              <div class="wiki-cap">
+                <span class="wiki-cap-icon">🧠</span>
+                <div class="wiki-cap-body">
+                  <div class="wiki-cap-name">Local LLMs</div>
+                  <div class="wiki-cap-desc">Run models on-device through Ollama or AmberCore — no cloud GPU, no data leaving your machine.</div>
+                </div>
+              </div>
+              <div class="wiki-cap">
+                <span class="wiki-cap-icon">☁️</span>
+                <div class="wiki-cap-body">
+                  <div class="wiki-cap-name">Cloud providers</div>
+                  <div class="wiki-cap-desc">Optionally route to any OpenAI-compatible Chat Completions API by registering a key.</div>
+                </div>
+              </div>
+              <div class="wiki-cap">
+                <span class="wiki-cap-icon">🔐</span>
+                <div class="wiki-cap-body">
+                  <div class="wiki-cap-name">Encrypted memory</div>
+                  <div class="wiki-cap-desc">All conversations and memory persist in a SQLCipher database, encrypted with AES-256 at rest.</div>
+                </div>
+              </div>
+              <div class="wiki-cap">
+                <span class="wiki-cap-icon">✅</span>
+                <div class="wiki-cap-body">
+                  <div class="wiki-cap-name">Approval-gated tools</div>
+                  <div class="wiki-cap-desc">File read/write, grep and shell tools require your sign-off before any write executes.</div>
+                </div>
+              </div>
+              <div class="wiki-cap">
+                <span class="wiki-cap-icon">📚</span>
+                <div class="wiki-cap-body">
+                  <div class="wiki-cap-name">Skills</div>
+                  <div class="wiki-cap-desc">Reusable blocks of detailed memory and instructions, injected into the prompt when activated.</div>
+                </div>
+              </div>
+              <div class="wiki-cap">
+                <span class="wiki-cap-icon">🗂️</span>
+                <div class="wiki-cap-body">
+                  <div class="wiki-cap-name">Context</div>
+                  <div class="wiki-cap-desc">Short-term, per-project facts the agent reads and updates as it works — an orchestrator, not a vault.</div>
+                </div>
+              </div>
+              <div class="wiki-cap">
+                <span class="wiki-cap-icon">🧩</span>
+                <div class="wiki-cap-body">
+                  <div class="wiki-cap-name">MCP connections</div>
+                  <div class="wiki-cap-desc">Link external Model Context Protocol servers (or an Obsidian vault) as long-term memory.</div>
+                </div>
+              </div>
+              <div class="wiki-cap">
+                <span class="wiki-cap-icon">🛡️</span>
+                <div class="wiki-cap-body">
+                  <div class="wiki-cap-name">2FA recovery</div>
+                  <div class="wiki-cap-desc">Forgotten launch password? A TOTP code (RFC 6238) lets you back in to your encrypted data.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ============ Sub-tab: Security ============ -->
+          <div class="wiki-sub" id="wiki-sub-security" hidden>
+            <div class="config-card-title wiki-section-title">Security model</div>
+            <p class="security-note">Phoenix Agent is built local-first: your data never has to leave your machine, and everything sensitive is encrypted at rest.</p>
+
+            <div class="config-security-card">
+              <div class="config-card-title">How the keys fit together</div>
+              <div class="tele-grid">
+                <div class="tele-field"><span class="tele-key">Launch password</span><span class="tele-val">typed at startup</span></div>
+                <div class="tele-field"><span class="tele-key">KDF</span><span class="tele-val">Argon2id</span></div>
+                <div class="tele-field"><span class="tele-key">Key wrap</span><span class="tele-val">AES-256-GCM</span></div>
+                <div class="tele-field"><span class="tele-key">Database</span><span class="tele-val">SQLCipher (AES-256)</span></div>
+                <div class="tele-field"><span class="tele-key">2FA</span><span class="tele-val">RFC 6238 TOTP</span></div>
+                <div class="tele-field"><span class="tele-key">Network</span><span class="tele-val">none by default</span></div>
+              </div>
+              <p class="security-note small" style="margin-top:10px">The database key is derived from a fixed internal password, then <b>wrapped</b> under your launch password and stored in <code>keys.phx</code>. On each launch the app unwraps it autonomously — you only ever type the launch password.</p>
+            </div>
+
+            <div class="config-security-card">
+              <div class="config-card-title">Recovery &amp; privacy</div>
+              <p class="security-note small">Enable 2FA and an authenticator code becomes a recovery factor: lose the launch password and a current 6-digit code re-wraps the key. Telemetry (the Chronos protocol) is captured locally only, and is never transmitted unless you explicitly run the Prometheus test protocol.</p>
+            </div>
+          </div>
+
+          <!-- ============ Sub-tab: AmberCore ============ -->
+          <div class="wiki-sub" id="wiki-sub-amber" hidden>
+            <div class="wiki-hero">
+              <div class="wiki-logo">✦</div>
+              <div class="wiki-hero-text">
+                <div class="wiki-title wiki-title-amber">AmberCore</div>
+                <div class="wiki-tagline">A pure-Rust LLM runner. Drop-in Ollama-compatible backend.</div>
+              </div>
+            </div>
+            <div class="wiki-pills">
+              <span class="wiki-pill">Candle-based</span>
+              <span class="wiki-pill">GGUF</span>
+              <span class="wiki-pill">Port 42069</span>
+              <span class="wiki-pill">CPU · CUDA · Metal</span>
+            </div>
+
+            <div class="config-security-card">
+              <div class="config-card-title">Overview</div>
+              <p class="security-note">AmberCore loads GGUF models and serves them over an Ollama-compatible HTTP API, so Phoenix Agent (or any Ollama client) can use it as its model backend — no Python, no separate runtime, just one binary.</p>
+            </div>
+
+            <div class="config-security-card">
+              <div class="config-card-title">Capabilities</div>
+              <div class="tele-grid">
+                <div class="tele-field"><span class="tele-key">Format</span><span class="tele-val">GGUF (quantized)</span></div>
+                <div class="tele-field"><span class="tele-key">API</span><span class="tele-val">Ollama-compatible</span></div>
+                <div class="tele-field"><span class="tele-key">Endpoints</span><span class="tele-val">/api/chat · /api/tags · /api/stats</span></div>
+                <div class="tele-field"><span class="tele-key">Backends</span><span class="tele-val">CPU · CUDA · Metal</span></div>
+                <div class="tele-field"><span class="tele-key">Replicas</span><span class="tele-val">parallel same-tag pool</span></div>
+                <div class="tele-field"><span class="tele-key">Telemetry</span><span class="tele-val">TTFT · TBT · TPS</span></div>
+              </div>
+            </div>
+
+            <div class="config-security-card">
+              <div class="config-card-title">CLI</div>
+              <table class="tele-table">
+                <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+                <tbody>
+                  <tr><td><code>ambercore serve</code></td><td>Start the Ollama-compatible server (default :42069)</td></tr>
+                  <tr><td><code>ambercore run --model &lt;tag&gt; --prompt "…"</code></td><td>One-off generation in the terminal</td></tr>
+                  <tr><td><code>ambercore register --file &lt;path&gt; --tag &lt;tag&gt;</code></td><td>Add a local GGUF to the catalog</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="config-security-card">
+              <div class="config-card-title">Using it with Phoenix Agent</div>
+              <p class="security-note small">Start the server with <code>ambercore serve</code>, then point Phoenix at it — either from the <b>Models</b> panel, or by setting <code>ollama_url = "http://localhost:42069"</code> in <code>~/.phoenix/config.toml</code>. Registered models appear automatically in the AmberCore box of the Models panel.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

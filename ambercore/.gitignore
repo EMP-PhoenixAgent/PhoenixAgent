@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target/
+
+# Model weights and tokenizers live in the user data dir (~/.ambercore/models),
+# never inside the repo. Guard against accidental copies anyway.
+*.gguf
+tokenizer.json
+manifest.json
+
+# Editor / OS cruft
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Tracing output
+trace-*.json

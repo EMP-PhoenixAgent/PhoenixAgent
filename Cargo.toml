@@ -1,0 +1,90 @@
+[package]
+name = "phoenix-agent"
+version = "0.8.0"
+edition = "2021"
+rust-version = "1.80"
+description = "A fully-local, encrypted, autonomous coding agent"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "phoenix"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Async
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# HTTP (Ollama) — rustls to avoid a second native OpenSSL dep
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+bytes = "1"
+
+# Encrypted DB
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite_migration = "1.3"
+
+# Crypto / KDF
+argon2 = "0.5"
+rand = "0.8"
+hex = "0.4"
+zeroize = { version = "1", features = ["derive"] }
+# AES-256-GCM for key-wrapping (wraps the SQLCipher DB key under the user's
+# launch password, and a recovery wrap under the 2FA seed). Pure Rust, no
+# native/OpenSSL build — matches the rustls philosophy. Authenticated so a
+# tampered blob fails cleanly instead of silently corrupting the DB.
+aes-gcm = "0.10"
+base64 = "0.22"
+
+# 2FA — RFC 6238 TOTP (Google Authenticator / Proton Pass compatible).
+# `gen_secret` for secret generation, `otpauth` for the provisioning URI;
+# QR rendering is done in the frontend from the URI (avoids a native dep).
+totp-rs = { version = "5", default-features = false, features = ["gen_secret", "otpauth"] }
+base32 = "0.5"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async trait
+async-trait = "0.1"
+
+# Errors / logging
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# Misc
+dirs = "5"
+chrono = { version = "0.4", features = ["serde"] }
+# tempfile is used at runtime (user-script tools write scripts to temp files)
+# and in tests.
+tempfile = "3"
+
+# Tauri (native desktop window with web frontend)
+tauri = { version = "2", features = [] }
+
+# Embedded AmberCore — the in-process model engine (pure Rust, Candle). Built
+# CPU-only by default so the distributed installers stay portable; opt into GPU
+# acceleration at build time with `--features ambercore-cuda` (NVIDIA; needs
+# nvcc) or `--features ambercore-metal` (macOS, Apple GPU).
+ambercore = { path = "ambercore" }
+
+[features]
+# GPU acceleration for the embedded engine (see the ambercore dep above).
+ambercore-cuda = ["ambercore/cuda"]
+ambercore-metal = ["ambercore/metal"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[dev-dependencies]

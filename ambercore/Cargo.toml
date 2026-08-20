@@ -1,0 +1,73 @@
+[package]
+name = "ambercore"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+description = "AmberCore, illuminated by Candle — a fully-Rust LLM runner. Ollama-compatible backend for the Phoenix Agent."
+license = "MIT"
+
+[lib]
+name = "ambercore"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ambercore"
+path = "src/bin/ambercore.rs"
+
+[dependencies]
+# --- Wire / infra (active since the scaffold) ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- Candle (M0: inference path is live) ---
+# candle-core ships the `quantized::gguf_file` loader and the CPU/CUDA/Metal
+# `Device` enum. candle-nn is pulled in by candle-transformers; we depend on it
+# directly for the bits we use (DType, etc. come from candle-core though).
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+# HuggingFace fast Rust tokenizer. GGUFs ship the tokenizer inline, but the
+# canonical path is a sibling `tokenizer.json` (HF format) — we load that.
+tokenizers = "0.21"
+hf-hub = "0.3"
+
+# --- HTTP server (M2: live — serves the Ollama-compatible API) ---
+axum = "0.8"
+tokio-stream = "0.1"
+bytes = "1"
+http = "1"
+
+# --- Prometheus telemetry push (alpha test collector) ---
+# reqwest pushes completed runs to the Phoenix collector; uuid mints run ids;
+# sysinfo reads CPU model/cores/RAM/OS for the hardware snapshot. All
+# fire-and-forget — never on the inference hot path.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+uuid = { version = "1", features = ["v4"] }
+sysinfo = "0.31"
+
+[features]
+default = []
+# CUDA backend (M4/M6). Requires the CUDA toolkit (`nvcc`) at build time and an
+# NVIDIA GPU at runtime. Propagates candle's `cuda` feature to all three crates so
+# the quantized GGUF kernels (`quantized/cuda.rs`, QStorage::Cuda) are compiled in.
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+# Metal backend (M7). macOS-only. Propagates candle's `metal` feature to all three
+# crates so the quantized GGUF kernels (`quantized/metal.rs`, QStorage::Metal) run
+# on an Apple GPU. The MetalBackend struct is additionally `target_os = "macos"`-
+# gated in backend.rs, so enabling this feature off-macOS is a no-op.
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+# AMD/ROCm backend (M8). Deliberately EMPTY: candle has no stable ROCm backend
+# (only stale experimental PRs #3424/#3801), so there is nothing to propagate.
+# `AmdBackend` always errors cleanly at resolve time. The feature exists only to
+# keep the surface ready the day candle merges official ROCm — no fragile fork.
+rocm = []
+
+[dev-dependencies]
+tempfile = "3"

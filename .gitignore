@@ -1,0 +1,7 @@
+/target
+/.phoenix
+*.db
+*.db-shm
+*.db-wal
+*.log
+/gen/
