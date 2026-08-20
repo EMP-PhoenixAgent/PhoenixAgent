@@ -1,64 +1,89 @@
 # Phoenix Agent
 
-> **ALPHA build notes (read first).** This is the reviewed, public source for the
-> Phoenix Agent desktop app. Current state: v0.8.0 — a Tauri 2 desktop GUI with a
-> dark glassmorphism UI, SQLCipher-encrypted memory + two-password/2FA model, a
-> ReAct agent with an approval gate, a **visible reasoning/tool pipeline**
-> (collapsible thinking block, expandable tool cards, sub-agent cards), and a
-> Models panel with three interchangeable backends.
->
-> **Model backends** (Models panel):
-> - **AmberCore** (pure-Rust runner) — **embedded in-process**: the engine is
->   compiled into this binary (`ambercore/`), launches with the app, and the
->   last-used model is preloaded at startup. No separate server or binary. A
->   **remote** AmberCore server can be linked instead by entering its URL:port
->   (see [`AmberCore-Server`](../AmberCore-Server/README.md)).
-> - **Ollama** (local).
-> - **Provider API** — any OpenAI-compatible cloud endpoint.
->
-> **GPU acceleration:** the default build embeds AmberCore's portable **CPU**
-> backend. Rebuild with `--features ambercore-cuda` (NVIDIA + CUDA toolkit) or
-> `--features ambercore-metal` (macOS Apple GPU, experimental) for hardware
-> acceleration.
->
-> **Build:** `cargo tauri dev` to run, `cargo tauri build` to bundle. Windows
-> needs Strawberry Perl on `PATH` for the SQLCipher/OpenSSL compile
-> (`set PATH=C:\Strawberry\perl\bin;%PATH%`). (The historical v0.1 notes below are
-> retained for context; the TUI they mention was replaced by the Tauri GUI.)
+> **ALPHA — v0.8.0.** The reviewed, public source for the Phoenix Agent
+> desktop app: fully local, encrypted at rest, autonomous. Models run through
+> the **embedded AmberCore engine** (compiled in-process; CPU or NVIDIA CUDA),
+> [Ollama](https://ollama.com), or any OpenAI-compatible cloud provider.
 
----
+A fully-local, encrypted, autonomous coding & research agent. Everything runs
+on your machine — your code, your conversations, and your memory never leave
+the box. The memory database is AES-256 encrypted (SQLCipher) and unlocks only
+with your launch password.
 
-A fully-local, encrypted, autonomous coding agent. Runs entirely on your
-machine — your code, your conversations, and your memory never leave the box.
-Your memory database is AES-256 encrypted at rest and unlocks only with your
-passphrase.
+## What it does
 
-```
-   Phoenix Agent v0.1 — local · encrypted · autonomous
-```
+- **Autonomous agent** — a ReAct reasoning loop with an approval gate: the
+  agent reads/writes files, searches code, and runs shell commands; anything
+  that mutates state asks first.
+- **Visible reasoning** — the chat reads as a pipeline: collapsible *thinking*
+  blocks (reasoning kept separate from answers, streaming with a flame glow),
+  expandable tool cards (arguments · result · duration · inline Approve/Deny),
+  nested sub-agent cards, and a live phase pill.
+- **Encrypted memory** — every session and message lands in a
+  SQLCipher-encrypted database. A two-password model gates it: the launch
+  password you type at startup unwraps the database key; optional TOTP 2FA
+  adds a recovery path.
+- **Science workbench** — profiles bundle a model + working directory + the
+  sidebar panels: **Skills** (markdown knowledge injected into the prompt),
+  **Tools** (user scripts the agent can call like built-ins), **Context**
+  (project ground-truth files), **Memory** (MCP server connections), and
+  specialized sub-agents.
+- **Hardware check-up** — Main Menu → **Telemetry** shows this machine's
+  baseline at launch: CPU · cores · RAM · OS, the active compute backend, and
+  the GPU + VRAM when a GPU backend is in use.
 
-## Features (v0.1)
+## Models
 
-- **Full-screen TUI** — chat with the agent, watch it stream responses and run
-  tools live, with a status bar and approval prompts.
-- **Local models via Ollama** — talk to any Ollama model (default
-  `qwen2.5-coder:7b`). The model layer is abstracted so other backends can be
-  added later.
-- **Encrypted memory (SQLCipher)** — every conversation turn, tool call, and
-  tool result is persisted to a SQLCipher-encrypted SQLite database. Locked when
-  Phoenix isn't running; unlocked only with your passphrase.
-- **Autonomous coding tools** — the agent can read/write/edit files, search
-  code (ripgrep or pure-Rust fallback), and run shell commands. Write actions
-  require your approval before they execute.
-- **ReAct reasoning loop** — the agent reasons, acts, observes, and iterates
-  (capped) until the task is done.
+The **Models** panel offers three interchangeable backends — switch live, no
+restart:
 
-## Quick start
+- **AmberCore** — the pure-Rust LLM runner (Candle), **embedded in-process**:
+  the engine ships inside the app binary, launches with it, and preloads your
+  last-used model so the first message answers fast. A remote AmberCore server
+  can be linked instead by entering its `URL:port` (see
+  [`AmberCore-Server`](../AmberCore-Server/README.md)).
+- **Ollama** — local; auto-install and model pulls from the panel.
+- **Provider API** — any OpenAI-compatible cloud endpoint. API keys are
+  stored encrypted in the database and always blurred in the UI.
 
-### 1. Prerequisites (one-time)
+### Pulling models (AmberCore)
 
-Phoenix needs the Rust toolchain and MSVC C++ build tools (to compile the
-bundled SQLCipher + OpenSSL from source). On Windows, install with
+Paste a model URL — any Hugging Face `…/resolve/…/<model>.gguf` link (page
+`/blob/` links and `?download=true` suffixes are handled) — and click
+**Pull**. Phoenix downloads the GGUF **and fetches its tokenizer
+automatically**: the same repo/revision first, then the base model repo, with
+an optional Tokenizer URL field for other sources. The progress bar shows each
+file as it downloads, and re-pulls skip files already on disk.
+
+Pulls are validated before anything is registered:
+
+- The GGUF's header is probed and **unsupported architectures are rejected
+  immediately** with a plain-language error (supported today: `qwen2`,
+  `qwen3`, `llama` — Qwen3.5's hybrid `qwen35` SSM architecture is not yet
+  supported).
+- A model **without a tokenizer never registers** — the pull fails listing
+  the URLs it tried, and a retry (or a manual tokenizer URL) only downloads
+  the missing file.
+
+Models live in `~/.ambercore/models/` by default (configurable in the panel)
+as `<model>.gguf` + `<model>.tokenizer.json`.
+
+### GPU acceleration
+
+The embedded engine **prefers the GPU automatically** — CUDA when compiled
+in, CPU otherwise; there is nothing to configure, and the active backend is
+shown in Main Menu → Telemetry. The default build embeds the portable CPU
+backend; rebuild with `--features ambercore-cuda` (NVIDIA; CUDA toolkit +
+MSVC) or `--features ambercore-metal` (macOS Apple GPU, experimental) for
+hardware acceleration. Ready-made Windows installers ship in both flavors —
+see [`Installers`](../Installers/README.md).
+
+## Build & run
+
+### Prerequisites (one-time)
+
+Phoenix needs the Rust toolchain, the Tauri CLI, and MSVC C++ build tools (to
+compile the bundled SQLCipher + OpenSSL from source). On Windows, install with
 [winget](https://learn.microsoft.com/windows/package-manager/winget/):
 
 ```powershell
@@ -66,145 +91,58 @@ winget install Rustlang.Rustup
 winget install Microsoft.VisualStudio.2022.BuildTools   # then add the "Desktop development with C++" workload
 winget install StrawberryPerl.StrawberryPerl            # for the bundled OpenSSL build
 winget install NASM.NASM                                 # OpenSSL assembler
-```
-
-Open a **fresh** terminal after installing, then verify:
-```powershell
-cargo --version   # should print cargo 1.x
-cl                # should find the MSVC compiler (run from a Developer prompt or after vcvars)
-perl --version    # Strawberry Perl
-nasm -v           # NASM
+cargo install tauri-cli --version "^2.0" --locked
 ```
 
 > **Build trouble?** If NASM causes issues, the vendored OpenSSL can be built
-> without assembly by setting `OPENSSL_NO_ASM=1` in your environment before
-> `cargo build`. The crypto will be slower but functionally fine for a local DB.
+> without assembly by setting `OPENSSL_NO_ASM=1`. Windows CUDA builds
+> additionally need `set CL=/Zc:preprocessor /std:c++17` and
+> `set CUDA_COMPUTE_CAP=<yy>` — see `ambercore/ACRoad.md` §8.
 
-### 2. Install Ollama + a model
-
-```powershell
-# Ollama runs the models locally.
-ollama serve             # start the server (leave it running)
-ollama pull qwen2.5-coder:7b
-```
-
-### 3. Build Phoenix
+### Run
 
 ```powershell
-cd phoenix-agent
-cargo build --release
-# binary: target\release\phoenix.exe
+cargo tauri dev
 ```
 
-### 4. Initialize
+The first run shows a setup screen — choose a **launch password** (it derives
+the keys that wrap the encrypted database). Then open **Models**, pull a
+model, e.g.:
 
-```powershell
-phoenix init
+```
+https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf
 ```
 
-This sets your encryption passphrase, creates the encrypted database, and
-confirms your model is available.
+click **Run**, and chat. A `phoenix doctor` CLI subcommand diagnoses the
+toolchain and database if something misbehaves.
 
-### 5. Run
-
-```powershell
-phoenix            # launch the TUI in the current directory
-phoenix doctor     # diagnose Ollama / DB / toolchain
-```
-
-## Usage
-
-Inside the TUI:
-
-| Key | Action |
-|-----|--------|
-| Type + `Enter` | Send a message |
-| `Shift+Enter` | Newline (multiline input) |
-| `Ctrl+C` | Clear input (or quit if empty) |
-| `Ctrl+U` | Clear line |
-| `PageUp` / `PageDown` | Scroll chat history |
-| `y` / `n` | Approve / deny a pending tool call |
-
-Slash commands:
-
-| Command | Action |
-|---------|--------|
-| `/model <name>` | Switch model |
-| `/new` | Start a fresh session |
-| `/clear` | Clear the screen |
-| `/note <text>` | Save a note |
-| `/help` | Show commands |
-| `/quit` | Exit |
-
-## How it works
-
-### Encryption
-
-- On `init`, you set a passphrase. Phoenix generates a random 16-byte salt
-  (`~/.phoenix/salt.bin`, not secret) and derives a 32-byte key with
-  **Argon2id** (64 MiB · 3 passes · 4 lanes).
-- The key is passed to **SQLCipher**, which performs transparent AES-256
-  encryption over the entire database file.
-- The derived key lives **only in process memory** for the session and is
-  zeroized on drop. Nothing secret is written to disk.
-- When Phoenix exits, the connection closes and the database file is opaque
-  ciphertext. Without the passphrase, it cannot be read.
-
-### Memory
-
-Every turn is persisted:
-
-- **sessions** — one per conversation, with project, model, timestamps.
-- **messages** — every system/user/assistant/tool message, including tool-call
-  requests and results, token counts, and the model that produced it.
-- **notes** — pinned facts and manual notes.
-
-Use `phoenix doctor` (with passphrase) to inspect session counts, or extend
-the code to add search/recall features.
-
-### Tool approval
-
-Read-only tools (`read_file`, `list_dir`, `grep`) run automatically. Tools that
-mutate state (`write_file`, `edit_file`, `run_command`) trigger an approval
-prompt in the TUI — press `y` to allow or `n` to deny. The policy is
-configurable in `config.toml`:
-
-```toml
-[approval_policy]  # one of: all, writes_only, never
-# (default: writes_only)
-```
-
-## Configuration
-
-`~/.phoenix/config.toml`:
-
-```toml
-model = "qwen2.5-coder:7b"
-ollama_url = "http://localhost:11434"
-db_filename = "memory.db"
-approval_policy = "writes_only"
-max_iterations = 25
-context_window = 50
-```
-
-Override the data directory with `--data-dir` or the `PHOENIX_DATA_DIR`
-environment variable.
+To bundle an installer: `cargo tauri build` (add `--features
+ambercore-cuda` for the GPU build).
 
 ## Project layout
 
 ```
 phoenix-agent/
 ├── src/
-│   ├── main.rs           CLI entry (init / doctor / chat)
-│   ├── config.rs         paths + config.toml
-│   ├── crypto.rs         passphrase → Argon2 → key
-│   ├── error.rs          unified error types
-│   ├── db/               SQLCipher connection + memory store
-│   ├── model/            ModelProvider trait + Ollama adapter
-│   ├── agent/            ReAct loop, prompt, tools (fs/search/shell)
-│   └── tui/              ratatui full-screen UI
-└── migrations/           SQL schema
+│   ├── main.rs            GUI entry (+ `doctor` subcommand)
+│   ├── config.rs          paths + config.toml
+│   ├── model/             ModelProvider trait + dispatch + Ollama / OpenAI /
+│   │                      embedded-AmberCore adapters
+│   ├── agent/             ReAct loop, prompt, skills, MCP client, tools
+│   │                      (fs/search/shell + user scripts + sub-agents)
+│   ├── backend/           process manager (Ollama serve)
+│   ├── web/               Tauri layer: commands, events, state
+│   ├── db/                SQLCipher connection + memory store + migrations
+│   ├── crypto/            Argon2id KDF, key wrapping (AES-256-GCM), TOTP
+│   └── health.rs          live backend/model health monitor
+├── ambercore/             the embedded LLM engine (pure Rust, Candle)
+├── frontend/              static HTML/CSS/JS UI (no build step)
+├── migrations/            SQL schema (0001–0007)
+└── installer.nsi          legacy NSIS script (Tauri's bundler drives builds)
 ```
+
+App data (encrypted database, wrapped-key bundle `keys.phx`, `config.toml`)
+lives under `~/.phoenix/` by default.
 
 ## Security notes (honest)
 
