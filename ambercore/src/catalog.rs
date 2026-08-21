@@ -68,7 +68,8 @@ pub struct Catalog {
 
 impl Catalog {
     /// Build a catalog by reading `manifest.json` (if present) and scanning the
-    /// models dir for `*.gguf` files.
+    /// models dir for `*.gguf` files — flat files **and** one level of
+    /// per-model subfolders (the Phoenix pull layout: `<model-name>/<model>.gguf`).
     pub fn load(models_dir: &Path) -> Result<Self> {
         let mut entries: BTreeMap<String, CatalogEntry> = BTreeMap::new();
 
@@ -77,24 +78,21 @@ impl Catalog {
             for entry in std::fs::read_dir(models_dir)? {
                 let entry = entry?;
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
-                    let stem = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("model");
-                    let tag = derive_tag(stem);
-                    entries.insert(
-                        tag.clone(),
-                        CatalogEntry {
-                            tag,
-                            file: path
+                if is_gguf(&path) {
+                    insert_scanned(&mut entries, &path, None);
+                } else if path.is_dir() {
+                    // One level of per-model subfolders. Relative `file` paths
+                    // (`<folder>/<name>.gguf`) resolve against the models dir.
+                    for sub in std::fs::read_dir(&path)? {
+                        let sub = sub?.path();
+                        if is_gguf(&sub) {
+                            let folder = path
                                 .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("model.gguf")
-                                .to_string(),
-                            arch: None,
-                        },
-                    );
+                                .and_then(|n| n.to_str())
+                                .unwrap_or_default();
+                            insert_scanned(&mut entries, &sub, Some(folder));
+                        }
+                    }
                 }
             }
         }
@@ -185,6 +183,34 @@ impl Catalog {
     }
 }
 
+/// Whether a path has a `.gguf` extension (case-insensitive).
+fn is_gguf(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("gguf"))
+        .unwrap_or(false)
+}
+
+/// Register a scanned GGUF under its derived tag. `folder` prefixes the stored
+/// (relative) `file` path when the model lives in a per-model subfolder.
+fn insert_scanned(
+    entries: &mut BTreeMap<String, CatalogEntry>,
+    path: &Path,
+    folder: Option<&str>,
+) {
+    let filename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model.gguf");
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+    let tag = derive_tag(stem);
+    let file = match folder {
+        Some(f) => format!("{f}/{filename}"),
+        None => filename.to_string(),
+    };
+    entries.insert(tag.clone(), CatalogEntry { tag, file, arch: None });
+}
+
 /// Derive an Ollama-style tag from a GGUF filename stem.
 ///
 /// Converts `qwen2.5-coder-7b` → `qwen2.5-coder:7b` by turning the last
@@ -226,5 +252,26 @@ mod tests {
     #[test]
     fn derive_tag_falls_back_to_latest() {
         assert_eq!(derive_tag("some-model"), "some-model:latest");
+    }
+
+    #[test]
+    fn scan_finds_flat_and_subfolder_models() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Flat model (the pre-subfolder layout — still supported).
+        std::fs::write(dir.path().join("flat-model-7b.gguf"), b"x").unwrap();
+        // Per-model subfolder (the Phoenix pull layout).
+        let sub = dir.path().join("gemma3-it");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("gemma3-it-q4.gguf"), b"x").unwrap();
+        // Non-GGUF files (tokenizers, manifests) must be ignored by the scan.
+        std::fs::write(sub.join("gemma3-it-q4.tokenizer.json"), b"{}").unwrap();
+
+        let cat = Catalog::load(dir.path()).unwrap();
+        assert!(cat.get("flat-model:7b").is_some(), "flat model registered");
+        let entry = cat.get("gemma3-it-q4:latest").expect("subfolder model registered");
+        assert_eq!(entry.file, "gemma3-it/gemma3-it-q4.gguf");
+        // Resolves against the models dir with the subfolder in the path.
+        let resolved = cat.resolve_path(entry);
+        assert_eq!(resolved, sub.join("gemma3-it-q4.gguf"));
     }
 }

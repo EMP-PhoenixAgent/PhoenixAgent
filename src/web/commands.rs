@@ -856,6 +856,40 @@ pub struct GgufFile {
     pub path: String,
 }
 
+/// Whether a path has a `.gguf` extension (case-insensitive).
+fn is_gguf_path(p: &std::path::Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("gguf"))
+        .unwrap_or(false)
+}
+
+/// Collect `*.gguf` paths from a directory **and its immediate subfolders**
+/// (the pull layout is `<model-name>/<model>.gguf`; flat files keep working).
+/// Deeper nesting is not traversed — the models dir is user-owned, not a tree.
+fn collect_gguf_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if is_gguf_path(&p) {
+            out.push(p);
+        } else if p.is_dir() {
+            if let Ok(sub) = std::fs::read_dir(&p) {
+                for e in sub.flatten() {
+                    let sp = e.path();
+                    if is_gguf_path(&sp) {
+                        out.push(sp);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Scan a directory for `.gguf` model files (read-only inventory for the Models
 /// panel). Returns an empty list if the directory is missing or unreadable.
 #[tauri::command]
@@ -865,25 +899,21 @@ pub async fn scan_gguf_directory(dir: String) -> Result<Vec<GgufFile>, String> {
         return Err(format!("Not a directory: {dir}"));
     }
     let mut out = Vec::new();
-    let rd = std::fs::read_dir(path).map_err(|e| format!("read dir: {e}"))?;
-    for entry in rd.flatten() {
-        let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()).map(|s| s.eq_ignore_ascii_case("gguf")).unwrap_or(false) {
-            let name = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("(gguf)")
-                .to_string();
-            let size = match std::fs::metadata(&p) {
-                Ok(m) => human_bytes(m.len()),
-                Err(_) => "?".into(),
-            };
-            out.push(GgufFile {
-                name,
-                size,
-                path: p.display().to_string(),
-            });
-        }
+    for p in collect_gguf_paths(path) {
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(gguf)")
+            .to_string();
+        let size = match std::fs::metadata(&p) {
+            Ok(m) => human_bytes(m.len()),
+            Err(_) => "?".into(),
+        };
+        out.push(GgufFile {
+            name,
+            size,
+            path: p.display().to_string(),
+        });
     }
     // Largest first — usually what you want when browsing models.
     out.sort_by(|a, b| b.path.cmp(&a.path));
@@ -1057,20 +1087,11 @@ pub async fn list_ambercore_models(
     let dir = resolve_ambercore_dir(&cfg);
     let mut out = Vec::new();
 
-    // 1. Scan the configured/native directory (rich metadata).
+    // 1. Scan the configured/native directory (rich metadata) — flat files
+    //    plus one level of per-model subfolders (the pull layout).
     if let Some(dir) = dir {
         if dir.is_dir() {
-            let read = std::fs::read_dir(&dir).map_err(|e| e.to_string())?;
-            for entry in read.flatten() {
-                let path = entry.path();
-                let is_gguf = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.eq_ignore_ascii_case("gguf"))
-                    .unwrap_or(false);
-                if !is_gguf {
-                    continue;
-                }
+            for path in collect_gguf_paths(&dir) {
                 let filename = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -1180,7 +1201,25 @@ pub async fn pull_ambercore_model(
     // Filename from the URL's last path segment, query string stripped.
     let filename = super::model_urls::filename_from_url(&url)
         .unwrap_or_else(|| format!("model-{}.gguf", chrono::Utc::now().timestamp()));
-    let dest = dir.join(&filename);
+
+    // Split/sharded GGUFs (e.g. `-00001-of-00003.gguf`) can never load in
+    // AmberCore (single-file loader) — fail BEFORE the multi-GB download.
+    if super::model_urls::is_split_gguf(&filename) {
+        return Err(format!(
+            "`{filename}` is one shard of a split GGUF. AmberCore loads single-file \
+             GGUFs only — pick a quant that is one file (no `-00001-of-000NN` \
+             shards) and Pull again."
+        ));
+    }
+
+    // Per-model folder: `<models_dir>/<model-name>/` holds the GGUF + its
+    // tokenizer (and any future per-model files) so models can never pick up
+    // each other's tokenizer. Flat files already on disk keep working.
+    let folder = super::model_urls::model_folder_name(&filename);
+    let model_dir = dir.join(&folder);
+    std::fs::create_dir_all(&model_dir)
+        .map_err(|e| format!("create model folder {}: {e}", model_dir.display()))?;
+    let dest = model_dir.join(&filename);
 
     let client = reqwest::Client::builder()
         .build()
@@ -1213,15 +1252,16 @@ pub async fn pull_ambercore_model(
     }
 
     // 3. Tokenizer — AmberCore looks for `<stem>.tokenizer.json` (or a
-    //    generic `tokenizer.json`) next to the GGUF. The model-specific name
-    //    lets models with different vocabularies share one directory.
+    //    generic `tokenizer.json`) next to the GGUF, i.e. inside the model's
+    //    own folder. The model-specific name lets multiple quants of the same
+    //    model share the folder without collisions.
     let stem = dest
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_default()
         .to_string();
-    let tok_dest = dir.join(format!("{stem}.tokenizer.json"));
-    let have_tokenizer = tok_dest.is_file() || dir.join("tokenizer.json").is_file();
+    let tok_dest = model_dir.join(format!("{stem}.tokenizer.json"));
+    let have_tokenizer = tok_dest.is_file() || model_dir.join("tokenizer.json").is_file();
     if !have_tokenizer {
         // Explicit URL first, then whatever the model URL implies.
         let mut candidates: Vec<String> = Vec::new();
@@ -1262,21 +1302,23 @@ pub async fn pull_ambercore_model(
                 } else {
                     failures.join("\n  ")
                 },
-                dir.display(),
+                model_dir.display(),
             ));
         }
     }
 
     // Register the model with the embedded engine's catalog — in-process
     // (persists to the dir's manifest.json); no `ambercore` binary involved.
+    // The manifest `file` is folder-relative (resolved against the models dir).
     let tag = derive_ambercore_tag(&filename);
+    let rel_path = format!("{folder}/{filename}");
     state
         .provider
         .embedded()
-        .register_model(&tag, &filename)
+        .register_model(&tag, &rel_path)
         .await
         .map_err(|e| format!("register model: {e}"))?;
-    tracing::info!(%tag, "registered AmberCore model (embedded catalog)");
+    tracing::info!(%tag, path = %rel_path, "registered AmberCore model (embedded catalog)");
     Ok(tag)
 }
 

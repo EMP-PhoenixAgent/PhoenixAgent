@@ -218,4 +218,29 @@ mod pull_urls {
         // Non-HF URLs can't derive anything.
         assert!(tokenizer_candidates("https://example.com/file.gguf").is_empty());
     }
+
+    #[test]
+    fn folder_name_sanitizes_and_uses_the_stem() {
+        use phoenix_agent::web::model_urls::model_folder_name;
+        // Normal case: the GGUF stem becomes the folder.
+        assert_eq!(model_folder_name("gemma3-1b-q4_k_m.gguf"), "gemma3-1b-q4_k_m");
+        // Path-hostile characters become dashes; case-insensitive extension.
+        assert_eq!(model_folder_name("Model<1?:.GGUF"), "Model-1");
+        // Degenerate names fall back instead of empty/dot folders.
+        assert_eq!(model_folder_name("???.gguf"), "model");
+        assert_eq!(model_folder_name(".gguf"), "model");
+    }
+
+    #[test]
+    fn split_gguf_shards_are_detected() {
+        use phoenix_agent::web::model_urls::is_split_gguf;
+        // The standard sharded pattern.
+        assert!(is_split_gguf("Mixtral-8x7B-Instruct-v0.1-Q4_K_M-00001-of-00003.gguf"));
+        assert!(is_split_gguf("model-00002-of-00009.gguf"));
+        // Benign "-of-" in names must NOT trip it.
+        assert!(!is_split_gguf("best-of-7b.gguf"));
+        assert!(!is_split_gguf("state-of-the-art-q4.gguf"));
+        // Plain single files.
+        assert!(!is_split_gguf("gemma3-1b-q4.gguf"));
+    }
 }

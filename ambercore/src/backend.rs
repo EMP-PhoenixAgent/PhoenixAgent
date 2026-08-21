@@ -40,6 +40,86 @@ pub struct GpuInfo {
     pub vram_used_mb: Option<u64>,
 }
 
+// ─────────────────────── CUDA error translation ────────────────────────────
+//
+// candle embeds its GPU kernels as PTX and JIT-compiles them through the
+// installed NVIDIA driver at runtime. A driver older than the toolkit that
+// built the binary rejects the PTX with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`
+// — surfacing deep inside a model load with no hint about the actual cause.
+// These helpers turn that (and its close cousins) into an actionable message,
+// and are applied both at backend construction (kernel warm-up) and at model
+// build time as defense in depth.
+
+/// Minimum NVIDIA driver version per CUDA toolkit (Windows). Used to make
+/// PTX-mismatch errors actionable.
+fn min_driver_for(toolkit: &str) -> &'static str {
+    match toolkit {
+        "12.0" => "525.60",
+        "12.1" => "531.14",
+        "12.2" => "536.25",
+        "12.3" => "545.84",
+        "12.4" => "550.54",
+        "12.5" => "555.42",
+        "12.6" => "560.76",
+        "12.7" => "565.57",
+        "12.8" => "570.51",
+        "13.0" => "580.65",
+        _ => "the driver release that shipped with this CUDA version",
+    }
+}
+
+/// The installed driver's CUDA version (e.g. `12080` → `"12.8"`), best-effort.
+fn driver_cuda_version() -> Option<String> {
+    #[cfg(feature = "cuda")]
+    {
+        use candle_core::cuda_backend::cudarc;
+        // SAFETY: cuDriverGetVersion only writes the i32 out-param.
+        let mut v: std::ffi::c_int = 0;
+        let rc = unsafe { cudarc::driver::sys::cuDriverGetVersion(&mut v) };
+        if rc as u32 == 0 && v > 0 {
+            Some(format!("{}.{}", v / 1000, (v % 1000) / 10))
+        } else {
+            None
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    None
+}
+
+/// Expand a CUDA driver-mismatch error into an actionable message. Returns the
+/// original text unchanged for unrelated errors.
+pub fn translate_cuda_error(err: &str) -> String {
+    let ptx = err.contains("UNSUPPORTED_PTX_VERSION") || err.contains("unsupported toolchain");
+    let no_binary = err.contains("NO_BINARY_FOR_GPU") || err.contains("no kernel image");
+    if !ptx && !no_binary {
+        return err.to_string();
+    }
+    let toolkit = option_env!("AMBERCORE_CUDA_TOOLKIT");
+    let driver = driver_cuda_version();
+    let cause = if ptx {
+        "this build's GPU kernels were compiled with a newer CUDA toolkit than \
+         your NVIDIA driver supports"
+    } else {
+        "this build's GPU kernels target a newer GPU generation than the one \
+         installed"
+    };
+    let fix = if ptx {
+        "update your NVIDIA driver (https://www.nvidia.com/drivers), or use the \
+         universal CPU build"
+    } else {
+        "use the universal CPU build (this GPU generation predates the kernels)"
+    };
+    let toolkit_note = toolkit
+        .map(|t| format!("built with CUDA {t} (needs driver {})", min_driver_for(t)))
+        .unwrap_or_else(|| "built with an unknown CUDA toolkit version".into());
+    let driver_note = driver
+        .map(|d| format!("your driver reports CUDA {d}"))
+        .unwrap_or_else(|| "your driver's CUDA version could not be read".into());
+    format!(
+        "{err}\n\nCUDA kernel mismatch: {cause} ({toolkit_note}; {driver_note}). To fix: {fix}."
+    )
+}
+
 /// A compute target. Implementations hand out the candle [`Device`] that models
 /// and tensors live on, and own any device-specific resources or limits.
 pub trait Backend: Send + Sync {
@@ -233,11 +313,30 @@ mod cuda {
 
     impl CudaBackend {
         /// Create a CUDA backend for GPU `ordinal` (0 = first GPU).
+        ///
+        /// Beyond creating the device, this **warms up one kernel immediately**:
+        /// candle JIT-compiles its embedded PTX through the driver at first
+        /// kernel use, so a driver/toolkit skew (the
+        /// `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` a too-old driver produces)
+        /// surfaces HERE — with the translated, actionable message — instead of
+        /// crashing a model load halfway through. Under `auto` the resolver
+        /// catches this and falls back to CPU, so the app still runs.
         pub fn new(ordinal: usize) -> Result<Self> {
             let device = Device::new_cuda(ordinal)
                 .map_err(|e| Error::Backend(format!("CUDA init (ordinal {ordinal}): {e}")))?;
+            warm_up_kernel(&device)
+                .map_err(|e| Error::Backend(translate_cuda_error(&e.to_string())))?;
             Ok(Self { ordinal, device })
         }
+    }
+
+    /// Run one trivial kernel so the PTX modules actually load + JIT now.
+    fn warm_up_kernel(device: &Device) -> std::result::Result<(), candle_core::Error> {
+        use candle_core::Tensor;
+        let a = Tensor::new([1.0f32, 2.0], device)?;
+        let b = Tensor::new([3.0f32, 4.0], device)?;
+        let _ = &a + &b;
+        Ok(())
     }
 
     impl Backend for CudaBackend {
@@ -466,5 +565,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn ptx_mismatch_error_gets_actionable_guidance() {
+        let msg = translate_cuda_error(
+            "DriverError(CUDA_ERROR_UNSUPPORTED_PTX_VERSION, \"the provided PTX was \
+             compiled with an unsupported toolchain.\")",
+        );
+        assert!(msg.contains("update your NVIDIA driver"), "msg was: {msg}");
+        assert!(msg.contains("CUDA kernel mismatch"), "msg was: {msg}");
+    }
+
+    #[test]
+    fn unrelated_cuda_errors_pass_through_unchanged() {
+        let original = "some unrelated driver hiccup";
+        assert_eq!(translate_cuda_error(original), original);
+    }
+
+    #[test]
+    fn min_driver_table_covers_the_shipped_toolkits() {
+        assert_eq!(min_driver_for("12.8"), "570.51");
+        assert!(min_driver_for("42.0").contains("driver release"));
     }
 }

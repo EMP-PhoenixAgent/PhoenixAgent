@@ -217,7 +217,13 @@ impl ServerState {
             let eos_meta = loaded
                 .meta_str(&format!("{arch}.eos_token_id"))
                 .and_then(|s| s.parse::<u32>().ok());
-            let model = build_model(&mut loaded, &device)?;
+            let model = build_model(&mut loaded, &device).map_err(|e| {
+                // Defense in depth: the backend constructor already warms up a
+                // kernel and rejects driver/toolkit skews with the translated
+                // message — this catches any CUDA error that still escapes a
+                // model build (e.g. arch-specific kernel gaps).
+                crate::error::Error::Model(crate::backend::translate_cuda_error(&e.to_string()))
+            })?;
             // Stop tokens: the GGUF's own `<arch>.eos_token_id` plus the
             // per-architecture end-of-turn markers (absent tokens are skipped,
             // so a family's list can include markers only some models carry).

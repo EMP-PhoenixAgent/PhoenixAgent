@@ -93,6 +93,64 @@ fn strip_gguf_suffix(repo: &str) -> Option<&str> {
     None
 }
 
+/// Derive the **per-model folder name** for a pull: the GGUF filename's stem,
+/// sanitized into a safe single path segment. Pulls land in
+/// `<models_dir>/<folder>/<gguf>` with the tokenizer beside it, so every model
+/// owns an isolated folder and models with different vocabularies can never
+/// pick up each other's tokenizer.
+///
+/// Sanitization replaces characters that are illegal (or hostile) in Windows
+/// path segments with `-`, trims leading/trailing dots+spaces, and caps the
+/// length. `"Model?.gguf"` → `"Model-"`.
+pub fn model_folder_name(filename: &str) -> String {
+    let stem = filename
+        .strip_suffix(".gguf")
+        .or_else(|| filename.strip_suffix(".GGUF"))
+        .unwrap_or(filename);
+    let sanitized: String = stem
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
+            c if c.is_control() => '-',
+            c => c,
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches(['.', ' ', '-']).to_string();
+    if trimmed.is_empty() {
+        return "model".to_string();
+    }
+    // Cap the length on a char boundary (Windows MAX_PATH headroom).
+    if trimmed.chars().count() > 80 {
+        trimmed.chars().take(80).collect()
+    } else {
+        trimmed
+    }
+}
+
+/// Detect a **split/sharded GGUF** filename (`…-00001-of-00003.gguf`). AmberCore
+/// loads single-file GGUFs only — shards of big MoE models (mixtral, qwen3moe)
+/// are published this way — so pulls must fail fast with guidance instead of
+/// downloading a partial model that can never load.
+pub fn is_split_gguf(filename: &str) -> bool {
+    let lower = filename.to_ascii_lowercase();
+    let base = lower
+        .strip_suffix(".gguf")
+        .unwrap_or(&lower);
+    let Some(idx) = base.find("-of-") else {
+        return false;
+    };
+    let left = &base[..idx];
+    let right = &base[idx + "-of-".len()..];
+    let left_num = left.rsplit('-').next().unwrap_or("");
+    // Both sides must be the shard counters (≥4 digits, all numeric) — e.g.
+    // `model-00001-of-00002`. Guards against innocuous "-of-" in names
+    // ("best-of-7b" → left_num "best" isn't numeric).
+    left_num.len() >= 4
+        && left_num.bytes().all(|b| b.is_ascii_digit())
+        && right.len() >= 4
+        && right.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Strip everything from the first `?` or `#` onwards.
 fn strip_query_fragment(s: &str) -> &str {
     let cut = s.find(['?', '#']).unwrap_or(s.len());

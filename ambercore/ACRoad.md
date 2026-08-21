@@ -933,3 +933,37 @@ fail at load with a clean error listing the supported set — same honest-refusa
 policy as qwen35. Porting deepseek/kimi (MLA + MoE) is the big remaining item.
 
 Tests: 54 passing (+7: per-template formatting, arch map, mixtral remap).
+
+---
+
+### 2026-08-22 (b) — CUDA driver-mismatch guard + per-model folder layout
+
+**The alpha bug:** a tester on an older NVIDIA driver hit
+`qwen2 from_gguf: DriverError(CUDA_ERROR_UNSUPPORTED_PTX_VERSION, "the
+provided PTX was compiled with an unsupported toolchain.")` mid-model-load.
+Cause: candle embeds its kernels as **PTX** JIT-compiled by the *installed
+driver* at runtime; the build toolkit (12.8 for `-CUDA12.exe`, 13.x for
+`-CUDA.exe`) was newer than the tester's driver, so the JIT refused the PTX.
+
+**Fixes (engine side):**
+1. `build.rs` (new): under the `cuda` feature, records the toolkit version
+   from `nvcc --version` into `AMBERCORE_CUDA_TOOLKIT` at build time.
+2. `CudaBackend::new` now **warms up one kernel immediately** (a 2-element
+   add) — the PTX JIT happens at construction, not at first model load. A
+   mismatch fails with a translated message naming the toolkit, the minimum
+   driver (12.8 → ≥ 570.51, 13.0 → ≥ 580.65, table in `backend.rs`), and the
+   driver's own reported CUDA version (`cuDriverGetVersion`). Under
+   `auto` (the embedded engine's default) the resolver catches it and **falls
+   back to CPU**, so the app still runs — the Telemetry panel shows `cpu`.
+3. Model-build errors get the same translation as defense in depth
+   (`server::build_loaded_entry`).
+4. Note: the PTX targets the build GPU's class (compute 8.6) and JITs forward
+   to newer GPUs (RTX 40/50 fine); pre-Ampere GTX needs the CPU build.
+   Multi-arch PTX would need a candle-kernels fork — deferred.
+
+**Per-model folder layout (catalog):** `Catalog::load` now scans one level of
+subfolders (`<models_dir>/<model>/<model>.gguf`, stored folder-relative in the
+manifest) alongside flat files. Phoenix pulls (v0.8.2+) create the subfolder
+per model, so models with different vocabularies can never share a tokenizer;
+flat layouts keep working. Split/sharded GGUFs are rejected at pull time.
+Tests: 58 (engine) / 31 (Phoenix) green.
