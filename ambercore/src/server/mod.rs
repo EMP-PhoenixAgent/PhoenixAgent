@@ -39,6 +39,22 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// End-of-turn token strings per architecture family. Tokens absent from the
+/// loaded tokenizer are skipped, and the GGUF's `<arch>.eos_token_id` is added
+/// separately (by id, so models with unusual EOS strings still stop).
+fn arch_stop_markers(arch: &str) -> &'static [&'static str] {
+    match arch {
+        "gemma" | "gemma2" | "gemma3" => &["<end_of_turn>", "<|endoftext|>"],
+        "phi2" => &["<|endoftext|>"],
+        "phi3" => &["<|end|>", "<|endoftext|>"],
+        "glm4" => &["<|user|>", "<|observation|>", "<|endoftext|>"],
+        "mixtral" => &["</s>", "<|end_of_text|>"],
+        "llama" => &["<|eot_id|>", "<|end_of_text|>", "</s>", "<|im_end|>"],
+        // qwen2/qwen2_v2/qwen3/qwen3moe/starcoder2/internlm2/lfm2 + default
+        _ => &["<|im_end|>", "<|endoftext|>", "<|end_of_text|>"],
+    }
+}
+
 /// A built model + its tokenizer, ready to serve generation requests.
 ///
 /// Must be `Send` so it can live behind an `Arc<std::sync::Mutex<...>>` shared
@@ -198,13 +214,23 @@ impl ServerState {
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(4096);
             let tokenizer = TokenizerWrapper::load_next_to(&gguf_path)?;
+            let eos_meta = loaded
+                .meta_str(&format!("{arch}.eos_token_id"))
+                .and_then(|s| s.parse::<u32>().ok());
             let model = build_model(&mut loaded, &device)?;
+            // Stop tokens: the GGUF's own `<arch>.eos_token_id` plus the
+            // per-architecture end-of-turn markers (absent tokens are skipped,
+            // so a family's list can include markers only some models carry).
             let mut stop_tokens = Vec::new();
-            if let Some(id) = tokenizer.token_to_id("<|im_end|>") {
+            if let Some(id) = eos_meta {
                 stop_tokens.push(id);
             }
-            if let Some(id) = tokenizer.token_to_id("<|endoftext|>") {
-                stop_tokens.push(id);
+            for marker in arch_stop_markers(&arch) {
+                if let Some(id) = tokenizer.token_to_id(marker) {
+                    if !stop_tokens.contains(&id) {
+                        stop_tokens.push(id);
+                    }
+                }
             }
             tracing::info!(tag = %tag_owned, arch = %arch, backend = %backend_name, context_length, "model replica ready");
             Ok(LoadedEntry {

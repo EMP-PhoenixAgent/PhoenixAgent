@@ -1,14 +1,17 @@
-//! Qwen3 / Qwen3.5 architecture.
+//! Qwen3 architecture.
 //!
 //! Wraps [`candle_transformers::models::quantized_qwen3::ModelWeights`] — the
-//! quantized (GGUF) Qwen3 implementation. Qwen3.5 reuses the Qwen3 architecture,
-//! so GGUFs reporting `general.architecture = "qwen35"` route here.
+//! quantized (GGUF) Qwen3 implementation (per-head q/k RMSNorm, no
+//! self-resetting KV cache).
+//!
+//! **Qwen3.5 (`qwen35`) does NOT route here** — it is a hybrid SSM whose
+//! tensor layout (`ssm_*`, fused `attn_qkv`, no `ffn_norm`) needs kernels
+//! candle doesn't have; the registry rejects it cleanly as an unsupported
+//! architecture (see the NOTE in [`registry`](super::registry)).
 //!
 //! The model is built via `ModelWeights::from_gguf(content, &mut file, device)`,
 //! same shape as qwen2. Each [`forward`](DynModel::forward) call returns
 //! last-position logits `[batch, vocab]`.
-//!
-//! [`candle_transformers::models::quantized_qwen3`]: https://docs.rs/candle-transformers/latest/candle_transformers/models/quantized_qwen3/index.html
 
 use crate::error::{Error, Result};
 use crate::model::gguf::LoadedModel;
@@ -46,32 +49,9 @@ impl DynModel for Qwen3Model {
 /// Registry entry point: construct a Qwen3 model from a loaded GGUF.
 ///
 /// Consumes `loaded.content` and reads tensor data from `loaded.file`.
-///
-/// **Qwen3.5 key remap:** Qwen3.5 GGUFs report `general.architecture = "qwen35"`
-/// and namespace their metadata keys as `qwen35.*`, but candle's
-/// `quantized_qwen3::ModelWeights::from_gguf` reads the `qwen3.*` prefix
-/// (hardcoded). We remap `qwen35.` → `qwen3.` in the metadata map before
-/// handing the content to candle, so Qwen3.5 GGUFs load correctly.
 pub fn build(loaded: &mut LoadedModel, device: &Device) -> Result<Box<dyn DynModel>> {
-    let mut content = loaded.take_content()?;
+    let content = loaded.take_content()?;
     let arch = loaded.arch.clone();
-
-    // Remap qwen35.* → qwen3.* so candle's qwen3 builder finds its keys.
-    if arch == "qwen35" {
-        let remapped: Vec<(String, candle_core::quantized::gguf_file::Value)> = content
-            .metadata
-            .iter()
-            .filter_map(|(k, v)| {
-                k.strip_prefix("qwen35.")
-                    .map(|suffix| (format!("qwen3.{suffix}"), v.clone()))
-            })
-            .collect();
-        for (k, v) in remapped {
-            content.metadata.insert(k, v);
-        }
-        tracing::debug!("qwen3.5: remapped qwen35.* metadata keys to qwen3.*");
-    }
-
     let inner = Qwen3::from_gguf(content, &mut loaded.file, device)
         .map_err(|e| Error::Model(format!("qwen3 from_gguf: {e}")))?;
     Ok(Box::new(Qwen3Model { arch, inner }))

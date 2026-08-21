@@ -26,7 +26,7 @@ use crate::error::{Error, Result};
 use crate::pipeline::{Pipeline, SampleParams, StopCondition};
 use crate::server::protocol::{ChatChunk, ChatRequest, ToolCall};
 use crate::server::ServerState;
-use crate::tokenizer::{format_qwen_chatml, ChatTurn, Role};
+use crate::tokenizer::{format_chat_prompt, pick_template, ChatTurn, Role};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -108,20 +108,27 @@ pub async fn generate_events(
     //    queue fairly if the pool is at capacity).
     let handle = state.acquire_replica(&req.model).await?;
 
-    // 2. Map messages → ChatML turns → prompt string.
+    // 2. Map messages → chat turns → prompt string, formatted with the
+    //    template the model's architecture was trained on (ChatML for Qwen,
+    //    Gemma/Phi3/GLM4/Llama3/Mistral for their families — `llama` is
+    //    disambiguated from the tokenizer's special tokens).
     //    If tools were supplied, render them into the system prompt (Hermes
     //    format) so the model knows how to emit calls.
     let turns = to_chat_turns(&req.messages);
     if turns.is_empty() {
         return Err(Error::InvalidInput("chat request has no messages".into()));
     }
+    let template = {
+        let replica = handle.replica().lock().unwrap();
+        pick_template(&replica.arch, &replica.tokenizer)
+    };
     let tools_section = crate::server::tools::render_tools_section(&req.tools);
     let system = if tools_section.is_empty() {
         None
     } else {
         Some(tools_section.leak() as &'static str)
     };
-    let prompt = format_qwen_chatml(&turns, system);
+    let prompt = format_chat_prompt(template, &turns, system);
     let has_tools = !req.tools.is_empty();
 
     // 3. Sampler params + stop condition. No max-tokens cap — AmberCore is fully

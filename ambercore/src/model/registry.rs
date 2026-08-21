@@ -46,7 +46,40 @@ pub trait DynModel: Send {
 /// Architectures [`build`] can construct — the single source of truth shared
 /// by load-time dispatch and pull-time validation (Phoenix rejects a download
 /// whose architecture isn't in this list before registering it).
-pub const SUPPORTED_ARCHS: &[&str] = &["qwen2", "qwen2_v2", "qwen3", "llama"];
+///
+/// Families:
+/// - **Qwen**: `qwen2` (Qwen2/2.5), `qwen2_v2`, `qwen3`, `qwen3moe`
+///   (Qwen3-30B-A3B & friends)
+/// - **Llama family**: `llama` (Llama 1/2/3, Mistral-7B conversions,
+///   TinyLlama, Yi, SmolLM, ...), `mixtral` (sparse MoE; via llama's MoE path)
+/// - **Gemma**: `gemma`, `gemma2`, `gemma3`
+/// - **Phi**: `phi2` (Phi-2), `phi3` (Phi-3 **and Phi-4**, which converts
+///   with the phi3 arch)
+/// - **GLM**: `glm4`
+/// - **Liquid**: `lfm2`
+/// - **Qwen2-layout relatives**: `starcoder2`, `internlm2` (metadata remap)
+///
+/// Known-but-unsupported (hybrid attention / MLA MoE — candle lacks the
+/// kernels, same class of gap as qwen35): `qwen35`, `deepseek2`/`deepseek_v3`,
+/// `kimi_k2`/`kimi_linear`, `gemma3n`, `granite`, `olmo`/`olmo2`, `nemotron`,
+/// `exaone`, `hunyuan`, `internlm3`(?), `llama4`, `mistral3`, `starcoder`.
+pub const SUPPORTED_ARCHS: &[&str] = &[
+    "qwen2",
+    "qwen2_v2",
+    "qwen3",
+    "qwen3moe",
+    "llama",
+    "mixtral",
+    "gemma",
+    "gemma2",
+    "gemma3",
+    "phi2",
+    "phi3",
+    "glm4",
+    "lfm2",
+    "starcoder2",
+    "internlm2",
+];
 
 /// Whether an architecture string (a GGUF's `general.architecture`) can be
 /// built by this registry.
@@ -60,15 +93,25 @@ pub fn is_supported(arch: &str) -> bool {
 /// from `loaded` and reads tensor data from its file handle.
 pub fn build(loaded: &mut LoadedModel, device: &Device) -> Result<Box<dyn DynModel>> {
     match loaded.arch.as_str() {
-        "qwen2" | "qwen2_v2" => crate::model::qwen2::build(loaded, device),
+        "qwen2" | "qwen2_v2" | "starcoder2" | "internlm2" => {
+            crate::model::qwen2::build(loaded, device)
+        }
         // NOTE: `qwen35` (Qwen3.5 hybrid SSM) is NOT qwen3-compatible — its
         // tensor layout (`ssm_*`, fused `attn_qkv`, `post_attention_norm`, no
         // `ffn_norm`) needs kernels candle doesn't have. It must fail as
         // "unsupported architecture", not crash inside the qwen3 builder.
         "qwen3" => crate::model::qwen3::build(loaded, device),
+        "qwen3moe" => crate::model::qwen3_moe::build(loaded, device),
         "llama" => crate::model::llama::build(loaded, device),
+        "mixtral" => crate::model::mixtral::build(loaded, device),
+        "gemma" | "gemma2" | "gemma3" => crate::model::gemma::build(loaded, device),
+        "phi2" | "phi3" => crate::model::phi::build(loaded, device),
+        "glm4" => crate::model::glm4::build(loaded, device),
+        "lfm2" => crate::model::lfm2::build(loaded, device),
         other => Err(Error::Model(format!(
-            "unsupported architecture: {other} (register it in src/model/registry.rs)"
+            "unsupported architecture: {other} (supported: {}; hybrid/MLA families like \
+             qwen35, deepseek, and kimi are not supported yet — see registry.rs)",
+            SUPPORTED_ARCHS.join(", ")
         ))),
     }
 }
@@ -102,8 +145,14 @@ mod tests {
         for arch in SUPPORTED_ARCHS {
             assert!(is_supported(arch), "{arch} should be supported");
         }
-        // Qwen3.5 hybrid — deliberately NOT supported (see build's NOTE).
-        assert!(!is_supported("qwen35"));
+        // Spot-check the newly added families.
+        for arch in ["gemma3", "phi3", "glm4", "mixtral", "qwen3moe", "llama", "starcoder2"] {
+            assert!(is_supported(arch), "{arch} should be supported");
+        }
+        // Hybrid-SSM / MLA families — deliberately NOT supported (see build's NOTE).
+        for arch in ["qwen35", "deepseek2", "deepseek_v3", "kimi_k2", "kimi_linear", "gemma3n"] {
+            assert!(!is_supported(arch), "{arch} must stay unsupported");
+        }
         assert!(!is_supported(""));
     }
 

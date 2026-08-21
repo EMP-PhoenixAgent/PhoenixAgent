@@ -247,6 +247,238 @@ pub fn format_qwen_chatml(turns: &[ChatTurn], default_system: Option<&str>) -> S
     out
 }
 
+// ─────────────────────── per-architecture chat templates ────────────────────
+//
+// Different model families are trained on different chat markups; using the
+// wrong one degrades output badly. These formats follow the vendors' official
+// templates (the same ones llama.cpp hardcodes per arch).
+
+/// The chat prompt format a model family was trained on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatTemplate {
+    /// `<|im_start|>role\n…<|im_end|>` — Qwen, StarCoder2-ChatML, InternLM2,
+    /// Hermes-style Llama finetunes, LFM2.
+    ChatMl,
+    /// `<start_of_turn>user/model … <end_of_turn>` — Gemma 1/2/3. No system
+    /// role: a system turn is folded into the first user turn.
+    Gemma,
+    /// `<|user|>…<|end|>` / `<|assistant|>…<|end|>` — Phi-3 and Phi-4.
+    Phi3,
+    /// `[gMASK]<sop><|user|>…<|assistant|>` — GLM-4.
+    Glm4,
+    /// `[INST] … [/INST]` — Mixtral and Llama-2-style conversions.
+    MistralInst,
+    /// `<|start_header_id|>role<|end_header_id|>` — Llama-3.
+    Llama3,
+}
+
+impl ChatTemplate {
+    /// The template an architecture trains on. `"llama"` is ambiguous
+    /// (Llama-2, Llama-3, Mistral conversions and ChatML finetunes all report
+    /// the `llama` arch) — [`pick_template`] resolves it from the tokenizer.
+    pub fn default_for_arch(arch: &str) -> ChatTemplate {
+        match arch {
+            "gemma" | "gemma2" | "gemma3" => ChatTemplate::Gemma,
+            "phi3" => ChatTemplate::Phi3,
+            "glm4" => ChatTemplate::Glm4,
+            "mixtral" => ChatTemplate::MistralInst,
+            // qwen2/qwen2_v2/qwen3/qwen3moe/phi2/starcoder2/internlm2/lfm2 + default
+            _ => ChatTemplate::ChatMl,
+        }
+    }
+}
+
+/// Disambiguate the `llama` arch using the tokenizer's special tokens (BOS is
+/// added by the tokenizer itself; only the chat markup differs here).
+fn resolve_llama_family(tok: &TokenizerWrapper) -> ChatTemplate {
+    if tok.token_to_id("<|start_header_id|>").is_some() {
+        ChatTemplate::Llama3
+    } else if tok.token_to_id("<|im_start|>").is_some() {
+        ChatTemplate::ChatMl
+    } else {
+        // Llama-2 / Mistral conversions speak [INST].
+        ChatTemplate::MistralInst
+    }
+}
+
+/// Pick the chat template for a loaded model: per-arch default, with the
+/// ambiguous `llama` arch resolved from the tokenizer's special tokens.
+pub fn pick_template(arch: &str, tok: &TokenizerWrapper) -> ChatTemplate {
+    if arch == "llama" {
+        resolve_llama_family(tok)
+    } else {
+        ChatTemplate::default_for_arch(arch)
+    }
+}
+
+/// Format chat turns with the given template. Same contract as
+/// [`format_qwen_chatml`]: an open-ended assistant prime ends the prompt, and
+/// `default_system` (e.g. the rendered tools section) overrides the family's
+/// default system handling.
+pub fn format_chat_prompt(
+    template: ChatTemplate,
+    turns: &[ChatTurn],
+    default_system: Option<&str>,
+) -> String {
+    match template {
+        ChatTemplate::ChatMl => format_qwen_chatml(turns, default_system),
+        ChatTemplate::Gemma => format_gemma_chat(turns, default_system),
+        ChatTemplate::Phi3 => format_phi3_chat(turns, default_system),
+        ChatTemplate::Glm4 => format_glm4_chat(turns, default_system),
+        ChatTemplate::MistralInst => format_mistral_inst(turns, default_system),
+        ChatTemplate::Llama3 => format_llama3_chat(turns, default_system),
+    }
+}
+
+/// Extract the system text (an explicit system turn or `default_system`),
+/// if any.
+fn system_text(turns: &[ChatTurn], default_system: Option<&str>) -> Option<String> {
+    turns
+        .iter()
+        .find(|t| matches!(t.role, Role::System))
+        .map(|t| t.content.clone())
+        .or_else(|| default_system.map(|s| s.to_string()))
+}
+
+/// Gemma: no system role — a system is folded into the first user turn.
+/// `<start_of_turn>user\n…<end_of_turn>\n` / `<start_of_turn>model\n…<end_of_turn>\n`,
+/// primed with an open `<start_of_turn>model\n`.
+fn format_gemma_chat(turns: &[ChatTurn], default_system: Option<&str>) -> String {
+    let system = system_text(turns, default_system);
+    let mut out = String::new();
+    let mut first_user_seen = false;
+    for turn in turns {
+        match turn.role {
+            Role::System => {}
+            Role::User => {
+                out.push_str("<start_of_turn>user\n");
+                if !first_user_seen {
+                    first_user_seen = true;
+                    if let Some(sys) = &system {
+                        out.push_str(sys);
+                        out.push_str("\n\n");
+                    }
+                }
+                out.push_str(&turn.content);
+                out.push_str("<end_of_turn>\n");
+            }
+            Role::Assistant => {
+                out.push_str("<start_of_turn>model\n");
+                out.push_str(&turn.content);
+                out.push_str("<end_of_turn>\n");
+            }
+        }
+    }
+    out.push_str("<start_of_turn>model\n");
+    out
+}
+
+/// Phi-3/Phi-4: `<|role|>\n…<|end|>\n`, primed with `<|assistant|>\n`.
+fn format_phi3_chat(turns: &[ChatTurn], default_system: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(sys) = system_text(turns, default_system) {
+        out.push_str("<|system|>\n");
+        out.push_str(&sys);
+        out.push_str("<|end|>\n");
+    }
+    for turn in turns {
+        if matches!(turn.role, Role::System) {
+            continue;
+        }
+        let tag = match turn.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::System => unreachable!(),
+        };
+        out.push_str(&format!("<|{tag}|>\n{}<|end|>\n", turn.content));
+    }
+    out.push_str("<|assistant|>\n");
+    out
+}
+
+/// GLM-4: `[gMASK]<sop>` once, then `<|system|>\n…`/`<|user|>\n…`/`<|assistant|>\n…`
+/// blocks (assistant replies are NOT terminated — the next `<|user|>` closes
+/// them), primed with `<|assistant|>\n`.
+fn format_glm4_chat(turns: &[ChatTurn], default_system: Option<&str>) -> String {
+    let mut out = String::from("[gMASK]<sop>");
+    if let Some(sys) = system_text(turns, default_system) {
+        out.push_str(&format!("<|system|>\n{sys}"));
+    }
+    for turn in turns {
+        match turn.role {
+            Role::System => {}
+            Role::User => out.push_str(&format!("<|user|>\n{}", turn.content)),
+            Role::Assistant => out.push_str(&format!("<|assistant|>\n{}", turn.content)),
+        }
+    }
+    out.push_str("<|assistant|>\n");
+    out
+}
+
+/// Mistral / Llama-2: `[INST] … [/INST]` with the system folded into the first
+/// instruction; prior assistant replies close with `</s>`.
+fn format_mistral_inst(turns: &[ChatTurn], default_system: Option<&str>) -> String {
+    let system = system_text(turns, default_system);
+    let mut out = String::new();
+    let mut first_user_seen = false;
+    let mut pending_open_inst = false;
+    for turn in turns {
+        match turn.role {
+            Role::System => {}
+            Role::User => {
+                out.push_str("[INST] ");
+                if !first_user_seen {
+                    first_user_seen = true;
+                    if let Some(sys) = &system {
+                        out.push_str(sys);
+                        out.push_str("\n\n");
+                    }
+                }
+                out.push_str(&turn.content);
+                out.push_str(" [/INST]");
+                pending_open_inst = true;
+            }
+            Role::Assistant => {
+                if pending_open_inst {
+                    out.push(' ');
+                    pending_open_inst = false;
+                }
+                out.push_str(&turn.content);
+                out.push_str("</s>");
+            }
+        }
+    }
+    out
+}
+
+/// Llama-3: `<|start_header_id|>role<|end_header_id|>\n\n…<|eot_id|>` blocks,
+/// primed with the assistant header. `<|begin_of_text|>` is intentionally not
+/// emitted — the tokenizer's post-processor adds BOS on encode.
+fn format_llama3_chat(turns: &[ChatTurn], default_system: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(sys) = system_text(turns, default_system) {
+        out.push_str(&format!(
+            "<|start_header_id|>system<|end_header_id|>\n\n{sys}<|eot_id|>"
+        ));
+    }
+    for turn in turns {
+        if matches!(turn.role, Role::System) {
+            continue;
+        }
+        let role = match turn.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::System => unreachable!(),
+        };
+        out.push_str(&format!(
+            "<|start_header_id|>{role}<|end_header_id|>\n\n{}<|eot_id|>",
+            turn.content
+        ));
+    }
+    out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +542,94 @@ mod tests {
         assert!(prompt.contains("<|im_start|>assistant\nHi there<|im_end|>"));
         // And the final assistant prime is open-ended.
         assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn default_for_arch_maps_each_family() {
+        assert_eq!(ChatTemplate::default_for_arch("qwen2"), ChatTemplate::ChatMl);
+        assert_eq!(ChatTemplate::default_for_arch("qwen3"), ChatTemplate::ChatMl);
+        assert_eq!(ChatTemplate::default_for_arch("qwen3moe"), ChatTemplate::ChatMl);
+        assert_eq!(ChatTemplate::default_for_arch("starcoder2"), ChatTemplate::ChatMl);
+        assert_eq!(ChatTemplate::default_for_arch("gemma"), ChatTemplate::Gemma);
+        assert_eq!(ChatTemplate::default_for_arch("gemma3"), ChatTemplate::Gemma);
+        assert_eq!(ChatTemplate::default_for_arch("phi3"), ChatTemplate::Phi3);
+        assert_eq!(ChatTemplate::default_for_arch("glm4"), ChatTemplate::Glm4);
+        assert_eq!(ChatTemplate::default_for_arch("mixtral"), ChatTemplate::MistralInst);
+    }
+
+    #[test]
+    fn gemma_template_folds_system_into_first_user_turn() {
+        let prompt = format_chat_prompt(
+            ChatTemplate::Gemma,
+            &[
+                ChatTurn { role: Role::System, content: "Be terse.".into() },
+                ChatTurn { role: Role::User, content: "Hi".into() },
+            ],
+            None,
+        );
+        assert!(prompt.contains("<start_of_turn>user\nBe terse.\n\nHi<end_of_turn>"));
+        assert!(prompt.ends_with("<start_of_turn>model\n"));
+        assert!(!prompt.contains("<start_of_turn>system"));
+    }
+
+    #[test]
+    fn phi3_template_uses_end_markers_and_assistant_prime() {
+        let prompt = format_chat_prompt(
+            ChatTemplate::Phi3,
+            &[
+                ChatTurn { role: Role::System, content: "Be terse.".into() },
+                ChatTurn { role: Role::User, content: "Hi".into() },
+            ],
+            None,
+        );
+        assert!(prompt.contains("<|system|>\nBe terse.<|end|>"));
+        assert!(prompt.contains("<|user|>\nHi<|end|>"));
+        assert!(prompt.ends_with("<|assistant|>\n"));
+    }
+
+    #[test]
+    fn glm4_template_uses_gmask_sop_prefix() {
+        let prompt = format_chat_prompt(
+            ChatTemplate::Glm4,
+            &[ChatTurn { role: Role::User, content: "Hi".into() }],
+            Some("Be terse."),
+        );
+        assert!(prompt.starts_with("[gMASK]<sop><|system|>\nBe terse."));
+        assert!(prompt.contains("<|user|>\nHi"));
+        assert!(prompt.ends_with("<|assistant|>\n"));
+    }
+
+    #[test]
+    fn mistral_template_wraps_users_in_inst() {
+        let prompt = format_chat_prompt(
+            ChatTemplate::MistralInst,
+            &[
+                ChatTurn { role: Role::User, content: "Hello".into() },
+                ChatTurn { role: Role::Assistant, content: "Hi".into() },
+                ChatTurn { role: Role::User, content: "Bye".into() },
+            ],
+            Some("Be terse."),
+        );
+        // System folded into the first instruction.
+        assert!(prompt.contains("[INST] Be terse.\n\nHello [/INST] Hi</s>"));
+        // Final turn: an open instruction awaiting the reply.
+        assert!(prompt.ends_with("Bye [/INST]"));
+    }
+
+    #[test]
+    fn llama3_template_uses_headers_and_eot() {
+        let prompt = format_chat_prompt(
+            ChatTemplate::Llama3,
+            &[
+                ChatTurn { role: Role::System, content: "Be terse.".into() },
+                ChatTurn { role: Role::User, content: "Hi".into() },
+            ],
+            None,
+        );
+        assert!(prompt.contains("<|start_header_id|>system<|end_header_id|>\n\nBe terse.<|eot_id|>"));
+        assert!(prompt.contains("<|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>"));
+        assert!(prompt.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+        // BOS is left to the tokenizer's post-processor.
+        assert!(!prompt.contains("<|begin_of_text|>"));
     }
 }

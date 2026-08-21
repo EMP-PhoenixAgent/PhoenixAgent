@@ -897,3 +897,39 @@ and the **server copy still carried the buggy `"qwen3" | "qwen35"` mapping**
 fixed 2026-08-20. Verified there are no intentional per-copy differences
 (identical Cargo.toml/features), then synced everything to the embedded tree
 as the single source of truth. `cargo test` green in the synced copies.
+
+---
+
+### 2026-08-22 — architecture expansion: 15 archs (gemma, phi, glm4, mixtral, llama, MoE, ...)
+
+AmberCore went from 4 architectures (qwen2, qwen2_v2, qwen3, llama-stub) to
+**15 fully working ones**, all pure Rust on candle 0.11:
+
+| Family | Arch strings | Path |
+|---|---|---|
+| Qwen | `qwen2`, `qwen2_v2`, `qwen3` | candle direct (unchanged) |
+| Qwen MoE | `qwen3moe` | **ported copy** of candle's quantized_qwen3_moe + the KV-cache clear candle 0.11 lacks (same replica-reuse bug class as dense qwen3) |
+| Llama | `llama` | candle quantized_llama — **the old stub now really loads** (Llama 1/2/3, Mistral-7B conversions, TinyLlama, Yi, SmolLM) |
+| Mixtral | `mixtral` | metadata remap `mixtral.*`→`llama.*` into candle llama's **MoE path** (router `ffn_gate_inp` + per-expert FFNs; 8x7B / 8x22B) |
+| Gemma | `gemma`, `gemma2`, `gemma3` | candle quantized_gemma3 (probes all three prefixes itself) |
+| Phi | `phi2`, `phi3` | candle quantized_phi / quantized_phi3 — **`phi3` also covers Phi-4** (converts with the phi3 arch incl. long-rope) |
+| GLM | `glm4` | candle quantized_glm4 (F32) |
+| Liquid | `lfm2` | candle quantized_lfm2 |
+| Qwen2-layout | `starcoder2`, `internlm2` | metadata remap into candle qwen2 (same tensors, different namespace) |
+
+**Chat templates per family** (`tokenizer.rs`): ChatML (Qwen + relatives),
+Gemma (`<start_of_turn>`, system folded into first user turn), Phi3
+(`<|user|>…<|end|>`), GLM4 (`[gMASK]<sop>`), Mistral/Llama-2 (`[INST]`),
+Llama-3 (headers + `<|eot_id>`). The ambiguous `llama` arch resolves its
+template from the tokenizer's special tokens (`<|start_header_id|>` → Llama3,
+`<|im_start|>` → ChatML/Hermes, else `[INST]`). **Stop tokens are arch-aware
+now**: the GGUF's `<arch>.eos_token_id` (by id) + per-family markers
+(`<end_of_turn>`, `<|end|>`, `<|user|>`/`<|observation|>`, `<|eot_id|>`, `</s>`).
+
+**Still unsupported, by design** (hybrid-SSM / MLA-MoE families candle has no
+kernels for): `qwen35`, `deepseek2`/`deepseek_v3`, `kimi_k2`/`kimi_linear`,
+`gemma3n`, `granite`, `olmo`, `nemotron`, `exaone`, `hunyuan`, `llama4`. They
+fail at load with a clean error listing the supported set — same honest-refusal
+policy as qwen35. Porting deepseek/kimi (MLA + MoE) is the big remaining item.
+
+Tests: 54 passing (+7: per-template formatting, arch map, mixtral remap).
