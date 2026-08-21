@@ -145,11 +145,19 @@ pub struct Usage {
 }
 
 /// Live provider stats surfaced to the UI (e.g. the health bar). Backends that
-/// don't expose throughput (Ollama) return `None` from [`ModelProvider::stats`].
-#[derive(Debug, Clone, Default)]
+/// don't expose throughput (Ollama) return `None` from [`ModelProvider::stats`];
+/// the dispatch layer fills the timing fields for every backend by timing the
+/// event stream itself.
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ProviderStats {
     /// Last measured generation throughput in tokens/second.
     pub tokens_per_sec: Option<f64>,
+    /// Time to first token of the last completed turn, in milliseconds.
+    pub ttft_ms: Option<f64>,
+    /// Average time between tokens of the last completed turn, in milliseconds.
+    pub tbt_avg_ms: Option<f64>,
+    /// True while at least one generation is in flight.
+    pub busy: bool,
 }
 
 /// Events streamed from the model as it generates a turn.

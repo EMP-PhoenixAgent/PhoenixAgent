@@ -212,6 +212,7 @@ impl ModelProvider for EmbeddedAmberCore {
             .await
             .map(|tps| ProviderStats {
                 tokens_per_sec: Some(tps),
+                ..Default::default()
             })
     }
 }

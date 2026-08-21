@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{watch, Mutex};
 
-use super::events::Forwarders;
+use super::events::{Forwarders, MODEL_CHANGED_EVENT};
 use super::state::WebState;
 use crate::agent::runtime::{McpConnectionSpec, ToolSpec};
 use crate::agent::skills as skill_helpers;
@@ -38,6 +38,15 @@ pub struct UnlockResult {
 #[tauri::command]
 pub async fn is_initialized(state: State<'_, WebState>) -> Result<bool, String> {
     Ok(state.paths.db_path.exists())
+}
+
+/// Whether the app was built in debug/dev mode. The frontend uses this to
+/// auto-unlock during `cargo tauri dev` so iteration doesn't require retyping
+/// the launch password. Stripped from release builds (`cfg!(debug_assertions)`
+/// is false in release).
+#[tauri::command]
+pub async fn is_dev() -> bool {
+    cfg!(debug_assertions)
 }
 
 /// The default "database access password" — the secret that derives the
@@ -943,9 +952,14 @@ pub struct ActiveRouteInfo {
 pub async fn get_active_route(
     state: State<'_, WebState>,
 ) -> Result<ActiveRouteInfo, String> {
+    Ok(active_route_info(&state).await)
+}
+
+/// Build the current route + model snapshot (shared by `get_active_route` and
+/// the `model-changed` event payload).
+async fn active_route_info(state: &WebState) -> ActiveRouteInfo {
     let cfg = state.config.lock().await;
-    let route = state.provider.route().await;
-    let info = match route {
+    match state.provider.route().await {
         ActiveRoute::Local { backend } => ActiveRouteInfo {
             kind: "local".into(),
             backend: Some(backend.as_str().into()),
@@ -958,8 +972,7 @@ pub async fn get_active_route(
             provider_id: Some(route.provider_id),
             model: cfg.model.clone(),
         },
-    };
-    Ok(info)
+    }
 }
 
 /// An AmberCore model row (blue box). Metadata is read from disk since AmberCore's
@@ -1323,6 +1336,7 @@ fn derive_ambercore_tag(filename: &str) -> String {
 /// the active model. The "Run" semantics for the AmberCore box.
 #[tauri::command]
 pub async fn run_ambercore(
+    app: AppHandle,
     state: State<'_, WebState>,
     model_tag: String,
 ) -> Result<(), String> {
@@ -1356,7 +1370,7 @@ pub async fn run_ambercore(
         state.provider.set_local_embedded().await;
     }
     // 3. Switch the active model.
-    apply_model(&state, model_tag.clone()).await?;
+    apply_model(&app, &state, model_tag.clone()).await?;
     // 4. Warm the model into the embedded engine's pool (background — loads the
     //    GGUF so the first message doesn't pay the cold-start). No-op remotely.
     if !remote {
@@ -1622,6 +1636,7 @@ pub async fn install_ollama(state: State<'_, WebState>) -> Result<String, String
 /// the active model. The "Run" semantics for the Ollama box.
 #[tauri::command]
 pub async fn run_ollama(
+    app: AppHandle,
     state: State<'_, WebState>,
     model: String,
 ) -> Result<(), String> {
@@ -1642,7 +1657,7 @@ pub async fn run_ollama(
         clone.ollama_url.clone()
     };
     state.provider.set_local(LocalBackend::Ollama, local_url).await;
-    apply_model(&state, model).await?;
+    apply_model(&app, &state, model).await?;
     Ok(())
 }
 
@@ -1754,6 +1769,7 @@ pub async fn get_provider_key(
 /// semantics for the red box.
 #[tauri::command]
 pub async fn run_provider(
+    app: AppHandle,
     state: State<'_, WebState>,
     provider_id: i64,
     model: Option<String>,
@@ -1803,7 +1819,7 @@ pub async fn run_provider(
             }
         }
     };
-    apply_model(&state, model).await?;
+    apply_model(&app, &state, model).await?;
     Ok(())
 }
 
@@ -1830,6 +1846,15 @@ pub async fn get_health(state: State<'_, WebState>) -> Result<health::HealthStat
     Ok(state.health.lock().await.clone())
 }
 
+/// Live runtime metrics (T/s, TTFT, TBT, busy) measured at the dispatch layer
+/// for the health bar. Works for every backend, not just AmberCore.
+#[tauri::command]
+pub async fn get_runtime_metrics(
+    state: State<'_, WebState>,
+) -> Result<crate::model::ProviderStats, String> {
+    Ok(state.provider.merged_stats().await)
+}
+
 // ---- Science Workbench: models, profiles, workdir ---------------------
 
 /// Switch the active model live. Persists the choice to `config.toml` so it
@@ -1837,15 +1862,17 @@ pub async fn get_health(state: State<'_, WebState>) -> Result<health::HealthStat
 /// tells the agent runtime to use the new model from the next turn.
 #[tauri::command]
 pub async fn set_model(
+    app: AppHandle,
     state: State<'_, WebState>,
     model: String,
 ) -> Result<(), String> {
-    apply_model(&state, model).await
+    apply_model(&app, &state, model).await
 }
 
 /// Shared model-switch implementation (used by `set_model` and the `run_*`
-/// commands). Persists the model, notifies the health monitor + runtime.
-async fn apply_model(state: &WebState, model: String) -> Result<(), String> {
+/// commands). Persists the model, notifies the health monitor + runtime, and
+/// emits `model-changed` so every model selector in the UI stays in sync.
+async fn apply_model(app: &AppHandle, state: &WebState, model: String) -> Result<(), String> {
     // 1. Persist to config.toml.
     {
         let mut cfg = state.config.lock().await;
@@ -1866,9 +1893,16 @@ async fn apply_model(state: &WebState, model: String) -> Result<(), String> {
         Some(sender) => sender
             .send(Command::SetModel { model })
             .await
-            .map_err(|e| format!("Agent channel closed: {e}")),
-        None => Err("Not unlocked yet".into()),
+            .map_err(|e| format!("Agent channel closed: {e}"))?,
+        None => return Err("Not unlocked yet".into()),
     }
+    drop(tx);
+
+    // 4. Notify the UI: the chat model selector and the Models panel both
+    //    re-render from this one event (two-way sync).
+    let info = active_route_info(state).await;
+    let _ = app.emit(MODEL_CHANGED_EVENT, &info);
+    Ok(())
 }
 
 /// List all profiles (for the sidebar profile selector).

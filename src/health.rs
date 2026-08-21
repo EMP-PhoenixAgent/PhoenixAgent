@@ -142,13 +142,24 @@ async fn probe_all(
             let ollama = ComponentStatus::Ok(format!("{} model(s)", models.len()));
             let has = models.iter().any(|m| m == model);
             let model_status = if has {
-                // If the backend exposes throughput stats (AmberCore), append
-                // tokens/sec to the model detail so it shows in the health bar.
+                // Append live runtime metrics (tokens/sec, TTFT, TBT) to the
+                // model detail so they surface in the health bar tooltip.
                 let mut detail = model.to_string();
                 if let Some(stats) = provider.stats().await {
                     if let Some(tps) = stats.tokens_per_sec {
                         detail.push_str(&format!(" · {tps:.1} T/s"));
                     }
+                    if let Some(ttft) = stats.ttft_ms {
+                        detail.push_str(&format!(" · TTFT {ttft:.0} ms"));
+                    }
+                    if let Some(tbt) = stats.tbt_avg_ms {
+                        detail.push_str(&format!(" · TBT {tbt:.1} ms"));
+                    }
+                    detail.push_str(if stats.busy {
+                        " · generating"
+                    } else {
+                        " · idle"
+                    });
                 }
                 ComponentStatus::Ok(detail)
             } else {

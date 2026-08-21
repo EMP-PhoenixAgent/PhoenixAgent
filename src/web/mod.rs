@@ -39,6 +39,7 @@ pub fn run(config: Config, paths: Paths, workdir: std::path::PathBuf) -> Result<
         })
         .invoke_handler(tauri::generate_handler![
             commands::is_initialized,
+            commands::is_dev,
             commands::setup,
             commands::unlock,
             commands::send_message,
@@ -60,6 +61,7 @@ pub fn run(config: Config, paths: Paths, workdir: std::path::PathBuf) -> Result<
             commands::list_sessions,
             commands::list_models,
             commands::get_health,
+            commands::get_runtime_metrics,
             // GGUF inventory (Models panel)
             commands::scan_gguf_directory,
             commands::get_gguf_directory,

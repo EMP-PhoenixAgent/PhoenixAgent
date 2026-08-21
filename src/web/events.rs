@@ -15,6 +15,9 @@ use crate::health::HealthState;
 pub const AGENT_EVENT: &str = "agent-event";
 /// Name of the Tauri event carrying health updates to the frontend.
 pub const HEALTH_EVENT: &str = "health-update";
+/// Emitted whenever the active model/route changes (`set_model` + the `run_*`
+/// commands) so the chat model selector and the Models panel stay in sync.
+pub const MODEL_CHANGED_EVENT: &str = "model-changed";
 
 /// Internal slots holding the receiver halves of the agent + health channels.
 /// Populated by `unlock()` (commands.rs).

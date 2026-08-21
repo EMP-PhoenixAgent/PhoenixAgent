@@ -12,7 +12,7 @@
 //! (OpenAI Chat Completions + Bearer auth + SSE), so we need a runtime route
 //! that picks the concrete backend per call.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, RwLock};
@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, RwLock};
 use crate::error::{PhoenixError, Result};
 use crate::model::{
     ambercore_embedded::EmbeddedAmberCore, openai::OpenAiProvider, ollama::OllamaProvider,
-    ChatEvent, ChatRequest, ModelProvider, ProviderStats,
+    ChatEvent, ChatRequest, ModelProvider, ProviderStats, Usage,
 };
 
 /// Which local Ollama-compatible server the local route points at.
@@ -75,6 +75,28 @@ impl Default for ActiveRoute {
     }
 }
 
+/// Live runtime metrics for the active route, measured at the dispatch layer so
+/// every backend (embedded AmberCore, remote AmberCore, Ollama, cloud APIs)
+/// reports the same numbers. TTFT = chat start → first generation event; TBT =
+/// average gap between generation events; T/s = output tokens ÷ stream duration.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RuntimeMetrics {
+    /// True while at least one generation is in flight (main agent or sub-agent).
+    pub busy: bool,
+    /// Number of generation streams currently in flight.
+    #[serde(skip)]
+    pub in_flight: u32,
+    /// Last completed turn's throughput in tokens/second.
+    pub tokens_per_sec: Option<f64>,
+    /// Last completed turn's time-to-first-token, in milliseconds.
+    pub ttft_ms: Option<f64>,
+    /// Last completed turn's average time-between-tokens, in milliseconds.
+    pub tbt_avg_ms: Option<f64>,
+    /// Token counts from the last completed turn, when the backend reported them.
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
 /// Routes [`ModelProvider`] calls to whichever backend is currently active.
 ///
 /// Holds one [`OllamaProvider`] (HTTP — Ollama, or a *remote* AmberCore server),
@@ -92,6 +114,8 @@ pub struct DispatchProvider {
     local: OllamaProvider,
     cloud: OpenAiProvider,
     embedded: EmbeddedAmberCore,
+    /// Dispatch-layer timing metrics shared by every instrumented chat stream.
+    metrics: Arc<Mutex<RuntimeMetrics>>,
 }
 
 impl DispatchProvider {
@@ -110,6 +134,43 @@ impl DispatchProvider {
             local,
             cloud,
             embedded,
+            metrics: Arc::new(Mutex::new(RuntimeMetrics::default())),
+        }
+    }
+
+    /// Snapshot of the dispatch-layer runtime metrics (for the health bar UI).
+    pub fn runtime_metrics(&self) -> RuntimeMetrics {
+        self.metrics.lock().expect("runtime metrics lock").clone()
+    }
+
+    /// Merged stats view for the UI: engine-reported throughput (decode-only,
+    /// the honest generation speed) wins when the backend exposes one; timing
+    /// metrics + busy come from the dispatch-layer instrumentation.
+    pub async fn merged_stats(&self) -> ProviderStats {
+        let embedded = match self.route.read().await.clone() {
+            ActiveRoute::Local { backend: LocalBackend::AmberCore } => {
+                *self.embedded_ambercore.read().await
+            }
+            _ => false,
+        };
+        let engine = if embedded {
+            self.embedded.stats().await
+        } else {
+            match self.route.read().await.clone() {
+                // Only AmberCore serves /api/stats; Ollama degrades to None inside.
+                ActiveRoute::Local { .. } => self.local.stats().await,
+                ActiveRoute::Cloud { .. } => None,
+            }
+        };
+        let m = self.runtime_metrics();
+        ProviderStats {
+            tokens_per_sec: engine
+                .as_ref()
+                .and_then(|e| e.tokens_per_sec)
+                .or(m.tokens_per_sec),
+            ttft_ms: m.ttft_ms,
+            tbt_avg_ms: m.tbt_avg_ms,
+            busy: m.busy,
         }
     }
 
@@ -193,14 +254,15 @@ impl ModelProvider for DispatchProvider {
             }
             _ => false,
         };
-        if embedded {
-            self.embedded.chat(model, request).await
+        let inner = if embedded {
+            self.embedded.chat(model, request).await?
         } else {
             match self.route.read().await.clone() {
-                ActiveRoute::Local { .. } => self.local.chat(model, request).await,
-                ActiveRoute::Cloud { .. } => self.cloud.chat(model, request).await,
+                ActiveRoute::Local { .. } => self.local.chat(model, request).await?,
+                ActiveRoute::Cloud { .. } => self.cloud.chat(model, request).await?,
             }
-        }
+        };
+        Ok(instrument_stream(inner, self.metrics.clone()))
     }
 
     /// Swap the local endpoint at runtime. Kept for compatibility with code that
@@ -210,21 +272,7 @@ impl ModelProvider for DispatchProvider {
     }
 
     async fn stats(&self) -> Option<ProviderStats> {
-        let embedded = match self.route.read().await.clone() {
-            ActiveRoute::Local { backend: LocalBackend::AmberCore } => {
-                *self.embedded_ambercore.read().await
-            }
-            _ => false,
-        };
-        if embedded {
-            self.embedded.stats().await
-        } else {
-            match self.route.read().await.clone() {
-                // Only AmberCore serves /api/stats; Ollama degrades to None inside.
-                ActiveRoute::Local { .. } => self.local.stats().await,
-                ActiveRoute::Cloud { .. } => None,
-            }
-        }
+        Some(self.merged_stats().await)
     }
 }
 
@@ -244,4 +292,145 @@ pub fn shared(
 #[allow(dead_code)]
 pub fn bad_route(msg: impl Into<String>) -> PhoenixError {
     PhoenixError::Model(msg.into())
+}
+
+/// Wrap a provider's event stream with wall-clock instrumentation and forward
+/// every event untouched. This is what makes runtime metrics work identically
+/// for every backend (embedded AmberCore, remote AmberCore, Ollama, cloud):
+/// TTFT = chat start → first generation event, TBT = average gap between
+/// generation events, T/s = output tokens ÷ stream duration.
+fn instrument_stream(
+    mut rx: mpsc::Receiver<ChatEvent>,
+    metrics: Arc<Mutex<RuntimeMetrics>>,
+) -> mpsc::Receiver<ChatEvent> {
+    let (tx, out) = mpsc::channel(32);
+    // Mark busy synchronously so the flag is true the moment chat() returns.
+    {
+        let mut m = metrics.lock().expect("runtime metrics lock");
+        m.in_flight += 1;
+        m.busy = true;
+    }
+    tokio::spawn(async move {
+        let start = std::time::Instant::now();
+        let mut first_event: Option<std::time::Instant> = None;
+        let mut last_event: Option<std::time::Instant> = None;
+        let mut intervals_ms: Vec<f64> = Vec::new();
+        let mut usage: Option<Usage> = None;
+        while let Some(ev) = rx.recv().await {
+            match &ev {
+                ChatEvent::Delta(_) | ChatEvent::Reasoning(_) => {
+                    let now = std::time::Instant::now();
+                    if first_event.is_none() {
+                        first_event = Some(now);
+                    } else if let Some(last) = last_event {
+                        intervals_ms.push(now.duration_since(last).as_secs_f64() * 1000.0);
+                    }
+                    last_event = Some(now);
+                }
+                ChatEvent::Done(u) => usage = Some(u.clone()),
+                _ => {}
+            }
+            if tx.send(ev).await.is_err() {
+                break; // consumer gone; still record metrics below
+            }
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let ttft_ms = first_event.map(|t| t.duration_since(start).as_secs_f64() * 1000.0);
+        let tbt_avg_ms = if intervals_ms.is_empty() {
+            None
+        } else {
+            Some(intervals_ms.iter().sum::<f64>() / intervals_ms.len() as f64)
+        };
+        let tokens_per_sec = usage
+            .as_ref()
+            .filter(|u| u.output_tokens > 0)
+            .filter(|_| elapsed > 0.0)
+            .map(|u| u.output_tokens as f64 / elapsed);
+        let mut m = metrics.lock().expect("runtime metrics lock");
+        m.in_flight = m.in_flight.saturating_sub(1);
+        m.busy = m.in_flight > 0;
+        // Only overwrite what this stream actually measured, so an aborted
+        // stream (error mid-turn) keeps the previous good numbers.
+        if let Some(v) = ttft_ms {
+            m.ttft_ms = Some(v);
+        }
+        if let Some(v) = tbt_avg_ms {
+            m.tbt_avg_ms = Some(v);
+        }
+        if let Some(v) = tokens_per_sec {
+            m.tokens_per_sec = Some(v);
+        }
+        if let Some(u) = usage {
+            m.input_tokens = Some(u.input_tokens);
+            m.output_tokens = Some(u.output_tokens);
+        }
+    });
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn instrument_stream_records_ttft_tbt_and_busy() {
+        let metrics = Arc::new(Mutex::new(RuntimeMetrics::default()));
+        let (tx, rx) = mpsc::channel(8);
+        let mut out = instrument_stream(rx, metrics.clone());
+        assert!(metrics.lock().unwrap().busy, "busy flips on at stream start");
+
+        tx.send(ChatEvent::Reasoning("thinking".into()))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        tx.send(ChatEvent::Delta("a".into())).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        tx.send(ChatEvent::Delta("b".into())).await.unwrap();
+        tx.send(ChatEvent::Done(Usage { input_tokens: 3, output_tokens: 2 }))
+            .await
+            .unwrap();
+        drop(tx);
+
+        while out.recv().await.is_some() {}
+        let m = metrics.lock().unwrap().clone();
+        assert!(!m.busy, "busy flips off when the stream ends");
+        assert!(m.ttft_ms.expect("ttft recorded") >= 0.0);
+        // One timed gap between the two post-first events.
+        assert!(m.tbt_avg_ms.expect("tbt recorded") > 0.0);
+        assert_eq!(m.output_tokens, Some(2));
+        assert_eq!(m.input_tokens, Some(3));
+        assert!(m.tokens_per_sec.expect("tok/s computed") > 0.0);
+    }
+
+    #[tokio::test]
+    async fn instrument_stream_forwards_events_and_clears_busy_on_error() {
+        let metrics = Arc::new(Mutex::new(RuntimeMetrics::default()));
+        let (tx, rx) = mpsc::channel(8);
+        let mut out = instrument_stream(rx, metrics.clone());
+        tx.send(ChatEvent::Delta("x".into())).await.unwrap();
+        tx.send(ChatEvent::Error("boom".into())).await.unwrap();
+        drop(tx);
+
+        assert!(matches!(out.recv().await, Some(ChatEvent::Delta(d)) if d == "x"));
+        assert!(matches!(out.recv().await, Some(ChatEvent::Error(_))));
+        assert!(out.recv().await.is_none());
+        assert!(!metrics.lock().unwrap().busy, "busy clears after an errored stream");
+    }
+
+    #[tokio::test]
+    async fn concurrent_streams_keep_busy_until_both_finish() {
+        let metrics = Arc::new(Mutex::new(RuntimeMetrics::default()));
+        let (tx1, rx1) = mpsc::channel(4);
+        let (tx2, rx2) = mpsc::channel(4);
+        let mut out1 = instrument_stream(rx1, metrics.clone());
+        let mut out2 = instrument_stream(rx2, metrics.clone());
+        tx1.send(ChatEvent::Delta("1".into())).await.unwrap();
+        tx2.send(ChatEvent::Delta("2".into())).await.unwrap();
+        drop(tx1);
+        while out1.recv().await.is_some() {}
+        assert!(metrics.lock().unwrap().busy, "still busy while stream 2 runs");
+        drop(tx2);
+        while out2.recv().await.is_some() {}
+        assert!(!metrics.lock().unwrap().busy, "busy clears when the last stream ends");
+    }
 }

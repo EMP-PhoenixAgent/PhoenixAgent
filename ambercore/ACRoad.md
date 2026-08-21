@@ -4,7 +4,7 @@
 > session to restore full context. Update it whenever a milestone lands or a decision
 > changes. Mirrors the role of `PROJECT_CONTEXT.md` for Phoenix Agent itself.
 
-**Last updated:** 2026-08-12
+**Last updated:** 2026-08-22
 **Version:** v0.8.0 (M5b replica pool + qwen3 KV-reset fix; M6 CUDA; M7 Metal; M8 AMD)
 **Status:** **M6 CUDA verified on GPU + M7/M8 landed.** The `cuda` feature propagates to all
 three candle crates and **builds green against CUDA 13.3 + MSVC** (`CL=/Zc:preprocessor /std:c++17`
@@ -870,3 +870,30 @@ It had never actually been exercised until Phoenix pulled `Qwen3.8-9B-Q4_K_M`.
 Tests: `supported_archs_match_build_arms` + `probe_arch_reads_minimal_gguf_header`
 (hand-crafts the smallest valid GGUF: magic + version 2 + 0 tensors + one
 string KV).
+
+---
+
+### 2026-08-20 — GPU/hardware status API (retroactive entry; synced 2026-08-22)
+
+Landed 2026-08-20 alongside the CUDA installers but was never logged here:
+
+1. `backend.rs`: new `GpuInfo { name, vram_total_mb, vram_used_mb }` (serde) +
+   `Backend::gpu_info()` default trait method (`None` on CPU; the CUDA override
+   queries device name + memory via candle's `cudarc` re-export).
+2. `server/telemetry.rs`: new `HardwareStatus { backend, cpu, cpu_cores,
+   ram_total_mb, os, gpu: Option<GpuInfo> }` (`skip_serializing_if` on the
+   optional fields).
+3. `server/mod.rs`: `ServerState::hardware_status()` merges the boot-time
+   CPU/RAM/OS snapshot with the live `gpu_info()` per call.
+4. Phoenix surfaces it in-app via the `get_hardware_status` Tauri command
+   (Telemetry panel).
+
+### 2026-08-22 — all four AmberCore copies synced
+
+The engine exists in 4 trees (embedded `phoenix-agent/ambercore`, sibling
+`AmberCore/`, `ALPHA/PhoenixAgent/ambercore`, `ALPHA/AmberCore-Server/ambercore`)
+and had drifted: the sibling + server copies lacked the GPU-status work above,
+and the **server copy still carried the buggy `"qwen3" | "qwen35"` mapping**
+fixed 2026-08-20. Verified there are no intentional per-copy differences
+(identical Cargo.toml/features), then synced everything to the embedded tree
+as the single source of truth. `cargo test` green in the synced copies.

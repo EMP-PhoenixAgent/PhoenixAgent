@@ -1,0 +1,89 @@
+# PhoenixAgent — release installer builder.
+#
+# Builds native installers for Windows, Linux, and macOS whenever a `v*` tag is
+# pushed (or via the Actions "Run workflow" button), and attaches them to the
+# GitHub Release for that tag.
+#
+#   Windows → "Phoenix Agent_<ver>_x64-setup.exe"   (NSIS; the space comes from
+#             productName "Phoenix Agent" in tauri.conf.json)
+#   Linux   → "Phoenix Agent_<ver>_amd64.deb"       + .AppImage + .rpm
+#   macOS   → "Phoenix Agent_<ver>_universal.dmg"   + .app (Intel + Apple Silicon)
+#
+# These are CPU builds (AmberCore's CUDA backend isn't available on CI runners
+# — users with an NVIDIA GPU can rebuild from source with `--features cuda`).
+#
+# Native-build notes: PhoenixAgent links SQLCipher with a *vendored* OpenSSL, so
+# each OS needs a C toolchain + Perl for that build (see the per-platform setup
+# steps). The bundle format per OS is driven by `tauri.conf.json` at the repo
+# root (`bundle.targets: "all"` → NSIS on Windows, deb/AppImage/rpm on Linux,
+# app/dmg on macOS). The first run after structural changes can need minor tuning.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # tauri-action creates/edits the GitHub Release
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: "--target universal-apple-darwin"
+            rust_targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          - platform: ubuntu-22.04
+            args: ""
+            rust_targets: ""
+          - platform: windows-latest
+            args: ""
+            rust_targets: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libssl-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libgtk-3-dev libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev build-essential curl wget file perl
+
+      - name: Install Strawberry Perl (Windows, for the vendored-OpenSSL build)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: choco install strawberryperl -y --no-progress
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      # tauri-action builds the bundles for the current OS and uploads them to
+      # the release matching ${{ github.ref_name }}. The Tauri project is the
+      # repo root itself (projectPath defaults to ".").
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "PhoenixAgent ${{ github.ref_name }}"
+          releaseBody: "See the assets below to download the installer for your platform."
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}

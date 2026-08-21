@@ -206,10 +206,19 @@ async function init() {
   // Set up listeners immediately so events aren't missed after unlock/setup.
   setupListeners();
 
+  // Dev convenience: in debug builds (`cargo tauri dev`), auto-unlock with the
+  // known dev launch password so iteration doesn't require retyping it every
+  // restart. `is_dev` is false in release builds, so this never ships.
+  const dev = await invoke("is_dev").catch(() => false);
+
   if (!ready) {
     // First run — show setup screen.
     setupScreen.classList.add("active");
     setupPassphrase.focus();
+  } else if (dev) {
+    // Returning user, dev build — skip the unlock screen automatically.
+    passphraseInput.value = "PhoenixAgent";
+    await doUnlock();
   } else {
     // Returning user — show unlock screen (launch password gate).
     unlockScreen.classList.add("active");
@@ -271,8 +280,6 @@ async function doUnlock() {
     currentModel = result.model;
     modelSelect.value = result.model;
 
-    // Hardware check-up at launch — preloads the Telemetry tab baseline.
-    refreshTelemetryTab();
     // Switch screens.
     unlockScreen.classList.remove("active");
     chatScreen.classList.add("active");
@@ -280,6 +287,9 @@ async function doUnlock() {
     // Load models + sidebar.
     await populateModels();
     await loadSidebar(result);
+
+    // Hardware check-up at launch — preloads the Telemetry tab baseline.
+    refreshTelemetryTab();
 
     // Add welcome message.
     addSystemMessage(`Ready. Working in: ${result.project_path}`);
@@ -431,6 +441,7 @@ async function sendMessage() {
   toolCards = {};
   subAgentBlocks = {};
   setPhase("Working…");
+  refreshHealthLabel(); // flip the health-bar busy indicator immediately
 
   try {
     await invoke("send_message", { text });
@@ -438,6 +449,7 @@ async function sendMessage() {
     addSystemMessage(`Error: ${e}`);
     isAgentBusy = false;
     sendBtn.disabled = false;
+    refreshHealthLabel();
   }
 }
 
@@ -593,6 +605,7 @@ function setupListeners() {
         toolCards = {};
         subAgentBlocks = {};
         setPhase(null);
+        refreshHealthLabel(); // idle indicator + final metrics right away
         break;
       }
       case "error": {
@@ -603,6 +616,7 @@ function setupListeners() {
         finalizeThinking();
         streamingBubble = null;
         setPhase(null);
+        refreshHealthLabel();
         break;
       }
       case "status": {
@@ -616,6 +630,18 @@ function setupListeners() {
   // Health updates.
   listen("health-update", (event) => {
     updateHealth(event.payload);
+  });
+
+  // Model/route changes (set_model + the Models-panel Run buttons all funnel
+  // through `apply_model` on the backend). Keeps the chat selector and the
+  // Models panel in sync in BOTH directions.
+  listen("model-changed", (event) => {
+    const route = event.payload;
+    if (!route || !route.model) return;
+    syncModelFromRoute(route);
+    // If the Models panel is open, move the "Running" indicator + box glow.
+    if (modelsPanel && !modelsPanel.hidden) refreshModelsPanel();
+    refreshHealthLabel();
   });
 }
 
@@ -892,8 +918,8 @@ function updateHealth(state) {
 }
 
 /** Relabel the first health-bar item to reflect the active route. Also suffix
- *  the model item's label with the active model name so it's visible at a
- *  glance. */
+ *  the model item's label with the active model name + live runtime metrics
+ *  (T/s · TTFT · TBT · generating/idle) so they're visible at a glance. */
 async function refreshHealthLabel() {
   let route = null;
   try { route = await invoke("get_active_route"); } catch { /* pre-unlock */ }
@@ -913,6 +939,22 @@ async function refreshHealthLabel() {
     modelItem.innerHTML = "";
     if (dot) modelItem.appendChild(dot);
     modelItem.appendChild(document.createTextNode(" " + modelLabel));
+    // Live metrics chip from the dispatch layer (works for every backend).
+    let stats = null;
+    try { stats = await invoke("get_runtime_metrics"); } catch { /* pre-unlock */ }
+    if (stats) {
+      const chip = document.createElement("span");
+      chip.className = "health-metrics";
+      const parts = [];
+      if (stats.tokens_per_sec != null) parts.push(`${Number(stats.tokens_per_sec).toFixed(1)} T/s`);
+      if (stats.ttft_ms != null) parts.push(`TTFT ${Math.round(stats.ttft_ms)} ms`);
+      if (stats.tbt_avg_ms != null) parts.push(`TBT ${Number(stats.tbt_avg_ms).toFixed(1)} ms`);
+      const busy = !!(stats.busy || isAgentBusy);
+      chip.innerHTML =
+        (parts.length ? ` · ${escapeHtml(parts.join(" · "))}` : "") +
+        ` <span class="metrics-busy${busy ? " busy" : ""}">${busy ? "● generating" : "○ idle"}</span>`;
+      modelItem.appendChild(chip);
+    }
   }
 }
 
@@ -985,9 +1027,26 @@ async function switchModel(model) {
   addSystemMessage(`Switching model to ${model}…`);
   try {
     await invoke("set_model", { model });
+    // The backend's `model-changed` event (emitted by set_model) re-syncs the
+    // Models panel's "Running" indicator; nothing else to do here.
   } catch (e) {
     addSystemMessage(`Model switch failed: ${e}`);
   }
+}
+
+/** Re-sync the chat-side model selector from the backend's active route —
+ *  the single source of truth. Used after Models-panel Run buttons and the
+ *  `model-changed` event so both selectors always show the same model. */
+async function syncModelFromRoute(route) {
+  if (!route) {
+    try { route = await invoke("get_active_route"); } catch { return; }
+  }
+  if (!route || !route.model) return;
+  currentModel = route.model;
+  modelSelect.value = route.model;
+  // Re-list (the backend may have changed) + re-render the popup so the green
+  // highlight lands on the right row, and update the button label.
+  await populateModels();
 }
 
 /** Load + render the working directory display. */
@@ -1123,7 +1182,7 @@ async function runAmberCore(modelTag) {
   try {
     await invoke("run_ambercore", { modelTag });
     await refreshModelsPanel();
-    await populateModels();
+    await syncModelFromRoute();
   } catch (e) {
     addSystemMessage(`AmberCore run failed: ${e}`);
   }
@@ -1246,7 +1305,7 @@ async function runOllama(model) {
   try {
     await invoke("run_ollama", { model });
     await refreshModelsPanel();
-    await populateModels();
+    await syncModelFromRoute();
   } catch (e) {
     addSystemMessage(`Ollama run failed: ${e}`);
   }
@@ -1310,7 +1369,7 @@ async function runProvider(providerId) {
   try {
     await invoke("run_provider", { providerId });
     await refreshModelsPanel();
-    await populateModels();
+    await syncModelFromRoute();
   } catch (e) {
     addSystemMessage(`Provider connection failed: ${e}`);
   }

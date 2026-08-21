@@ -738,9 +738,18 @@ select option {
 }
 .model-popup .model-opt:last-child { border-bottom: none; }
 .model-popup .model-opt:hover { background: rgba(255,255,255,0.06); }
+/* The currently-used model is laid out in green (left bar + tinted row) so it
+   is instantly distinguishable from the amber accents used elsewhere. */
 .model-popup .model-opt.active {
-  background: var(--phoenix-glow);
-  color: var(--phoenix-warm);
+  background: rgba(78, 201, 176, 0.12);
+  color: var(--health-green);
+  font-weight: 600;
+  border-left: 3px solid var(--health-green);
+  padding-left: 7px;
+}
+.model-popup .model-opt.active::after {
+  content: " ✓";
+  color: var(--health-green);
 }
 .model-popup .model-opt-empty {
   padding: 10px;
@@ -786,6 +795,25 @@ select option {
   margin-left: auto;
   font-weight: 600;
   color: var(--text-muted);
+}
+
+/* Live runtime metrics chip appended to the model health item. */
+.health-metrics {
+  color: var(--text-dim);
+  font-size: 10px;
+}
+.metrics-busy {
+  color: var(--health-green);
+  opacity: 0.8;
+}
+.metrics-busy.busy {
+  color: var(--phoenix-warm);
+  font-weight: 600;
+  animation: metrics-pulse 1.6s ease-in-out infinite;
+}
+@keyframes metrics-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
 }
 
 /* ---------- Buttons ---------- */

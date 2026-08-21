@@ -133,6 +133,7 @@ impl ModelProvider for OllamaProvider {
         let parsed: StatsResp = resp.json().await.ok()?;
         parsed.tokens_per_sec.map(|tps| ProviderStats {
             tokens_per_sec: Some(tps),
+            ..Default::default()
         })
     }
 }
