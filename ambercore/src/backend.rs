@@ -64,6 +64,10 @@ fn min_driver_for(toolkit: &str) -> &'static str {
         "12.7" => "565.57",
         "12.8" => "570.51",
         "13.0" => "580.65",
+        // Point releases within a major CUDA line: the major line's first
+        // driver is the baseline; newer PTX may need a newer driver within it.
+        t if t.starts_with("13.") => "580.65 or newer (CUDA 13 era)",
+        t if t.starts_with("12.") => "570.51 or newer (late CUDA 12 era)",
         _ => "the driver release that shipped with this CUDA version",
     }
 }
@@ -586,6 +590,10 @@ mod tests {
     #[test]
     fn min_driver_table_covers_the_shipped_toolkits() {
         assert_eq!(min_driver_for("12.8"), "570.51");
+        assert_eq!(min_driver_for("13.0"), "580.65");
+        // Point releases map to their major line's baseline.
+        assert!(min_driver_for("13.3").contains("580.65"));
+        assert!(min_driver_for("12.9").contains("570.51"));
         assert!(min_driver_for("42.0").contains("driver release"));
     }
 }
