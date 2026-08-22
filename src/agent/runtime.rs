@@ -125,6 +125,11 @@ pub enum Command {
     /// Switch the reasoning mode (Plan/Think/Auto) live — applies the mode's
     /// approval-policy preset to the registry.
     SetMode { mode: crate::config::Mode },
+    /// Replace the to-do list markdown (the shared plan shown in the chat's
+    /// to-do panel). Sent by the UI editor; the `update_todo` tool has the
+    /// same effect from the agent side. Rebuilds the system prompt so the
+    /// model always sees the current plan.
+    SetTodo { markdown: String },
     /// Apply a profile's behavior settings live (approval policy, iteration
     /// cap, context window). The tool registry is rebuilt with the new policy.
     ApplyProfileSettings {
@@ -219,6 +224,9 @@ pub enum AgentEvent {
     },
     /// A turn finished (final answer delivered or iteration cap hit).
     TurnDone { iterations: u32 },
+    /// The to-do list (shared plan markdown) changed — the chat's to-do panel
+    /// re-renders from this. Emitted by the `update_todo` tool.
+    TodoUpdated { markdown: String },
     /// The agent encountered an error.
     Error { message: String },
     /// Status / diagnostic text (not shown as model output).
@@ -258,6 +266,10 @@ struct Shared {
     /// Enabled MCP connections for the active profile (so NewSession /
     /// ApplyProfileSettings rebuilds stay consistent with the registry).
     mcp: Vec<McpConnectionSpec>,
+    /// The current to-do list markdown (the shared plan shown in the chat's
+    /// to-do panel). Rendered into the system prompt so the model works from
+    /// the same plan the user sees.
+    todo: String,
 }
 
 struct PendingApproval {
@@ -286,6 +298,7 @@ impl AgentRuntime {
         enabled_user_tools: Vec<ToolSpec>,
         context: Vec<(String, String, String)>,
         mcp: Vec<McpConnectionSpec>,
+        todo: String,
     ) -> AgentHandle {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(16);
         let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(64);
@@ -321,7 +334,7 @@ impl AgentRuntime {
                 .iter()
                 .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
                 .collect();
-            prompt::build_system_prompt(&ctx, &refs, &skill_refs, &context_refs, crate::config::Mode::default())
+            prompt::build_system_prompt(&ctx, &refs, &skill_refs, &context_refs, &todo, crate::config::Mode::default())
         };
 
         let shared = Arc::new(Mutex::new(Shared {
@@ -338,6 +351,7 @@ impl AgentRuntime {
             enabled_user_tools,
             context,
             mcp,
+            todo,
         }));
 
         tokio::spawn(run_loop(
@@ -404,7 +418,7 @@ async fn run_loop(
                         os: std::env::consts::OS.to_string(),
                     };
                     ChatMessage::system(prompt::build_system_prompt(
-                        &ctx, &refs, &skill_refs, &context_refs, s.mode,
+                        &ctx, &refs, &skill_refs, &context_refs, &s.todo, s.mode,
                     ))
                 });
                 s.messages = vec![sys];
@@ -532,6 +546,17 @@ async fn run_loop(
                     .send(AgentEvent::Status { message: format!("Mode switched to {}.", mode.label()) })
                     .await;
             }
+            Command::SetTodo { markdown } => {
+                // Update Shared + rebuild the prompt so the model works from
+                // the same plan the user sees. Persistence is the caller's
+                // job (the `set_todo` command already saved it to the DB).
+                {
+                    let mut s = shared.lock().await;
+                    s.todo = markdown;
+                }
+                let workdir = shared.lock().await.workdir.clone();
+                rebuild_prompt_from(&shared, &registry, &workdir).await;
+            }
             Command::ReloadSkills { skills } => {
                 let count = skills.len();
                 // Rebuild the system prompt (messages[0]) with the new skill set,
@@ -563,8 +588,9 @@ async fn run_loop(
                     workdir: s.workdir.clone(),
                     os: std::env::consts::OS.to_string(),
                 };
-                let new_prompt =
-                    prompt::build_system_prompt(&ctx, &refs, &skill_refs, &context_refs, s.mode);
+                let new_prompt = prompt::build_system_prompt(
+                    &ctx, &refs, &skill_refs, &context_refs, &s.todo, s.mode,
+                );
                 // Replace the system message in place.
                 if let Some(first) = s.messages.first_mut() {
                     first.content = new_prompt;
@@ -587,9 +613,9 @@ async fn run_loop(
                 let rows = tools.iter().flat_map(|s| s.to_rows()).collect::<Vec<_>>();
                 let extra = build_user_tools(&rows);
                 // We need the approval policy from Shared to rebuild.
-                let (policy, workdir, skills, context, mode) = {
+                let (policy, workdir, skills, context, todo, mode) = {
                     let s = shared.lock().await;
-                    (s.approval_policy, s.workdir.clone(), s.skills.clone(), s.context.clone(), s.mode)
+                    (s.approval_policy, s.workdir.clone(), s.skills.clone(), s.context.clone(), s.todo.clone(), s.mode)
                 };
                 registry = Arc::new(ToolRegistry::default_tools_with(policy, extra));
 
@@ -618,7 +644,8 @@ async fn run_loop(
                     workdir,
                     os: std::env::consts::OS.to_string(),
                 };
-                let new_prompt = prompt::build_system_prompt(&ctx, &refs, &skill_refs, &context_refs, mode);
+                let new_prompt =
+                    prompt::build_system_prompt(&ctx, &refs, &skill_refs, &context_refs, &todo, mode);
                 let mut s = shared.lock().await;
                 s.enabled_user_tools = tools;
                 if let Some(first) = s.messages.first_mut() {
@@ -664,8 +691,9 @@ async fn run_loop(
                     workdir: s.workdir.clone(),
                     os: std::env::consts::OS.to_string(),
                 };
-                let new_prompt =
-                    prompt::build_system_prompt(&ctx, &refs, &skill_refs, &context_refs, s.mode);
+                let new_prompt = prompt::build_system_prompt(
+                    &ctx, &refs, &skill_refs, &context_refs, &s.todo, s.mode,
+                );
                 if let Some(first) = s.messages.first_mut() {
                     first.content = new_prompt;
                 } else {
@@ -765,9 +793,9 @@ async fn rebuild_prompt_from(
     registry: &Arc<ToolRegistry>,
     workdir: &std::path::Path,
 ) {
-    let (skills, context, mode) = {
+    let (skills, context, todo, mode) = {
         let s = shared.lock().await;
-        (s.skills.clone(), s.context.clone(), s.mode)
+        (s.skills.clone(), s.context.clone(), s.todo.clone(), s.mode)
     };
     let tool_refs: Vec<(String, String)> = registry
         .definitions()
@@ -790,7 +818,8 @@ async fn rebuild_prompt_from(
         workdir: workdir.to_path_buf(),
         os: std::env::consts::OS.to_string(),
     };
-    let new_prompt = prompt::build_system_prompt(&ctx, &refs, &skill_refs, &context_refs, mode);
+    let new_prompt =
+        prompt::build_system_prompt(&ctx, &refs, &skill_refs, &context_refs, &todo, mode);
     let mut s = shared.lock().await;
     if let Some(first) = s.messages.first_mut() {
         first.content = new_prompt;
@@ -1000,6 +1029,8 @@ async fn handle_user_input(
             let result = if approved {
                 if name == "delegate" {
                     run_delegation(&provider, &store, &model, &args, index, event_tx).await
+                } else if name == "update_todo" {
+                    run_update_todo(&store, &shared, &registry, &args, event_tx).await
                 } else {
                     registry.execute(&name, &args, &ctx).await
                 }
@@ -1038,6 +1069,54 @@ async fn handle_user_input(
 
     let _ = event_tx.send(AgentEvent::TurnDone { iterations }).await;
     Ok(())
+}
+
+/// Execute an `update_todo` tool call: replace the to-do list markdown,
+/// persist it to the DB, rebuild the system prompt, and notify the UI. The
+/// to-do list is shared ground truth — the model maintains it while working,
+/// and the user may edit it directly in Plan mode.
+async fn run_update_todo(
+    store: &Arc<Mutex<crate::db::MemoryStore>>,
+    shared: &Arc<Mutex<Shared>>,
+    registry: &Arc<ToolRegistry>,
+    args: &serde_json::Value,
+    event_tx: &mpsc::Sender<AgentEvent>,
+) -> Result<crate::agent::tools::ToolResult> {
+    let markdown = args
+        .get("markdown")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            crate::error::PhoenixError::Other(
+                "update_todo: missing 'markdown' argument".into(),
+            )
+        })?
+        .to_string();
+    if markdown.trim().is_empty() {
+        return Ok(crate::agent::tools::ToolResult::err(
+            "The 'markdown' argument is empty — send the full updated to-do list.",
+        ));
+    }
+    // Persist so the plan survives restarts, then update Shared + the prompt.
+    {
+        let s = store.lock().await;
+        if let Err(e) = s.set_setting("todo_markdown", &markdown) {
+            tracing::warn!("persisting the to-do list failed: {e}");
+        }
+    }
+    let workdir = {
+        let mut s = shared.lock().await;
+        s.todo = markdown.clone();
+        s.workdir.clone()
+    };
+    rebuild_prompt_from(shared, registry, &workdir).await;
+    let _ = event_tx
+        .send(AgentEvent::TodoUpdated {
+            markdown: markdown.clone(),
+        })
+        .await;
+    Ok(crate::agent::tools::ToolResult::ok(
+        "To-do list updated — the user now sees this plan in the to-do panel.",
+    ))
 }
 
 /// Build the tool list for a model turn, rewriting the `delegate` tool's

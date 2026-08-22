@@ -256,6 +256,7 @@ async function doSetup() {
 
     await populateModels();
     await loadSidebar(result);
+    await loadTodo();
 
     addSystemMessage(`Welcome! Encrypted memory created. Working in: ${result.project_path}`);
     messageInput.focus();
@@ -287,6 +288,7 @@ async function doUnlock() {
     // Load models + sidebar.
     await populateModels();
     await loadSidebar(result);
+    await loadTodo();
 
     // Hardware check-up at launch — preloads the Telemetry tab baseline.
     refreshTelemetryTab();
@@ -402,22 +404,549 @@ modelSelect?.addEventListener("change", (e) => {
   switchModel(e.target.value);
 });
 
-// ----- Mode selector (Plan/Think/Auto) above the send button -----
+// ----- Mode selector (Plan/Think/Auto) — 32×32 button beside Send -----
+const modeSelector = $("mode-selector");
+const modeFace = $("mode-face");
+const modeFaceIcon = $("mode-face-icon");
+const modePopout = $("mode-popout");
+let currentMode = "think"; // tracked for mode-gated UI (to-do editing)
+
 function setActiveMode(mode) {
-  document.querySelectorAll(".mode-btn").forEach((b) =>
-    b.classList.toggle("active", b.dataset.mode === mode)
-  );
+  currentMode = mode;
+  document.querySelectorAll(".mode-btn").forEach((b) => {
+    const active = b.dataset.mode === mode;
+    b.classList.toggle("active", active);
+    if (active) {
+      // Mirror the active option's icon onto the face; the tooltip names it.
+      modeFaceIcon.innerHTML = b.querySelector("svg")?.outerHTML || "";
+      modeFace.title = `Reasoning mode: ${b.textContent.trim()} — click to change`;
+    }
+  });
+  renderTodo();
 }
+function setModePopout(open) {
+  modePopout.hidden = !open;
+  modeSelector.classList.toggle("open", open);
+  modeFace.setAttribute("aria-expanded", String(open));
+}
+modeFace.addEventListener("click", () => setModePopout(modePopout.hidden));
+document.addEventListener("click", (e) => {
+  if (!modeSelector.contains(e.target)) setModePopout(false);
+});
 document.querySelectorAll(".mode-btn").forEach((btn) => {
   btn.addEventListener("click", () => {
     const m = btn.dataset.mode;
     invoke("set_mode", { mode: m })
-      .then(() => setActiveMode(m))
+      .then(() => {
+        setActiveMode(m);
+        setModePopout(false);
+      })
       .catch((e) => addSystemMessage(`Error: ${e}`));
   });
 });
-// Restore the active mode on load (default Auto).
-invoke("get_mode").then(setActiveMode).catch(() => {});
+// Restore the active mode on load (default Think).
+invoke("get_mode").then(setActiveMode).catch(() => setActiveMode("think"));
+
+// ----- To-do list (the shared plan panel + drag-and-drop editor modal) --------
+// The agent maintains it via the `update_todo` tool (events arrive as
+// `todo_updated`); the 📋 title opens the editor modal for manual changes
+// (Plan mode only). The floating panel itself is display-only. The modal is a
+// card-based flow builder that compiles to the plan markdown:
+//   - [ ] Task            main task
+//   - [x] ~~Task~~        done (strikethrough)
+//     - [ ] Sub-task      nested (2-space indent)
+//       - 🔧 `tool`       tool for the sub-task above
+//     - 🔧 `tool`         tool directly under a Task = whole-task scope
+//   - 🤖 sub-agent: Name  the NEXT task is delegated to this sub-agent
+//   - ⏹ STOP              movable sub-agent stop marker
+const todoPanel = $("todo-panel");
+const todoBody = $("todo-body");
+const todoOpenBtn = $("todo-open-btn");
+const todoCollapseBtn = $("todo-collapse-btn");
+const todoModal = $("todo-modal");
+const todoModalCloseBtn = $("todo-modal-close-btn");
+const todoFlow = $("todo-flow");
+const todoPreview = $("todo-preview");
+const todoSaveBtn = $("todo-save-btn");
+const todoCancelBtn = $("todo-cancel-btn");
+let todoMarkdown = "";
+let flowItems = [];       // structured plan (see comment above)
+let flowIdSeq = 1;
+let flowHint = "";        // transient guidance shown at the top of the flow
+let flowHintTimer = null;
+let todoSubAgents = [];   // loaded when the modal opens (picker data)
+let todoTools = [];       // enabled user tool names + built-ins
+const BUILTIN_TOOLS = ["read_file", "write_file", "edit_file", "list_dir", "grep", "run_command", "delegate", "update_todo"];
+
+function renderTodo() {
+  const empty = !todoMarkdown.trim();
+  // Visible when there's a plan to show, or when the user could write one
+  // (Plan mode shows the panel with an empty-state hint).
+  todoPanel.hidden = empty && currentMode !== "plan";
+  if (todoPanel.hidden) return;
+  todoBody.innerHTML = empty
+    ? '<div id="todo-empty">No plan yet — the agent will fill this in while working, or open the editor (📋 above) in Plan mode.</div>'
+    : marked.parse(todoMarkdown);
+}
+
+async function loadTodo() {
+  try {
+    todoMarkdown = await invoke("get_todo");
+  } catch (e) {
+    todoMarkdown = "";
+  }
+  renderTodo();
+}
+
+// ---- markdown ⇄ flow conversion ---------------------------------------------
+
+function parseFlow(md) {
+  const items = [];
+  let lastTask = null;
+  let lastSub = null;
+  for (const raw of md.split(/\r?\n/)) {
+    const line = raw.trimEnd();
+    if (!line.trim()) continue;
+    let m;
+    if ((m = line.match(/^##\s+(.+)$/))) {
+      items.push({ kind: "heading", text: m[1], _id: flowIdSeq++ });
+      lastTask = lastSub = null;
+    } else if ((m = line.match(/^-\s+🤖\s*(?:sub-agent:)?\s*(.+)$/i))) {
+      items.push({ kind: "subagent", name: m[1].trim(), _id: flowIdSeq++ });
+      lastTask = lastSub = null;
+    } else if (/^-\s+⏹/.test(line)) {
+      items.push({ kind: "stop", _id: flowIdSeq++ });
+    } else if ((m = line.match(/^(\s*)-\s+\[([ xX])\]\s+(.*)$/))) {
+      const done = m[2].toLowerCase() === "x";
+      let text = m[3].trim();
+      const strike = text.match(/^~~(.*)~~$/);
+      if (strike) text = strike[1];
+      if (m[1].length >= 2 && lastTask) {
+        lastSub = { text, done, tool: null, _id: flowIdSeq++ };
+        lastTask.subtasks.push(lastSub);
+      } else {
+        lastTask = { kind: "task", text, done, tool: null, subtasks: [], _id: flowIdSeq++ };
+        lastSub = null;
+        items.push(lastTask);
+      }
+    } else if ((m = line.match(/^(\s*)-\s+🔧\s+`?([A-Za-z0-9_\-]+)`?/))) {
+      const tool = m[2];
+      if (m[1].length >= 4 && lastSub) lastSub.tool = tool;
+      else if (lastTask) lastTask.tool = tool;
+    } else if ((m = line.match(/^#\s+(.+)$/))) {
+      items.push({ kind: "heading", text: m[1], _id: flowIdSeq++ });
+      lastTask = lastSub = null;
+    } else {
+      items.push({ kind: "note", text: line, _id: flowIdSeq++ });
+    }
+  }
+  return items;
+}
+
+function compileFlow() {
+  const out = [];
+  for (const it of flowItems) {
+    if (it.kind === "heading") out.push(`## ${it.text}`);
+    else if (it.kind === "note") out.push(it.text);
+    else if (it.kind === "subagent") out.push(`- 🤖 sub-agent: ${it.name}`);
+    else if (it.kind === "stop") out.push("- ⏹ STOP");
+    else if (it.kind === "task") {
+      out.push(it.done ? `- [x] ~~${it.text}~~` : `- [ ] ${it.text}`);
+      if (it.tool) out.push(`  - 🔧 \`${it.tool}\``);
+      for (const st of it.subtasks) {
+        out.push(st.done ? `  - [x] ~~${st.text}~~` : `  - [ ] ${st.text}`);
+        if (st.tool) out.push(`    - 🔧 \`${st.tool}\``);
+      }
+    }
+  }
+  return out.join("\n");
+}
+
+// ---- flow rendering ----------------------------------------------------------
+
+function setFlowHint(msg) {
+  flowHint = msg;
+  clearTimeout(flowHintTimer);
+  flowHintTimer = setTimeout(() => {
+    flowHint = "";
+    renderTodoFlow();
+  }, 2600);
+  renderTodoFlow();
+}
+
+function refreshTodoPreview() {
+  const md = compileFlow();
+  todoPreview.innerHTML = md.trim()
+    ? marked.parse(md)
+    : '<div id="todo-empty">Preview — your plan renders here.</div>';
+}
+
+/** The innermost item "above" a gap: the last sub-task of the task above it,
+ *  or that task itself when it has no sub-tasks. */
+function innermostAbove(gapIndex) {
+  for (let i = gapIndex - 1; i >= 0; i--) {
+    const it = flowItems[i];
+    if (it.kind === "task") {
+      return it.subtasks.length ? it.subtasks[it.subtasks.length - 1] : it;
+    }
+  }
+  return null;
+}
+
+function nearestTaskAbove(gapIndex) {
+  for (let i = gapIndex - 1; i >= 0; i--) {
+    if (flowItems[i].kind === "task") return flowItems[i];
+  }
+  return null;
+}
+
+function toolPicker(target, onPick) {
+  const sel = document.createElement("select");
+  sel.className = "flow-picker";
+  const names = [...BUILTIN_TOOLS, ...todoTools.filter((t) => !BUILTIN_TOOLS.includes(t))];
+  const opts = [target.tool ? "✕ remove tool" : "Select a tool…", ...names];
+  for (const n of opts) {
+    const o = document.createElement("option");
+    o.textContent = n;
+    sel.appendChild(o);
+  }
+  sel.addEventListener("change", () => {
+    const v = sel.value;
+    onPick(v.startsWith("✕") ? null : v.startsWith("Select") ? target.tool : v);
+  });
+  return sel;
+}
+
+function makeGap(index) {
+  const gap = document.createElement("div");
+  gap.className = "flow-gap";
+  gap.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    gap.classList.add("over");
+  });
+  gap.addEventListener("dragleave", () => gap.classList.remove("over"));
+  gap.addEventListener("drop", (e) => {
+    e.preventDefault();
+    gap.classList.remove("over");
+    handleFlowDrop(e, index);
+  });
+  return gap;
+}
+
+function handleFlowDrop(e, index) {
+  const payload = e.dataTransfer.getData("text/plain");
+  if (payload.startsWith("new:")) insertCard(payload.slice(4), index);
+  else if (payload.startsWith("move:")) moveFlowItem(parseInt(payload.slice(5), 10), index);
+}
+
+/** Insert a palette card at gap `index` (flowItems.length = append). */
+function insertCard(card, index) {
+  if (card === "task") {
+    flowItems.splice(index, 0, { kind: "task", text: "New task", done: false, tool: null, subtasks: [], _id: flowIdSeq++, _editing: true });
+  } else if (card === "subtask") {
+    const task = nearestTaskAbove(index);
+    if (!task) return setFlowHint("Drop a Sub-task under a Task.");
+    task.subtasks.push({ text: "New sub-task", done: false, tool: null, _id: flowIdSeq++, _editing: true });
+  } else if (card === "tool") {
+    const target = innermostAbove(index);
+    if (!target || (target.kind !== "task" && !target.text)) return setFlowHint("Drop a Tool below a task or sub-task.");
+    target._picking = true;
+  } else if (card === "subagent") {
+    const next = flowItems[index];
+    if (!next || next.kind !== "task") return setFlowHint("Place the Sub-agent card ABOVE a Task.");
+    flowItems.splice(index, 0, { kind: "subagent", name: "", _id: flowIdSeq++, _picking: true });
+    if (todoSubAgents.length === 0) {
+      flowItems.splice(index, 1);
+      return setFlowHint("No sub-agents defined — create one in the Sub-Agents panel first.");
+    }
+    // The card also spawns a movable stop marker right after the delegated task.
+    let stopAt = index + 2; // subagent + task
+    flowItems.splice(stopAt, 0, { kind: "stop", _id: flowIdSeq++ });
+  }
+  renderTodoFlow();
+}
+
+/** Move an existing top-level item (incl. the stop marker) to gap `index`. */
+function moveFlowItem(id, index) {
+  const idx = flowItems.findIndex((it) => it._id === id);
+  if (idx === -1) return;
+  const item = flowItems[idx];
+  let target = index;
+  if (idx < target) target--;
+  // Validate sub-agent placement: it must sit above a main Task.
+  const probe = flowItems.filter((_, i) => i !== idx);
+  probe.splice(target, 0, item);
+  if (item.kind === "subagent") {
+    const next = probe[target + 1];
+    if (!next || next.kind !== "task") return setFlowHint("A Sub-agent card must sit above a Task.");
+  }
+  flowItems.splice(idx, 1);
+  flowItems.splice(target, 0, item);
+  renderTodoFlow();
+}
+
+function textEditor(value, onCommit) {
+  const input = document.createElement("input");
+  input.className = "flow-text-input";
+  input.value = value;
+  const commit = () => onCommit(input.value.trim() || value);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); input.blur(); }
+    if (e.key === "Escape") { e.stopImmediatePropagation(); input.value = value; input.blur(); }
+  });
+  input.addEventListener("blur", commit);
+  setTimeout(() => { input.focus(); input.select(); }, 0);
+  return input;
+}
+
+function renderTodoFlow() {
+  todoFlow.innerHTML = "";
+  if (flowHint) {
+    const hint = document.createElement("div");
+    hint.id = "todo-flow-hint";
+    hint.textContent = flowHint;
+    todoFlow.appendChild(hint);
+  }
+  if (flowItems.length === 0 && !flowHint) {
+    const empty = document.createElement("div");
+    empty.id = "todo-flow-hint";
+    empty.textContent = "Empty plan — drag a card here (or click one above).";
+    todoFlow.appendChild(empty);
+  }
+  const appendGap = (i) => todoFlow.appendChild(makeGap(i));
+
+  flowItems.forEach((it, i) => {
+    appendGap(i);
+    const block = document.createElement("div");
+    block.className = "flow-block";
+    const row = document.createElement("div");
+    row.className = "flow-item";
+
+    const mkDel = () => {
+      const b = document.createElement("button");
+      b.className = "flow-del";
+      b.textContent = "✕";
+      b.title = "Remove";
+      b.addEventListener("click", () => {
+        flowItems.splice(i, 1);
+        renderTodoFlow();
+      });
+      return b;
+    };
+    const mkCheck = (obj, owner) => {
+      const c = document.createElement("input");
+      c.type = "checkbox";
+      c.className = "flow-check";
+      c.checked = obj.done;
+      c.title = "Done";
+      c.addEventListener("change", () => {
+        obj.done = c.checked;
+        owner.classList.toggle("done", obj.done);
+        refreshTodoPreview();
+      });
+      return c;
+    };
+    const mkText = (obj) => {
+      if (obj._editing) {
+        return textEditor(obj.text, (v) => {
+          obj.text = v;
+          obj._editing = false;
+          renderTodoFlow();
+        });
+      }
+      const s = document.createElement("span");
+      s.className = "flow-text";
+      s.textContent = obj.text;
+      s.title = "Click to edit";
+      s.addEventListener("click", () => {
+        obj._editing = true;
+        renderTodoFlow();
+      });
+      return s;
+    };
+
+    if (it.kind === "heading" || it.kind === "note") {
+      row.classList.add("heading");
+      row.appendChild(mkText(it));
+      row.appendChild(mkDel());
+      block.draggable = true;
+      block.appendChild(row);
+    } else if (it.kind === "subagent") {
+      row.classList.add("subagent");
+      if (it._picking || !it.name) {
+        const sel = document.createElement("select");
+        sel.className = "flow-picker";
+        for (const sa of todoSubAgents) {
+          const o = document.createElement("option");
+          o.textContent = sa.name;
+          sel.appendChild(o);
+        }
+        sel.addEventListener("change", () => {
+          it.name = sel.value;
+          it._picking = false;
+          renderTodoFlow();
+        });
+        row.appendChild(sel);
+      } else {
+        const chip = document.createElement("span");
+        chip.className = "flow-chip agent";
+        chip.textContent = `🤖 ${it.name} → next task`;
+        chip.title = "Click to change the sub-agent";
+        chip.addEventListener("click", () => {
+          it._picking = true;
+          renderTodoFlow();
+        });
+        row.appendChild(chip);
+      }
+      row.appendChild(mkDel());
+      block.draggable = true;
+      block.appendChild(row);
+    } else if (it.kind === "stop") {
+      row.classList.add("stop");
+      row.textContent = "⏹ STOP — drag between tasks";
+      row.title = "The sub-agent stops when the plan reaches this marker";
+      block.draggable = true;
+      block.appendChild(row);
+    } else {
+      // task
+      row.classList.add("task");
+      if (it.done) row.classList.add("done");
+      row.appendChild(mkCheck(it, row));
+      row.appendChild(mkText(it));
+      if (it._picking) {
+        row.appendChild(toolPicker(it, (v) => {
+          it.tool = v;
+          it._picking = false;
+          renderTodoFlow();
+        }));
+      } else if (it.tool) {
+        const chip = document.createElement("span");
+        chip.className = "flow-chip";
+        chip.textContent = `🔧 ${it.tool} · whole task`;
+        chip.title = "Used throughout this task — click to change";
+        chip.addEventListener("click", () => {
+          it._picking = true;
+          renderTodoFlow();
+        });
+        row.appendChild(chip);
+      }
+      row.appendChild(mkDel());
+      block.appendChild(row);
+      if (it.subtasks.length) {
+        const subs = document.createElement("div");
+        subs.className = "flow-subs";
+        for (const st of it.subtasks) {
+          const sr = document.createElement("div");
+          sr.className = "flow-sub-row" + (st.done ? " done" : "");
+          sr.appendChild(mkCheck(st, sr));
+          sr.appendChild(mkText(st));
+          if (st._picking) {
+            sr.appendChild(toolPicker(st, (v) => {
+              st.tool = v;
+              st._picking = false;
+              renderTodoFlow();
+            }));
+          } else if (st.tool) {
+            const chip = document.createElement("span");
+            chip.className = "flow-chip";
+            chip.textContent = `🔧 ${st.tool}`;
+            chip.title = "Tool for this sub-task — click to change";
+            chip.addEventListener("click", () => {
+              st._picking = true;
+              renderTodoFlow();
+            });
+            sr.appendChild(chip);
+          }
+          const del = document.createElement("button");
+          del.className = "flow-del";
+          del.textContent = "✕";
+          del.addEventListener("click", () => {
+            it.subtasks = it.subtasks.filter((s) => s._id !== st._id);
+            renderTodoFlow();
+          });
+          sr.appendChild(del);
+          subs.appendChild(sr);
+        }
+        block.appendChild(subs);
+      }
+      block.draggable = true;
+    }
+
+    block.addEventListener("dragstart", (e) => {
+      e.dataTransfer.setData("text/plain", `move:${it._id}`);
+      e.dataTransfer.effectAllowed = "move";
+      block.classList.add("dragging");
+    });
+    block.addEventListener("dragend", () => block.classList.remove("dragging"));
+    // Dropping a Tool/Sub-task card ON a task row = the gap right after it.
+    block.addEventListener("dragover", (e) => e.preventDefault());
+    block.addEventListener("drop", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      handleFlowDrop(e, i + 1);
+    });
+    todoFlow.appendChild(block);
+  });
+  appendGap(flowItems.length);
+  refreshTodoPreview();
+}
+
+// ---- palette: drag sources + click-to-append fallback ------------------------
+
+document.querySelectorAll(".palette-card").forEach((card) => {
+  card.addEventListener("dragstart", (e) => {
+    e.dataTransfer.setData("text/plain", `new:${card.dataset.card}`);
+    e.dataTransfer.effectAllowed = "copy";
+  });
+  card.addEventListener("click", () => insertCard(card.dataset.card, flowItems.length));
+});
+
+// ---- modal lifecycle ---------------------------------------------------------
+
+async function openTodoModal() {
+  if (currentMode !== "plan") {
+    addSystemMessage("Switch to Plan mode to edit the plan manually.");
+    return;
+  }
+  // Picker data: defined sub-agents + enabled user tools.
+  try { todoSubAgents = await invoke("list_sub_agents"); } catch (e) { todoSubAgents = []; }
+  try {
+    const rows = await invoke("list_tools_for_active_profile");
+    todoTools = (rows || []).map((r) => r.name);
+  } catch (e) { todoTools = []; }
+  flowItems = parseFlow(todoMarkdown);
+  todoModal.hidden = false;
+  renderTodoFlow();
+}
+function closeTodoModal() {
+  todoModal.hidden = true;
+}
+
+todoOpenBtn.addEventListener("click", openTodoModal);
+todoModalCloseBtn.addEventListener("click", closeTodoModal);
+todoCancelBtn.addEventListener("click", closeTodoModal);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !todoModal.hidden) closeTodoModal();
+});
+todoSaveBtn.addEventListener("click", async () => {
+  todoSaveBtn.disabled = true;
+  try {
+    const md = compileFlow();
+    await invoke("set_todo", { markdown: md });
+    todoMarkdown = md;
+    closeTodoModal();
+    renderTodo();
+  } catch (e) {
+    addSystemMessage(`Error saving the to-do list: ${e}`);
+  } finally {
+    todoSaveBtn.disabled = false;
+  }
+});
+todoCollapseBtn.addEventListener("click", () => {
+  const collapsed = todoPanel.classList.toggle("collapsed");
+  todoCollapseBtn.textContent = collapsed ? "▸" : "▾";
+  todoCollapseBtn.title = collapsed ? "Expand" : "Collapse";
+});
 
 // ----- Send message ---------------------------------------------------------
 async function sendMessage() {
@@ -622,6 +1151,17 @@ function setupListeners() {
       case "status": {
         const msg = payload.message || payload.status || JSON.stringify(payload);
         addSystemMessage(msg);
+        break;
+      }
+      case "todo_updated": {
+        // The agent replaced the shared plan (via the update_todo tool).
+        todoMarkdown = payload.markdown || "";
+        renderTodo();
+        // If the editor modal is open, rebuild the flow from the new plan.
+        if (!todoModal.hidden) {
+          flowItems = parseFlow(todoMarkdown);
+          renderTodoFlow();
+        }
         break;
       }
     }
@@ -2140,6 +2680,7 @@ async function recoverLaunch() {
     chatScreen.classList.add("active");
     await populateModels();
     await loadSidebar(result);
+    await loadTodo();
     addSystemMessage(`Access recovered. Set a new launch password. Working in: ${result.project_path}`);
     messageInput.focus();
   } catch (e) {
@@ -2529,12 +3070,43 @@ function startNewSubAgent() {
   openSubAgentForm(null);
 }
 
-function openSubAgentForm(sa) {
+/** Fill the sub-agent form's model selector with every model the active
+ *  backend recognizes (same source as the chat picker). `selected` is the
+ *  sub-agent's saved tag; a tag no longer listed (e.g. pulled from another
+ *  backend) is kept as an extra option so editing never silently loses it. */
+async function populateSubAgentModelSelect(selected) {
+  let models = [];
+  try {
+    models = await invoke("list_models");
+  } catch (e) {
+    console.warn("Sub-agent model list failed:", e);
+  }
+  subagentFormModel.innerHTML = "";
+  const active = document.createElement("option");
+  active.value = "";
+  active.textContent = "(active model) — follows the chat's selection";
+  subagentFormModel.appendChild(active);
+  for (const m of models) {
+    const opt = document.createElement("option");
+    opt.value = m;
+    opt.textContent = m;
+    subagentFormModel.appendChild(opt);
+  }
+  if (selected && !models.includes(selected)) {
+    const stale = document.createElement("option");
+    stale.value = selected;
+    stale.textContent = `${selected} (not currently listed)`;
+    subagentFormModel.appendChild(stale);
+  }
+  subagentFormModel.value = selected || "";
+}
+
+async function openSubAgentForm(sa) {
   editingSubAgentId = sa ? sa.id : null;
   subagentFormTitle.textContent = sa ? `Edit: ${sa.name}` : "New sub-agent";
   subagentFormName.value = sa ? sa.name : "";
   subagentFormDesc.value = sa ? sa.description : "";
-  subagentFormModel.value = sa ? sa.model : "";
+  await populateSubAgentModelSelect(sa ? sa.model : "");
   subagentFormPersona.value = sa ? sa.persona : "";
   subagentForm.hidden = false;
   subagentFormName.focus();

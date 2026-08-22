@@ -126,6 +126,43 @@ impl Tool for DelegateTool {
     }
 }
 
+/// The `update_todo` tool — replaces the to-do list shown in the chat's
+/// to-do panel. This built-in only ADVERTISES the tool to the model; execution
+/// is intercepted by the runtime (`run_update_todo`), which persists the
+/// markdown, injects it into the system prompt, and notifies the UI.
+pub struct UpdateTodoTool;
+
+#[async_trait]
+impl Tool for UpdateTodoTool {
+    fn name(&self) -> &str {
+        "update_todo"
+    }
+    fn description(&self) -> &str {
+        "Replace the shared to-do list shown to the user in the chat's plan panel. \
+         Call with {\"markdown\":\"<full updated markdown>\"} — headings for phases, \
+         `- [ ] task` for pending, `- [x] ~~task~~` (strikethrough) for done. Send the \
+         COMPLETE list every time (it replaces the old one). Use it whenever a plan \
+         is agreed and whenever a task completes."
+    }
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "markdown": {"type": "string", "description": "The full to-do list markdown."}
+            },
+            "required": ["markdown"]
+        })
+    }
+    fn kind(&self) -> ToolKind {
+        // Only touches the in-app plan panel — no filesystem effect.
+        ToolKind::Read
+    }
+    async fn run(&self, _args: &Value, _ctx: &ToolContext) -> ToolResult {
+        // Execution is intercepted by the runtime before this is reached.
+        ToolResult::err("update_todo is handled by the runtime.")
+    }
+}
+
 /// The registry of available tools.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
@@ -152,6 +189,7 @@ impl ToolRegistry {
             Box::new(search::Grep),
             Box::new(shell::RunCommand),
             Box::new(DelegateTool),
+            Box::new(UpdateTodoTool),
         ];
         tools.extend(extra);
         Self { tools, approval_policy: std::sync::Mutex::new(approval_policy) }

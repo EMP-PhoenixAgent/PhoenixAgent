@@ -49,7 +49,7 @@ pub struct WebState {
     pub db_key: Mutex<Option<DerivedKey>>,
     /// Current reasoning mode (Plan/Think/Auto) — drives the approval-policy
     /// preset selected from the chat mode bar. Readable from launch (default
-    /// Auto); the runtime applies it live via `Command::SetMode`.
+    /// Think); the runtime applies it live via `Command::SetMode`.
     pub mode: Mutex<crate::config::Mode>,
 }
 

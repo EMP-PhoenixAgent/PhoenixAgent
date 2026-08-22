@@ -47,6 +47,9 @@ pub fn run(config: Config, paths: Paths, workdir: std::path::PathBuf) -> Result<
             commands::learn,
             commands::set_mode,
             commands::get_mode,
+            // To-do list (shared plan panel)
+            commands::get_todo,
+            commands::set_todo,
             // Sub-Agents (Panel 6)
             commands::list_sub_agents,
             commands::create_sub_agent,

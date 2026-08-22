@@ -112,24 +112,55 @@
           <!-- Chat messages -->
           <div id="chat-messages"></div>
 
+          <!-- To-do list (the shared plan) — pinned to the top-right corner of
+               the chat area. Display only: the agent maintains it via the
+               update_todo tool, and the 📋 title opens the editor modal (Plan
+               mode) for manual changes. Markdown with GFM strikethrough
+               (`~~task~~`) marking done tasks. -->
+          <div id="todo-panel" hidden>
+            <div id="todo-header">
+              <button id="todo-open-btn" class="todo-btn" title="Open the plan editor (Plan mode)">📋 Plan</button>
+              <button id="todo-collapse-btn" class="todo-btn" title="Collapse">▾</button>
+            </div>
+            <div id="todo-body" class="todo-md"></div>
+          </div>
+
           <!-- Live phase indicator (shown while the agent is working) -->
           <div id="agent-phase" class="agent-phase" hidden></div>
 
-          <!-- Reasoning mode selector (Plan/Think/Auto) — sits above the send button -->
-          <div id="mode-bar">
-            <button class="mode-btn" data-mode="plan" title="Read-only: investigate + plan, no edits">🧭 Plan</button>
-            <button class="mode-btn" data-mode="think" title="Discuss the task with the agent, no execution">💬 Think</button>
-            <button class="mode-btn" data-mode="auto" title="Autonomous: full access, act directly">⚡ Auto</button>
-          </div>
-
-          <!-- Input area: textarea (left) + controls column (right) -->
+          <!-- Chatbox: ONE big container — text input (left) | invisible wall |
+               controls column (right: model picker above, mode selector +
+               Send at the corner). -->
           <div id="input-row" class="glass">
             <textarea id="message-input" placeholder="Type a message... (Enter to send, Shift+Enter for newline)" rows="3"></textarea>
             <div id="input-controls">
-              <button id="send-btn" class="btn-primary">Send ▶</button>
               <div id="model-picker" class="model-picker">
                 <button id="model-picker-btn" class="model-picker-btn" title="Switch model">Model ▾</button>
                 <div id="model-popup" class="model-popup" hidden></div>
+              </div>
+              <!-- Send row: 32px-high reasoning-mode selector beside an
+                   even-height Send button. -->
+              <div id="send-row">
+                <div id="mode-selector">
+                  <button id="mode-face" title="Reasoning mode: Think — click to change" aria-haspopup="menu" aria-expanded="false">
+                    <span id="mode-face-icon"><svg class="mode-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/><path d="M17.599 6.5a3 3 0 0 0 .399-1.375"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M19.938 10.5a4 4 0 0 1 .585.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M19.967 17.484A4 4 0 0 1 18 18"/></svg></span>
+                  </button>
+                  <div id="mode-popout" hidden>
+                    <button class="mode-btn" data-mode="plan" title="Read-only: investigate + plan, no edits">
+                      <svg class="mode-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/></svg>
+                      <span>Plan</span>
+                    </button>
+                    <button class="mode-btn active" data-mode="think" title="Discuss the task with the agent, no execution">
+                      <svg class="mode-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/><path d="M17.599 6.5a3 3 0 0 0 .399-1.375"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M19.938 10.5a4 4 0 0 1 .585.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M19.967 17.484A4 4 0 0 1 18 18"/></svg>
+                      <span>Think</span>
+                    </button>
+                    <button class="mode-btn" data-mode="auto" title="Autonomous: full access, act directly">
+                      <svg class="mode-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                      <span>Auto</span>
+                    </button>
+                  </div>
+                </div>
+                <button id="send-btn" class="btn-primary">Send ▶</button>
               </div>
               <!-- Hidden native select kept for any code that reads .value; the
                    custom picker is the real UI now. -->
@@ -492,7 +523,7 @@
           <div class="panel-body">
             <input type="text" id="subagent-form-name" placeholder="Name (e.g. Mathematician)" autocomplete="off" />
             <input type="text" id="subagent-form-desc" placeholder="Short specialty (shown to the main agent)" autocomplete="off" />
-            <input type="text" id="subagent-form-model" placeholder="Model tag (e.g. qwen3:8b) — blank = active model" autocomplete="off" />
+            <select id="subagent-form-model" title="Model this sub-agent runs on — (active model) follows the chat's selection"></select>
             <textarea id="subagent-form-persona" placeholder="Persona / system prompt for the sub-agent…" rows="10"></textarea>
             <div class="skill-form-actions">
               <button id="subagent-form-save" class="btn-primary">Save</button>
@@ -516,6 +547,54 @@
             <button id="alpha-run-btn" class="btn-primary">Run Chronos test</button>
             <button id="alpha-later-btn" class="btn-secondary">Remind me later</button>
             <button id="alpha-never-btn" class="btn-link">Don't show again</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- To-do list editor modal — manual plan changes (Plan mode). Drag the
+         palette cards into the flow (or click a card to append); the plan
+         compiles to markdown, previewed live on the right. -->
+    <div id="todo-modal" class="panel-overlay" hidden>
+      <div class="panel glass panel-todo">
+        <div class="panel-header panel-header-stacked">
+          <span class="panel-title">Plan — To-do list</span>
+          <div class="panel-header-row">
+            <span class="todo-modal-hint">Drag a card into the flow · `- [ ]` pending · `- [x] ~~done~~`</span>
+            <button id="todo-modal-close-btn" class="btn-icon" title="Close">✕</button>
+          </div>
+        </div>
+        <div class="panel-body todo-edit-body">
+          <div id="todo-palette">
+            <div class="palette-card" draggable="true" data-card="task" title="Drag into the flow to create a task (or click to append)">
+              <span class="palette-icon">➕</span>
+              <span class="palette-name">New Task</span>
+              <span class="palette-desc">main step</span>
+            </div>
+            <div class="palette-card" draggable="true" data-card="subtask" title="Drop under a Task to add a sub-task">
+              <span class="palette-icon">↳</span>
+              <span class="palette-name">New Sub-task</span>
+              <span class="palette-desc">under a task</span>
+            </div>
+            <div class="palette-card" draggable="true" data-card="tool" title="Drop below a task or sub-task to attach a tool">
+              <span class="palette-icon">🔧</span>
+              <span class="palette-name">Tool</span>
+              <span class="palette-desc">for the item above</span>
+            </div>
+            <div class="palette-card" draggable="true" data-card="subagent" title="Drop ABOVE a Task — it will be delegated to a sub-agent">
+              <span class="palette-icon">🤖</span>
+              <span class="palette-name">Sub-agent</span>
+              <span class="palette-desc">next task + stop marker</span>
+            </div>
+          </div>
+          <div class="todo-edit-split">
+            <div id="todo-flow"></div>
+            <div id="todo-preview" class="todo-md"></div>
+          </div>
+          <div id="todo-editor-actions">
+            <span class="todo-editor-note">Saving updates the plan panel and the agent's context immediately.</span>
+            <button id="todo-cancel-btn" class="todo-btn">Cancel</button>
+            <button id="todo-save-btn">Save</button>
           </div>
         </div>
       </div>

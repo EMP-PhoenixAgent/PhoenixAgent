@@ -329,6 +329,15 @@ async fn boot_runtime(
         }
     };
 
+    // Load the persisted to-do list (the shared plan) so the system prompt and
+    // the UI panel start from where the last session left off.
+    let todo: String = {
+        let s = store.lock().await;
+        s.get_setting("todo_markdown")
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default()
+    };
+
     let model_name = cfg.model.clone();
 
     // If a cloud provider was active at last shutdown, re-apply its endpoint now
@@ -441,6 +450,7 @@ async fn boot_runtime(
         enabled_user_tools,
         enabled_context,
         enabled_mcp,
+        todo,
     );
 
     // Store the channels for commands to use.
@@ -651,7 +661,7 @@ pub async fn learn(state: State<'_, WebState>) -> Result<String, String> {
 }
 
 /// Mode selector (Plan/Think/Auto) — apply the mode's approval-policy preset
-/// live. The UI bar above the send button calls this.
+/// live. The selector in the chatbox's send row calls this.
 #[tauri::command]
 pub async fn set_mode(state: State<'_, WebState>, mode: String) -> Result<(), String> {
     let m = crate::config::Mode::parse(&mode)
@@ -671,6 +681,41 @@ pub async fn set_mode(state: State<'_, WebState>, mode: String) -> Result<(), St
 #[tauri::command]
 pub async fn get_mode(state: State<'_, WebState>) -> Result<String, String> {
     Ok(state.mode.lock().await.label().to_string())
+}
+
+/// Read the to-do list markdown (the shared plan shown in the chat's to-do
+/// panel). Empty string when none exists.
+#[tauri::command]
+pub async fn get_todo(state: State<'_, WebState>) -> Result<String, String> {
+    let store = state.store.lock().await;
+    let store = store.as_ref().ok_or("Not unlocked yet")?;
+    let s = store.lock().await;
+    s.get_setting("todo_markdown")
+        .map_err(|e| e.to_string())
+        .map(|v| v.unwrap_or_default())
+}
+
+/// Replace the to-do list markdown from the UI editor (Plan mode). Persists it
+/// and pushes it into the runtime so the system prompt reflects the new plan.
+#[tauri::command]
+pub async fn set_todo(state: State<'_, WebState>, markdown: String) -> Result<(), String> {
+    // 1. Persist (source of truth; the runtime does not persist on SetTodo).
+    {
+        let store = state.store.lock().await;
+        let store = store.as_ref().ok_or("Not unlocked yet")?;
+        let s = store.lock().await;
+        s.set_setting("todo_markdown", &markdown)
+            .map_err(|e| e.to_string())?;
+    }
+    // 2. Push into the runtime (updates Shared.todo + rebuilds the prompt).
+    let tx = state.cmd_tx.lock().await;
+    match tx.as_ref() {
+        Some(sender) => sender
+            .send(Command::SetTodo { markdown })
+            .await
+            .map_err(|e| format!("Agent channel closed: {e}")),
+        None => Err("Not unlocked yet".into()),
+    }
 }
 
 /// List all sub-agents (Panel 6).

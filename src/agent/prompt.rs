@@ -12,11 +12,14 @@ use crate::config::Mode;
 /// - `context` — enabled context files (name, description, body); rendered into
 ///   a `## Project Context` section framed as authoritative ground truth the
 ///   model must respect and never contradict.
+/// - `todo` — the current to-do list markdown; rendered into a `## Current
+///   Plan` section so the model works from the same plan the user sees.
 pub fn build_system_prompt(
     ctx: &ToolContext,
     tool_summaries: &[(&str, &str)],
     skills: &[(&str, &str, &str)],
     context: &[(&str, &str, &str)],
+    todo: &str,
     mode: Mode,
 ) -> String {
     let mut s = String::new();
@@ -98,6 +101,26 @@ pub fn build_system_prompt(
                 s.push('\n');
             }
         }
+    }
+
+    // Current plan — the shared to-do list, only when one exists. The user
+    // sees this same markdown in the chat's to-do panel.
+    if !todo.is_empty() {
+        s.push_str("\n## Current Plan\n");
+        s.push_str("This is the to-do list the user currently sees in the plan panel. \
+                    Work from it and keep it current: call `update_todo` with the full \
+                    updated markdown whenever a task completes or the plan changes. Mark \
+                    finished tasks `- [x] ~~task~~` (strikethrough), keep pending ones \
+                    `- [ ] task`. The user may also annotate the plan:\n");
+        s.push_str("- `- 🤖 sub-agent: <name>` — the task AFTER this line must be \
+                    delegated to that sub-agent (via the `delegate` tool).\n");
+        s.push_str("- `- ⏹ STOP` — when running a delegated task, stop the sub-agent's \
+                    work once the plan reaches this marker; the user positions it.\n");
+        s.push_str("- `- 🔧 \\`tool\\`` under a Task — prefer this tool throughout that \
+                    whole task; under a sub-task — use it for that sub-task only.\n");
+        s.push_str("- Sub-tasks are indented list items belonging to the task above them.\n\n");
+        s.push_str(todo);
+        s.push('\n');
     }
 
     // Operating mode — tells the model how to behave (on top of the approval
