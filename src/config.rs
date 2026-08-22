@@ -1,16 +1,31 @@
 //! Configuration loading/saving and path resolution.
 //!
-//! Data layout under the data directory (default `~/.phoenix`):
+//! Phoenix is **fully portable**: every file the app creates lives inside the
+//! installation folder the user picked in the installer (the directory of the
+//! running executable) — no scattered home-directory folders.
+//!
+//! Data layout under the data directory:
 //! ```text
-//! ~/.phoenix/
+//! <install folder>/
 //! ├── config.toml
 //! ├── memory.db            <- SQLCipher-encrypted database
 //! ├── salt.bin             <- Argon2 salt (needed to re-derive key)
-//! └── logs/
-//!     └── phoenix.log
+//! ├── keys.phx             <- wrapped key bundle
+//! ├── 2fa_enabled          <- unencrypted boolean hint
+//! ├── logs/
+//! │   └── phoenix.log
+//! └── models/              <- AmberCore GGUFs + tokenizers + manifest.json
 //! ```
+//!
+//! Resolution order for the data dir ([`Paths::default_data_dir`]):
+//! 1. `$PHOENIX_DATA_DIR` (tests / tooling),
+//! 2. debug builds → `~/.phoenix-dev` (keeps the dev tree clean),
+//! 3. release builds → the executable's folder (the install folder).
+//!
+//! [`migrate_legacy_data`] copies a pre-portable layout (`~/.phoenix` +
+//! `~/.ambercore`) into the new data root on first run — nothing is deleted.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -54,7 +69,7 @@ pub struct Config {
     pub active_provider_id: Option<i64>,
 
     /// Optional custom models directory for AmberCore. When unset, AmberCore uses
-    /// its native folder (`~/.ambercore/models`).
+    /// the portable default (`<install folder>/models`).
     #[serde(default)]
     pub ambercore_models_dir: Option<String>,
 
@@ -99,7 +114,7 @@ impl Config {
     }
 
     /// The resolved AmberCore models directory, or `None` to use AmberCore's native
-    /// folder (`~/.ambercore/models`).
+    /// portable default (`<install folder>/models`).
     pub fn ambercore_models_dir_path(&self) -> Option<PathBuf> {
         self.ambercore_models_dir
             .as_ref()
@@ -289,21 +304,135 @@ impl Paths {
         }
     }
 
-    /// Default data dir: `~/.phoenix` (or `$PHOENIX_DATA_DIR` if set).
+    /// Default data dir — see the module docs for the resolution order:
+    /// `$PHOENIX_DATA_DIR`, then `~/.phoenix-dev` in debug builds, then the
+    /// executable's folder (the user-selected installation folder) in release
+    /// builds. That last one is the point of the portable layout: everything
+    /// Phoenix creates (config, DB, keys, logs, models) lives where the user
+    /// installed the app.
     pub fn default_data_dir() -> PathBuf {
         if let Ok(custom) = std::env::var("PHOENIX_DATA_DIR") {
             return PathBuf::from(custom);
         }
-        let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        base.join(".phoenix")
+        #[cfg(debug_assertions)]
+        {
+            let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            base.join(".phoenix-dev")
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| PathBuf::from("."))
+        }
     }
 
-    /// Ensure the data and logs directories exist.
+    /// Ensure the data and logs directories exist **and are writable** — the
+    /// portable layout keeps everything in the install folder, so a folder the
+    /// user can't write to (e.g. a system location) must fail loudly here, not
+    /// as a mysterious DB error later.
     pub fn ensure_dirs(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.data_dir)?;
-        std::fs::create_dir_all(&self.logs_dir)?;
+        std::fs::create_dir_all(&self.data_dir).map_err(|e| self.unwritable(e))?;
+        std::fs::create_dir_all(&self.logs_dir).map_err(|e| self.unwritable(e))?;
+        let probe = self.data_dir.join(".write-probe");
+        std::fs::write(&probe, b"ok")
+            .and_then(|_| std::fs::remove_file(&probe))
+            .map_err(|e| self.unwritable(e))?;
         Ok(())
     }
+
+    fn unwritable(&self, e: std::io::Error) -> PhoenixError {
+        PhoenixError::Config(format!(
+            "the data folder {} is not writable ({e}). Phoenix stores all of its \
+             files in the installation folder — reinstall it to a location your \
+             user account can write to.",
+            self.data_dir.display(),
+        ))
+    }
+}
+
+/// The default AmberCore models dir: `<data root>/models` — inside the
+/// installation folder like everything else (a custom dir set in the Models
+/// panel still wins).
+pub fn default_models_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("models")
+}
+
+/// One-time migration from the pre-portable layout into `paths.data_dir`.
+///
+/// Runs when the new data root has no `config.toml` yet. Copies (never
+/// deletes) from `legacy_home/.phoenix` (config, DB, salt, keys, 2FA marker)
+/// and `legacy_home/.ambercore/models` (GGUFs, tokenizers, manifest) into the
+/// new root; a migrated config pointing at the old default models dir is
+/// rewritten to use the new one. Existing files in the destination are never
+/// overwritten.
+pub fn migrate_legacy_data(paths: &Paths, legacy_home: &Path) {
+    if paths.config_path.exists() {
+        return; // Fresh install or already migrated.
+    }
+    let legacy_phoenix = legacy_home.join(".phoenix");
+    let legacy_models = legacy_home.join(".ambercore").join("models");
+    if !legacy_phoenix.is_dir() && !legacy_models.is_dir() {
+        return; // Nothing to migrate.
+    }
+    tracing::info!(
+        new_root = %paths.data_dir.display(),
+        "first run after the portable-layout change: migrating legacy data"
+    );
+
+    if legacy_phoenix.is_dir() {
+        for name in ["config.toml", "memory.db", "salt.bin", "keys.phx", "2fa_enabled"] {
+            let src = legacy_phoenix.join(name);
+            let dst = paths.data_dir.join(name);
+            if src.is_file() && !dst.exists() {
+                if let Err(e) = std::fs::copy(&src, &dst) {
+                    tracing::warn!("migrate {name}: {e}");
+                } else {
+                    tracing::info!("migrated {name}");
+                }
+            }
+        }
+    }
+
+    let new_models = default_models_dir(&paths.data_dir);
+    if legacy_models.is_dir() {
+        if let Err(e) = copy_dir_missing(&legacy_models, &new_models) {
+            tracing::warn!("migrate models: {e}");
+        }
+    }
+
+    // A migrated config may still point at the old default models dir —
+    // rewrite it to the portable one (a truly custom dir is left alone).
+    if let Ok(mut cfg) = load_config(paths) {
+        let rewrite = cfg
+            .ambercore_models_dir
+            .as_deref()
+            .map(|d| PathBuf::from(d) == legacy_models)
+            .unwrap_or(false);
+        if rewrite {
+            cfg.ambercore_models_dir = None;
+            let _ = save_config(paths, &cfg);
+            tracing::info!("migrated config: models dir reset to the portable default");
+        }
+    }
+}
+
+/// Recursively copy `src` into `dst`, skipping files that already exist at the
+/// destination (never overwrites). Creates `dst` as needed.
+fn copy_dir_missing(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let s = entry.path();
+        let d = dst.join(entry.file_name());
+        if s.is_dir() {
+            copy_dir_missing(&s, &d)?;
+        } else if !d.exists() {
+            std::fs::copy(&s, &d)?;
+        }
+    }
+    Ok(())
 }
 
 /// Load config from disk, falling back to defaults if missing.

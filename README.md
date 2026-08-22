@@ -65,8 +65,9 @@ Pulls are validated before anything is registered:
   the URLs it tried, and a retry (or a manual tokenizer URL) only downloads
   the missing file.
 
-Models live in `~/.ambercore/models/` by default (configurable in the panel)
-as `<model>.gguf` + `<model>.tokenizer.json`.
+Models live in `<install folder>/models/` by default (configurable in the
+panel) as per-model subfolders: `<model>/<model>.gguf` +
+`<model>/<model>.tokenizer.json`.
 
 ### GPU acceleration
 
@@ -141,8 +142,13 @@ phoenix-agent/
 └── installer.nsi          legacy NSIS script (Tauri's bundler drives builds)
 ```
 
-App data (encrypted database, wrapped-key bundle `keys.phx`, `config.toml`)
-lives under `~/.phoenix/` by default.
+Phoenix Agent is **fully portable**: everything the app creates — the
+encrypted database, the wrapped-key bundle `keys.phx`, `config.toml`, logs,
+and models — lives inside the **installation folder you chose in the
+installer**. Nothing is scattered in your home directory. (Upgrading from a
+pre-v0.8.3 install? The app copies your old `~/.phoenix` + `~/.ambercore`
+data into the install folder automatically on first run — the originals are
+left untouched.)
 
 ## Security notes (honest)
 

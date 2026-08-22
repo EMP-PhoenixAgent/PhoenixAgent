@@ -1015,14 +1015,17 @@ pub struct AmberCoreModel {
     pub size: String,
 }
 
-/// Resolve the AmberCore models directory: the configured override, else AmberCore's
-/// native folder (`~/.ambercore/models`).
+/// Resolve the AmberCore models directory: the configured override, else the
+/// portable default (`<install folder>/models`).
 fn resolve_ambercore_dir(cfg: &crate::config::Config) -> Option<std::path::PathBuf> {
     if let Some(d) = cfg.ambercore_models_dir_path() {
         return Some(d);
     }
-    // Fall back to AmberCore's native folder.
-    dirs::home_dir().map(|h| h.join(".ambercore").join("models"))
+    // Portable default: `<install folder>/models` — same resolution order as
+    // `Paths::default_data_dir` (env override → dev → executable folder).
+    Some(crate::config::default_models_dir(
+        &crate::config::Paths::default_data_dir(),
+    ))
 }
 
 /// Parse a quantization tag out of a GGUF filename, e.g.

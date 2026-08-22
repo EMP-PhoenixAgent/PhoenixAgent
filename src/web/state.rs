@@ -71,17 +71,20 @@ impl WebState {
             ActiveRoute::Local { backend: local_backend }
         };
         // The embedded AmberCore engine is constructed once at launch (cheap —
-        // models load lazily on first use / warm-up). A missing/unreadable
-        // models dir degrades to a temp catalog so the app still boots.
-        let embedded = crate::model::ambercore_embedded::EmbeddedAmberCore::new(
-            config.ambercore_models_dir_path(),
-        )
-        .unwrap_or_else(|e| {
-            tracing::warn!("embedded AmberCore init failed; falling back to a temp catalog: {e}");
-            let dir = std::env::temp_dir().join("phoenix-ambercore-fallback");
-            crate::model::ambercore_embedded::EmbeddedAmberCore::new(Some(dir))
-                .expect("embedded AmberCore fallback engine must construct")
-        });
+        // models load lazily on first use / warm-up). Models default to
+        // `<install folder>/models` (the portable layout); a custom dir set in
+        // the Models panel wins. A missing/unreadable dir degrades to a temp
+        // catalog so the app still boots.
+        let models_dir = config
+            .ambercore_models_dir_path()
+            .unwrap_or_else(|| crate::config::default_models_dir(&paths.data_dir));
+        let embedded = crate::model::ambercore_embedded::EmbeddedAmberCore::new(Some(models_dir))
+            .unwrap_or_else(|e| {
+                tracing::warn!("embedded AmberCore init failed; falling back to a temp catalog: {e}");
+                let dir = std::env::temp_dir().join("phoenix-ambercore-fallback");
+                crate::model::ambercore_embedded::EmbeddedAmberCore::new(Some(dir))
+                    .expect("embedded AmberCore fallback engine must construct")
+            });
         let provider = Arc::new(DispatchProvider::new(&local_url, route, embedded));
 
         Self {

@@ -20,7 +20,8 @@ use phoenix_agent::model::ModelProvider as _;
     about = "Phoenix Agent — a fully-local, encrypted, autonomous coding agent"
 )]
 struct Cli {
-    /// Override the data directory (default ~/.phoenix).
+    /// Override the data directory (default: the installation folder — the
+    /// directory the app is running from).
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
 
@@ -48,7 +49,12 @@ fn main() -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(Paths::default_data_dir);
     let paths = Paths::new(data_dir);
-    paths.ensure_dirs().context("create data dirs")?;
+    paths.ensure_dirs().context("prepare data dirs")?;
+    // One-time migration from the pre-portable layout (~/.phoenix +
+    // ~/.ambercore) into the install-folder data root. No-op on fresh
+    // installs and after the first run.
+    let legacy_home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    phoenix_agent::config::migrate_legacy_data(&paths, &legacy_home);
 
     let workdir = cli
         .workdir

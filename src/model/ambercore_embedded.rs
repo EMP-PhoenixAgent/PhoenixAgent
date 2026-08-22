@@ -41,7 +41,7 @@ pub struct EmbeddedAmberCore {
 
 impl EmbeddedAmberCore {
     /// Build the engine against a models directory (`None` = AmberCore's native
-    /// `~/.ambercore/models`). The directory is created if missing so pulls and
+    /// `<install folder>/models`). The directory is created if missing so pulls and
     /// `ambercore register` have a home; an unreadable directory is a hard error.
     pub fn new(models_dir: Option<PathBuf>) -> Result<Self> {
         let dir = match models_dir {
