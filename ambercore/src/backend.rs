@@ -329,7 +329,7 @@ mod cuda {
             let device = Device::new_cuda(ordinal)
                 .map_err(|e| Error::Backend(format!("CUDA init (ordinal {ordinal}): {e}")))?;
             warm_up_kernel(&device)
-                .map_err(|e| Error::Backend(translate_cuda_error(&e.to_string())))?;
+                .map_err(|e| Error::Backend(super::translate_cuda_error(&e.to_string())))?;
             Ok(Self { ordinal, device })
         }
     }
@@ -337,8 +337,8 @@ mod cuda {
     /// Run one trivial kernel so the PTX modules actually load + JIT now.
     fn warm_up_kernel(device: &Device) -> std::result::Result<(), candle_core::Error> {
         use candle_core::Tensor;
-        let a = Tensor::new([1.0f32, 2.0], device)?;
-        let b = Tensor::new([3.0f32, 4.0], device)?;
+        let a = Tensor::new(&[1.0f32, 2.0], device)?;
+        let b = Tensor::new(&[3.0f32, 4.0], device)?;
         let _ = &a + &b;
         Ok(())
     }
