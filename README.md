@@ -52,7 +52,7 @@ restart:
   the engine ships inside the app binary, launches with it, and preloads your
   last-used model so the first message answers fast. A remote AmberCore server
   can be linked instead by entering its `URL:port` (see
-  [`AmberCore-Server`](../AmberCore-Server/README.md)).
+  [`AmberCore-Server`](../AmberCore/README.md)).
 - **Ollama** — local; auto-install and model pulls from the panel.
 - **Provider API** — any OpenAI-compatible cloud endpoint. API keys are
   stored encrypted in the database and always blurred in the UI.
