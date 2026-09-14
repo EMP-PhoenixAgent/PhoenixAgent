@@ -10,7 +10,7 @@
 //! `registry::build(&mut loaded, &device)` → a boxed [`DynModel`] the pipeline
 //! drives.
 //!
-//! Two adapter patterns exist:
+//! Adapter patterns:
 //! 1. **Direct** — thin [`DynModel`] wrappers over candle's
 //!    `quantized_*::ModelWeights::from_gguf` (qwen2, qwen3, llama, gemma, phi,
 //!    glm4, lfm2).
@@ -20,18 +20,33 @@
 //! 3. **Port** — when candle's model needs a local fix, a copied +
 //!    modified implementation lives here ([`qwen3_moe`], which adds the
 //!    KV-cache clear candle 0.11 lacks).
+//! 4. **Hand-built** — architectures candle has no quantized loader for at
+//!    all, built here from llama.cpp's reference graph over the same
+//!    quantized primitives (QMatMul / grouped MoE GEMM / ConcatKvCache):
+//!    [`granite`], [`nemotron`], [`minimax_m2`], [`gemma4`], [`deepseek2`].
+//!    [`common`] (masks, metadata, rope) + [`moe`] (routed experts) hold the
+//!    pieces they share.
 
+pub mod common;
+pub mod deepseek2;
 pub mod gguf;
 pub mod gemma;
+pub mod gemma4;
 pub mod glm4;
+pub mod granite;
 pub mod lfm2;
 pub mod llama;
+pub mod minimax_m2;
 pub mod mixtral;
+pub mod moe;
+pub mod nemotron;
 pub mod phi;
 pub mod qwen2;
 pub mod qwen3;
 pub mod qwen3_moe;
+pub mod qwen35;
 pub mod registry;
+pub mod st_shim;
 
 pub use gguf::LoadedModel;
 pub use registry::{build, DynModel};

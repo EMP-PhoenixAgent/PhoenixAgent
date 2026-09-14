@@ -227,9 +227,17 @@ pub async fn generate_events(
                 }
 
                 if has_tools {
-                    // With tools active, DON'T stream during generation — the
-                    // model may emit `<tool_call>` blocks mid-stream that are
-                    // only safely filtered after the fact (below).
+                    // Tools active: CONTENT stays buffered (a `<tool_call>`
+                    // block must not leak as text — it is parsed after the
+                    // fact, below), but the reasoning streams live: a `<think>`
+                    // block can never contain a tool call, and streaming it
+                    // makes TTFT real and feeds the UI's live working
+                    // indicator during tool turns.
+                    for piece in splitter_inner_feed(&splitter_inner, &delta) {
+                        if let Piece::Think(t) = piece {
+                            let _ = tx_for_events.blocking_send(GenEvent::Reasoning(t));
+                        }
+                    }
                     return;
                 }
 
@@ -249,13 +257,17 @@ pub async fn generate_events(
 
         // Flush any think/content text left buffered in the splitter (the final
         // delta often ends mid-classification with a partial marker held back).
-        if !has_tools {
-            for piece in splitter.borrow_mut().finish() {
-                let ev = match piece {
-                    Piece::Think(t) => GenEvent::Reasoning(t),
-                    Piece::Content(t) => GenEvent::Content(t),
-                };
-                let _ = tx.blocking_send(ev);
+        // Reasoning flushes in BOTH paths (with tools it was streaming live);
+        // content only streams in the no-tools path — the tools path buffers
+        // content for post-processing below.
+        for piece in splitter.borrow_mut().finish() {
+            match piece {
+                Piece::Think(t) => { let _ = tx.blocking_send(GenEvent::Reasoning(t)); }
+                Piece::Content(t) => {
+                    if !has_tools {
+                        let _ = tx.blocking_send(GenEvent::Content(t));
+                    }
+                }
             }
         }
 
@@ -263,10 +275,9 @@ pub async fn generate_events(
         // `<tool_call>` markers into structured calls, and stream the clean
         // content in one shot.
         let tool_calls = if has_tools {
-            let (think_text, content_text) = split_think(&full_text.borrow());
-            if !think_text.is_empty() {
-                let _ = tx.blocking_send(GenEvent::Reasoning(think_text));
-            }
+            // Reasoning was already streamed live (above); only the content
+            // side is parsed for tool calls here.
+            let (_, content_text) = split_think(&full_text.borrow());
             let parsed = crate::server::tools::parse_tool_calls(&content_text);
             if !parsed.remaining_text.is_empty() {
                 let _ = tx.blocking_send(GenEvent::Content(parsed.remaining_text));

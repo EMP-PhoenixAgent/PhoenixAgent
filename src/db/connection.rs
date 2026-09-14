@@ -22,6 +22,7 @@ fn migrations() -> &'static Migrations<'static> {
             M::up(include_str!("../../migrations/0006_memory.sql")),
             M::up(include_str!("../../migrations/0007_providers.sql")),
             M::up(include_str!("../../migrations/0008_sub_agents.sql")),
+            M::up(include_str!("../../migrations/0009_sessions_status.sql")),
         ])
     })
 }

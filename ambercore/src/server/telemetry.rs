@@ -80,6 +80,10 @@ pub struct HardwareStatus {
     pub os: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu: Option<crate::backend::GpuInfo>,
+    /// Set when the most recent model load found less free VRAM than the
+    /// model needs (WDDM oversubscription risk). Surfaced so the UI can warn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vram_warning: Option<String>,
 }
 
 /// Capture the hardware snapshot once. Cheap to clone thereafter.

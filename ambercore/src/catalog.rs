@@ -78,14 +78,14 @@ impl Catalog {
             for entry in std::fs::read_dir(models_dir)? {
                 let entry = entry?;
                 let path = entry.path();
-                if is_gguf(&path) {
+                if is_model_file(&path) && is_first_shard(&path) {
                     insert_scanned(&mut entries, &path, None);
                 } else if path.is_dir() {
                     // One level of per-model subfolders. Relative `file` paths
                     // (`<folder>/<name>.gguf`) resolve against the models dir.
                     for sub in std::fs::read_dir(&path)? {
                         let sub = sub?.path();
-                        if is_gguf(&sub) {
+                        if is_model_file(&sub) && is_first_shard(&sub) {
                             let folder = path
                                 .file_name()
                                 .and_then(|n| n.to_str())
@@ -126,6 +126,27 @@ impl Catalog {
     /// Look up an entry by its exact tag.
     pub fn get(&self, tag: &str) -> Option<&CatalogEntry> {
         self.entries.get(tag)
+    }
+
+    /// Look up an entry tolerating the two spellings the ecosystem produces:
+    /// Phoenix registers pulled models under the bare file stem
+    /// (`gemma-4-E2B-it-Q4_K_M`) while the directory scan derives
+    /// `<stem>:latest`. Resolution tries the exact tag, then the stem before
+    /// the first `:`, then `tag:latest` (when the tag has no `:`). Returns the
+    /// entry and the canonical registered tag — used to key replica pools so
+    /// alias spellings share one pool.
+    pub fn resolve(&self, tag: &str) -> Option<(&CatalogEntry, String)> {
+        if let Some(entry) = self.entries.get(tag) {
+            return Some((entry, tag.to_string()));
+        }
+        if let Some((stem, _)) = tag.split_once(':') {
+            if let Some(entry) = self.entries.get(stem) {
+                return Some((entry, stem.to_string()));
+            }
+        } else if let Some(entry) = self.entries.get(&format!("{tag}:latest")) {
+            return Some((entry, format!("{tag}:latest")));
+        }
+        None
     }
 
     /// Resolve an entry's `file` to an absolute path.
@@ -184,11 +205,29 @@ impl Catalog {
 }
 
 /// Whether a path has a `.gguf` extension (case-insensitive).
-fn is_gguf(path: &Path) -> bool {
+/// A model file the catalog registers: quantized GGUF, or native F16
+/// safetensors (needs a sibling `config.json` to load — enforced at load
+/// time, not here).
+fn is_model_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("gguf"))
+        .map(|e| e.eq_ignore_ascii_case("gguf") || e.eq_ignore_ascii_case("safetensors"))
         .unwrap_or(false)
+}
+
+/// Whether a scanned model file should be REGISTERED: sharded safetensors
+/// checkpoints contribute only their first shard — the engine stitches the
+/// rest via the sibling index.json, and the catalog stays one-entry-per-model.
+fn is_first_shard(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return true };
+    let lower = name.to_ascii_lowercase();
+    if !lower.ends_with(".safetensors") {
+        return true;
+    }
+    match lower.rfind("-of-") {
+        None => true,
+        Some(_) => lower.contains("-00001-of-"),
+    }
 }
 
 /// Register a scanned GGUF under its derived tag. `folder` prefixes the stored
@@ -252,6 +291,33 @@ mod tests {
     #[test]
     fn derive_tag_falls_back_to_latest() {
         assert_eq!(derive_tag("some-model"), "some-model:latest");
+    }
+
+    #[test]
+    fn resolve_tolerates_both_tag_spellings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Scan-registered: tag is `<stem>:latest`, but Phoenix references the
+        // bare stem (its `derive_ambercore_tag` keeps the stem verbatim).
+        std::fs::write(dir.path().join("gemma-4-E2B-it-Q4_K_M.gguf"), b"x").unwrap();
+        let mut cat = Catalog::load(dir.path()).unwrap();
+        assert!(cat.get("gemma-4-E2B-it-Q4_K_M").is_none(), "bare stem is not the exact tag");
+        let (_, canonical) = cat
+            .resolve("gemma-4-E2B-it-Q4_K_M")
+            .expect("bare stem resolves to the :latest entry");
+        assert_eq!(canonical, "gemma-4-E2B-it-Q4_K_M:latest");
+
+        // Manifest-registered: Phoenix writes the bare stem; a `:latest`
+        // client spelling still finds it and reports the canonical tag.
+        cat.register(CatalogEntry {
+            tag: "kimi-k2-instruct-Q4_K_M".into(),
+            file: "kimi/kimi-k2-instruct-Q4_K_M.gguf".into(),
+            arch: None,
+        })
+        .unwrap();
+        let (_, canonical) = cat
+            .resolve("kimi-k2-instruct-Q4_K_M:latest")
+            .expect(":latest spelling resolves to the bare-stem entry");
+        assert_eq!(canonical, "kimi-k2-instruct-Q4_K_M");
     }
 
     #[test]

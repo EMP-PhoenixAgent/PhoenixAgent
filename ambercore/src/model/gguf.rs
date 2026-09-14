@@ -17,32 +17,88 @@ use crate::error::{Error, Result};
 use candle_core::quantized::gguf_file::Content;
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::{Read, Seek};
 use std::path::Path;
 
-/// A loaded GGUF model, ready to be handed to an architecture constructor.
+/// The model file the architecture builder reads tensors from: a plain GGUF,
+/// or the safetensors-backed patched reader (see [`crate::model::st_shim`]).
+/// Adapters are generic over `Read + Seek`, so both flow through `Gguf::new`
+/// unchanged.
+pub enum ModelFile {
+    Gguf(File),
+    Safetensors(crate::model::st_shim::PatchedReader),
+}
+
+impl Read for ModelFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            ModelFile::Gguf(f) => f.read(buf),
+            ModelFile::Safetensors(r) => r.read(buf),
+        }
+    }
+}
+
+impl Seek for ModelFile {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        match self {
+            ModelFile::Gguf(f) => f.seek(pos),
+            ModelFile::Safetensors(r) => r.seek(pos),
+        }
+    }
+}
+
+/// A loaded model, ready to be handed to an architecture constructor.
 ///
 /// Owns the open file (so tensors can be read lazily from disk by the
-/// architecture builder) plus the parsed [`Content`] (consumed by `from_gguf`).
+/// architecture builder) plus the parsed [`Content`] (consumed by `from_gguf`
+/// — for safetensors models the Content is synthesized by [`crate::model::st_shim`]
+/// over the mmap, keeping weights F16/BF16 in place).
 pub struct LoadedModel {
-    /// Architecture string from `general.architecture` (e.g. `"qwen2"`, `"llama"`).
+    /// Architecture string from `general.architecture` (e.g. `"qwen2"`, `"qwen35"`).
     pub arch: String,
-    /// Human-readable name from `general.name` (best-effort).
+    /// Human-readable model name from `general.name` (best-effort).
     pub name: Option<String>,
     /// The parsed GGUF content — handed to `ModelWeights::from_gguf`. It is an
     /// `Option` because the architecture builder consumes it.
     pub content: Option<Content>,
-    /// The still-open file handle, kept so the builder can read tensor data.
-    pub file: File,
+    /// The still-open model file, kept so the builder can read tensor data.
+    pub file: ModelFile,
     /// Selected metadata values surfaced for convenience (max seq len, etc.).
     pub meta: HashMap<String, String>,
 }
 
-/// Read only a GGUF's header and return its `general.architecture` string.
+/// Read a model's architecture string: the GGUF header's
+/// `general.architecture`, or — for `.safetensors` — the `model_type` of the
+/// sibling `config.json` mapped onto the same arch names.
 ///
-/// Cheap regardless of model size (the header + metadata table is a few MB;
-/// tensor data is never read). Used to validate a freshly downloaded model
-/// against the registry's supported set before it's registered.
+/// Cheap regardless of model size. Used to validate a freshly downloaded
+/// model against the registry's supported set before it's registered.
 pub fn probe_arch(path: &Path) -> Result<String> {
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("safetensors"))
+        .unwrap_or(false)
+    {
+        let cfg_path = path.parent().unwrap_or(Path::new(".")).join("config.json");
+        let raw = std::fs::read_to_string(&cfg_path)
+            .map_err(|e| Error::Model(format!("F16 model needs {}: {e}", cfg_path.display())))?;
+        let cfg: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| Error::Model(format!("parse {}: {e}", cfg_path.display())))?;
+        let mt = cfg
+            .get("text_config")
+            .and_then(|t| t.get("model_type"))
+            .or_else(|| cfg.get("model_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        return match mt {
+            "qwen3" => Ok("qwen3".into()),
+            "qwen3_5" | "qwen3_5_text" => Ok("qwen35".into()),
+            other => Err(Error::Model(format!(
+                "safetensors model_type `{other}` has no F16 loader yet (supported: qwen3, qwen3_5)"
+            ))),
+        };
+    }
     let mut file = File::open(path)
         .map_err(|e| Error::Model(format!("open {}: {e}", path.display())))?;
     let content = Content::read(&mut file)
@@ -56,11 +112,31 @@ pub fn probe_arch(path: &Path) -> Result<String> {
 }
 
 impl LoadedModel {
-    /// Open and parse a GGUF file.
+    /// Open and parse a model file — GGUF, or `.safetensors` with a sibling
+    /// `config.json` (native F16/BF16 via the content shim).
     ///
     /// Reads the header + metadata table. Tensor data is left on disk and read
     /// lazily by the architecture builder (via `from_gguf`).
     pub fn load(path: &Path) -> Result<Self> {
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("safetensors"))
+            .unwrap_or(false)
+        {
+            let (arch, content, reader, meta) = crate::model::st_shim::load_safetensors(path)?;
+            let name = std::fs::File::open(path.parent().unwrap_or(Path::new(".")).join("config.json"))
+                .ok()
+                .and_then(|_| None::<String>);
+            return Ok(Self {
+                arch,
+                name,
+                content: Some(content),
+                file: ModelFile::Safetensors(reader),
+                meta,
+            });
+        }
+
         let mut file = File::open(path)
             .map_err(|e| Error::Model(format!("open {}: {e}", path.display())))?;
 
@@ -114,7 +190,7 @@ impl LoadedModel {
             arch,
             name,
             content: Some(content),
-            file,
+            file: ModelFile::Gguf(file),
             meta,
         })
     }

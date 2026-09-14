@@ -305,11 +305,12 @@ impl Paths {
     }
 
     /// Default data dir — see the module docs for the resolution order:
-    /// `$PHOENIX_DATA_DIR`, then `~/.phoenix-dev` in debug builds, then the
-    /// executable's folder (the user-selected installation folder) in release
-    /// builds. That last one is the point of the portable layout: everything
-    /// Phoenix creates (config, DB, keys, logs, models) lives where the user
-    /// installed the app.
+    /// `$PHOENIX_DATA_DIR`, then `~/.phoenix-dev` in debug builds, then —
+    /// this Encapsulated build — the **staging dir**: a private temp folder
+    /// keyed by the exe's own path (`%TEMP%\PA-Encaps\<hash>`). All state
+    /// lives there at runtime and is sealed back INTO the exe at exit /
+    /// auto-save, so the app folder holds nothing but the exe itself.
+    /// (`PHOENIX_ENCAPS_PORTABLE=1` restores the classic exe-dir layout.)
     pub fn default_data_dir() -> PathBuf {
         if let Ok(custom) = std::env::var("PHOENIX_DATA_DIR") {
             return PathBuf::from(custom);
@@ -321,11 +322,27 @@ impl Paths {
         }
         #[cfg(not(debug_assertions))]
         {
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .unwrap_or_else(|| PathBuf::from("."))
+            if std::env::var_os("PHOENIX_ENCAPS_PORTABLE").is_some() {
+                return std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                    .unwrap_or_else(|| PathBuf::from("."));
+            }
+            Self::encaps_staging_dir()
         }
+    }
+
+    /// The Encapsulated staging dir: stable per exe LOCATION (copying the exe
+    /// to another folder gives a fresh, isolated staging), tucked into the
+    /// user's temp where it never pollutes the app folder.
+    pub fn encaps_staging_dir() -> PathBuf {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pa-encaps"));
+        let mut h = DefaultHasher::new();
+        exe.to_string_lossy().to_lowercase().hash(&mut h);
+        let key = format!("{:016x}", h.finish());
+        std::env::temp_dir().join("PA-Encaps").join(key)
     }
 
     /// Ensure the data and logs directories exist **and are writable** — the
@@ -357,6 +374,109 @@ impl Paths {
 /// panel still wins).
 pub fn default_models_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("models")
+}
+
+/// The Encapsulated default models dir: a plain `models` folder **beside the
+/// exe** — public artifacts that live and stay on disk, never inside the
+/// encrypted capsule and never in the temp staging area. Created on
+/// resolution. Falls back to the data-dir default when the exe folder is
+/// unwritable (or in debug builds, where the "exe" is `target/debug` and
+/// models belong in the dev data dir instead).
+pub fn encaps_models_dir(data_dir: &Path) -> PathBuf {
+    #[cfg(not(debug_assertions))]
+    {
+        if std::env::var_os("PHOENIX_ENCAPS_PORTABLE").is_none() {
+            if let Some(dir) = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("models")))
+            {
+                if dir_writable(&dir) {
+                    return dir;
+                }
+            }
+        }
+    }
+    let dir = default_models_dir(data_dir);
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Ensure `dir` exists and is writable (probe write). Used by
+/// [`encaps_models_dir`] — a models dir the app cannot write to would make
+/// every pull fail, so we check once and fall back instead.
+fn dir_writable(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".write-probe");
+    std::fs::write(&probe, b"ok")
+        .and_then(|_| std::fs::remove_file(&probe))
+        .is_ok()
+}
+
+/// One-time move of models from the old staging layout (`<temp staging>/
+/// models`, where the pre-Phase-C build kept them) into the exe-side models
+/// folder. Best-effort: per-item failures are logged and skipped; `rename`
+/// first (fast, same volume), then a streamed copy across volumes. Never
+/// overwrites, never deletes a source that failed to copy.
+pub fn migrate_staging_models(staging_models: &Path, dest: &Path) {
+    let _ = std::fs::create_dir_all(dest);
+    // Same dir (read-only-exe fallback resolves both to `<data dir>/models`)
+    // — nothing to move, and the per-item "already there" branch must NOT
+    // run against itself.
+    let (Ok(a), Ok(b)) = (staging_models.canonicalize(), dest.canonicalize()) else {
+        return;
+    };
+    if a == b {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(staging_models) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dest);
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let from = entry.path();
+        let to = dest.join(&name);
+        if to.exists() {
+            let _ = std::fs::remove_dir_all(&from); // already there — drop the dup
+            continue;
+        }
+        let moved = std::fs::rename(&from, &to).is_ok() || copy_dir_streamed(&from, &to);
+        if moved {
+            tracing::info!("models: moved {} beside the exe", name.to_string_lossy());
+        } else {
+            tracing::warn!(
+                "models: could not move {} — it stays in the temp staging area",
+                name.to_string_lossy()
+            );
+        }
+    }
+    let _ = std::fs::remove_dir(staging_models); // no-op unless now empty
+}
+
+/// Recursive copy used by [`migrate_staging_models`] (streamed, never
+/// buffered in full). Returns success only when every file copied.
+fn copy_dir_streamed(src: &Path, dst: &Path) -> bool {
+    if src.is_file() {
+        if let Some(p) = dst.parent() {
+            if std::fs::create_dir_all(p).is_err() {
+                return false;
+            }
+        }
+        let Ok(mut s) = std::fs::File::open(src) else { return false };
+        let Ok(mut d) = std::fs::File::create(dst) else { return false };
+        if std::io::copy(&mut s, &mut d).is_err() {
+            let _ = std::fs::remove_file(dst);
+            return false;
+        }
+        return std::fs::remove_file(src).is_ok();
+    }
+    let Ok(rd) = std::fs::read_dir(src) else { return false };
+    if std::fs::create_dir_all(dst).is_err() {
+        return false;
+    }
+    rd.flatten().all(|e| copy_dir_streamed(&e.path(), &dst.join(e.file_name())))
 }
 
 /// One-time migration from the pre-portable layout into `paths.data_dir`.
@@ -452,4 +572,40 @@ pub fn save_config(paths: &Paths, cfg: &Config) -> Result<()> {
         .map_err(|e| PhoenixError::Config(format!("serialize config: {e}")))?;
     std::fs::write(&paths.config_path, text)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrate_staging_models_moves_children() {
+        let tmp = std::env::temp_dir().join(format!("pa-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let src = tmp.join("staging/models/qwen-3");
+        let dst = tmp.join("exedir/models");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("model.gguf"), b"gguf").unwrap();
+        std::fs::write(src.join("model.tokenizer.json"), b"tk").unwrap();
+
+        migrate_staging_models(&tmp.join("staging/models"), &dst);
+        assert!(dst.join("qwen-3/model.gguf").exists());
+        assert!(dst.join("qwen-3/model.tokenizer.json").exists());
+        assert!(!src.exists(), "the moved tree is gone from staging");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn migrate_staging_models_same_dir_is_a_noop() {
+        let tmp = std::env::temp_dir().join(format!("pa-mig-same-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dir = tmp.join("models/qwen-3");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.gguf"), b"gguf").unwrap();
+
+        // src == dest (the read-only-exe fallback): must not delete anything.
+        migrate_staging_models(&tmp.join("models"), &tmp.join("models"));
+        assert!(dir.join("model.gguf").exists(), "same-dir migrate must be a no-op");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

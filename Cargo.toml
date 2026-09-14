@@ -1,19 +1,22 @@
 [package]
 name = "phoenix-agent"
-version = "0.8.4"
+version = "0.8.5"
 edition = "2021"
 rust-version = "1.80"
 description = "A fully-local, encrypted, autonomous coding agent"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
-name = "phoenix"
+name = "phoenix-agent"
 path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# Capsule: zip tail writer/reader (crc + raw deflate for the small entries).
+crc32fast = "1"
+flate2 = "1"
 # Async
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
@@ -71,6 +74,9 @@ tempfile = "3"
 
 # Tauri (native desktop window with web frontend)
 tauri = { version = "2", features = [] }
+# Native OS file/directory picker (workdir selection uses the directory dialog).
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
 
 # Embedded AmberCore — the in-process model engine (pure Rust, Candle). Built
 # CPU-only by default so the distributed installers stay portable; opt into GPU

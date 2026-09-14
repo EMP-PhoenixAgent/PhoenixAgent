@@ -24,7 +24,6 @@ const setupBtn = $("setup-btn");
 const setupError = $("setup-error");
 
 const chatMessages = $("chat-messages");
-const agentPhase = $("agent-phase");
 const messageInput = $("message-input");
 const sendBtn = $("send-btn");
 const modelSelect = $("model-select");
@@ -38,25 +37,51 @@ const sidebarResizer = $("sidebar-resizer");
 const modelsNavItem = document.querySelector('.nav-item[data-panel="models"]');
 const skillsNavItem = document.querySelector('.nav-item[data-panel="skills"]');
 const workdirDisplay = $("workdir-display");
-const workdirChangeBtn = $("workdir-change-btn");
-const profileSelect = $("profile-select");
+const workdirRow = $("workdir-row");
 const profileNewBtn = $("profile-new-btn");
+const profileHomeBtn = $("profile-home-btn");
+// Sidebar console (output log + input line) + its height drag handle.
+const consoleOutput = $("console-output");
+const consoleInput = $("console-input");
+const consoleResizer = $("console-resizer");
+const consoleSection = $("console-section");
 const modelsPanel = $("models-panel");
 const modelsCloseBtn = $("models-close-btn");
-// Models panel v0.5 — AmberCore / Ollama / Provider API
-const icBox = $("ambercore-box");
+// Circular download progress ring on the Models nav item (far right of the
+// button) — thin ring with the completion percentage inside.
+const navEta = $("nav-eta");
+const navEtaRing = navEta ? navEta.querySelector(".nav-eta-ring") : null;
+const navEtaPct = navEta ? navEta.querySelector(".nav-eta-pct") : null;
+// Models panel v0.5 — runner tabs (AmberCore | Ollama) + shared model list
+const runnerBox = $("runner-box");
+const paneAmberCore = $("pane-ambercore");
+const paneOllama = $("pane-ollama");
+const mlTitle = $("ml-title");
+const mlAcquireAmberCore = $("ml-acquire-ambercore");
+const mlAcquireOllama = $("ml-acquire-ollama");
+// Which runner the settings pane + model list show ("ambercore" | "ollama");
+// persisted across sessions like the console height.
+let activeRunner = "ambercore";
 const icDir = $("ic-dir");
 const icDirClear = $("ic-dir-clear");
-const icUrl = $("ic-url");
-const icTokenizerUrl = $("ic-tokenizer-url");
-const icPullBtn = $("ic-pull-btn");
-const icProgress = $("ic-progress");
+const icSearchBtn = $("ic-search-btn");
+// Model search modal.
+const modelSearchModal = $("model-search-modal");
+const msQuery = $("ms-query");
+const msSearchBtn = $("ms-search-btn");
+const msCloseBtn = $("ms-close-btn");
+const msResults = $("ms-results");
+const msVram = $("ms-vram");
+const msFilterSize = $("ms-filter-size");
+const msFilterQuant = $("ms-filter-quant");
+const msFilterParams = $("ms-filter-params");
+let msActiveSource = "huggingface";
+let msLastResponse = null; // last search — the filters re-slice it, no re-fetch
+const mlPullBars = $("ml-pull-bars");
 const icList = $("ic-list");
-const olBox = $("ollama-box");
 const olInstallBtn = $("ol-install-btn");
 const olPull = $("ol-pull");
 const olPullBtn = $("ol-pull-btn");
-const olProgress = $("ol-progress");
 const olList = $("ol-list");
 const prBox = $("provider-box");
 const prName = $("pr-name");
@@ -188,9 +213,8 @@ let pendingTotp = null;
 let currentModel = "";
 let isAgentBusy = false;
 let streamingBubble = null; // the assistant bubble currently receiving deltas
-let streamingThinking = null; // the thinking block currently receiving reasoning
+let workingBlock = null; // the inline working indicator currently receiving reasoning
 let toolCards = {}; // index -> tool-card element for the current turn's batch
-let subAgentBlocks = {}; // index -> sub-agent block nested in the delegate card
 let activeProfileId = null; // tracked across unlock/profile switch
 let editingSkillId = null;  // null = creating new, number = editing
 
@@ -206,19 +230,13 @@ async function init() {
   // Set up listeners immediately so events aren't missed after unlock/setup.
   setupListeners();
 
-  // Dev convenience: in debug builds (`cargo tauri dev`), auto-unlock with the
-  // known dev launch password so iteration doesn't require retyping it every
-  // restart. `is_dev` is false in release builds, so this never ships.
-  const dev = await invoke("is_dev").catch(() => false);
-
+  // NOTE: this tree ships as the encapsulated launcher — there is no dev
+  // auto-unlock here (no bypass and no hardcoded password in the shipped JS).
+  // Developer convenience lives in the old dev tree / typing the password.
   if (!ready) {
     // First run — show setup screen.
     setupScreen.classList.add("active");
     setupPassphrase.focus();
-  } else if (dev) {
-    // Returning user, dev build — skip the unlock screen automatically.
-    passphraseInput.value = "PhoenixAgent";
-    await doUnlock();
   } else {
     // Returning user — show unlock screen (launch password gate).
     unlockScreen.classList.add("active");
@@ -295,6 +313,7 @@ async function doUnlock() {
 
     // Add welcome message.
     addSystemMessage(`Ready. Working in: ${result.project_path}`);
+    refreshSessionRail();
 
     messageInput.focus();
 
@@ -483,6 +502,9 @@ function renderTodo() {
   // Visible when there's a plan to show, or when the user could write one
   // (Plan mode shows the panel with an empty-state hint).
   todoPanel.hidden = empty && currentMode !== "plan";
+  // The "invisible wall": while the to-do overlay is up, reserve the chat's
+  // right side so messages never flow under it (see styles.css todo-open).
+  document.getElementById("main-column")?.classList.toggle("todo-open", !todoPanel.hidden);
   if (todoPanel.hidden) return;
   todoBody.innerHTML = empty
     ? '<div id="todo-empty">No plan yet — the agent will fill this in while working, or open the editor (📋 above) in Plan mode.</div>'
@@ -966,9 +988,8 @@ async function sendMessage() {
   isAgentBusy = true;
   sendBtn.disabled = true;
   streamingBubble = null; // will be created on first delta
-  streamingThinking = null;
+  workingBlock = null;
   toolCards = {};
-  subAgentBlocks = {};
   setPhase("Working…");
   refreshHealthLabel(); // flip the health-bar busy indicator immediately
 
@@ -987,11 +1008,15 @@ function handleSlashCommand(text) {
   const arg = rest.join(" ").trim();
   switch (cmd) {
     case "/help":
-      addSystemMessage("Commands: /model <name>, /new, /clear, /learn, /context-resume, /help");
+      addSystemMessage(
+        "Commands: /model <name>, /new, /clear, /cc (compact the conversation into a context file + new session), /learn (update the agent's project memory: what's to do & what's done), /context-resume, /help"
+      );
       break;
     case "/new":
       invoke("new_session").catch((e) => addSystemMessage(`Error: ${e}`));
       chatMessages.innerHTML = "";
+      sessionViews.clear(); // fresh chat — past-session views close with it
+      refreshSessionRail();
       addSystemMessage("New session started.");
       break;
     case "/clear":
@@ -1004,10 +1029,30 @@ function handleSlashCommand(text) {
         addSystemMessage(`Current model: ${currentModel}`);
       }
       break;
+    case "/cc":
+      // Context Compacting: summarize the whole conversation into a context
+      // file, then start a fresh session (the history is replaced by the
+      // compact — nothing deleted, the old session stays in the DB).
+      addSystemMessage("Compacting context — summarizing the conversation…");
+      invoke("compact_context")
+        .then((name) => {
+          if (!name) return;
+          chatMessages.innerHTML = "";
+          sessionViews.clear(); // the chat was cleared — past views go with it
+          refreshSessionRail(); // dash flips to green (learned + compacted)
+          addSystemMessage(
+            `Context compacted into “${name}” — new session started with the compact loaded.`
+          );
+        })
+        .catch((e) => addSystemMessage(`Error: ${e}`));
+      break;
     case "/learn":
-      addSystemMessage("Compacting this conversation into a memory note…");
+      addSystemMessage("Updating project memory — what's to do & what's done…");
       invoke("learn")
-        .then((r) => { if (r) addSystemMessage(r); })
+        .then((r) => {
+          if (r) addSystemMessage(r);
+          refreshSessionRail(); // dash flips to orange/green
+        })
         .catch((e) => addSystemMessage(`Error: ${e}`));
       break;
     case "/context-resume":
@@ -1026,19 +1071,20 @@ function setupListeners() {
     const payload = event.payload;
     switch (payload.type) {
       case "assistant_reasoning": {
-        if (!streamingThinking) {
-          streamingThinking = createThinkingBlock();
+        if (!workingBlock) {
+          workingBlock = ensureWorkingBlock();
         }
-        const content = streamingThinking.querySelector(".thinking-body .content");
+        const content = workingBlock.querySelector(".thinking-body .content");
         content.dataset.raw = (content.dataset.raw || "") + payload.delta;
         content.textContent += payload.delta;
-        updateThinkingMeta(streamingThinking);
+        updateThinkingMeta(workingBlock);
+        setPhaseTitle("Thinking…");
         scrollToBottom();
         break;
       }
       case "assistant_delta": {
         // The visible answer begins → fold the thinking block away (auto-collapse).
-        finalizeThinking();
+        endReasoningSegment();
         if (!streamingBubble) {
           streamingBubble = addAssistantMessage("");
         }
@@ -1048,7 +1094,7 @@ function setupListeners() {
         break;
       }
       case "assistant_message": {
-        finalizeThinking();
+        endReasoningSegment();
         if (streamingBubble) {
           // Finalize: render markdown.
           const content = streamingBubble.querySelector(".content");
@@ -1059,90 +1105,93 @@ function setupListeners() {
         }
         // A new assistant message starts a fresh tool batch (indices reset to 0).
         toolCards = {};
-        subAgentBlocks = {};
         scrollToBottom();
         break;
       }
       case "tool_started": {
-        finalizeThinking();
+        endReasoningSegment();
         streamingBubble = null; // stop streaming into an assistant bubble
-        createToolCard(payload.index, payload.name, payload.args);
+        createToolActivityCard(payload.index, payload.name, payload.args);
         setPhase(`Running ${toolLabel(payload.name)}…`);
         break;
       }
       case "tool_needs_approval": {
-        finalizeThinking();
+        endReasoningSegment();
         // Render the card (if not already) and transition it to approval state.
         if (!toolCards[payload.index]) {
-          createToolCard(payload.index, payload.name, payload.args);
+          createToolActivityCard(payload.index, payload.name, payload.args);
         }
-        setToolApproval(payload.index, payload.name);
+        setToolActivityApproval(payload.index, payload.name);
         setPhase(`Needs approval: ${toolLabel(payload.name)}`);
         break;
       }
       case "tool_finished": {
-        finishToolCard(payload.index, payload.success, payload.result, payload.duration_ms);
+        finishToolActivityCard(payload.index, payload.success, payload.result, payload.duration_ms);
         break;
       }
       case "tool_denied": {
         if (toolCards[payload.index]) {
-          finishToolCard(payload.index, false, "Denied by user.", null);
+          denyToolActivityCard(payload.index);
         } else {
           addSystemMessage(`Tool denied: ${payload.name}`);
         }
         break;
       }
       case "subagent_started": {
-        if (toolCards[payload.index]) {
-          addSubAgentBlock(payload.index, payload.name, payload.model, payload.task);
+        const card = toolCards[payload.index];
+        if (card) {
+          const body = card.querySelector(".activity-body");
+          body.innerHTML = "";
+          body.appendChild(activitySubagentBody(payload.name, payload.model, payload.task));
+          const out = document.createElement("div");
+          out.className = "sa-out";
+          body.appendChild(out);
+          setActivityStatus(card, "working…", "live");
         }
         setPhase(`Delegating to ${payload.name}…`);
         break;
       }
       case "subagent_delta": {
-        const block = subAgentBlocks[payload.index];
-        if (block) {
-          block.querySelector(".subagent-text").textContent += payload.text;
-          scrollToBottom();
-        }
-        break;
-      }
-      case "subagent_reasoning": {
-        const block = subAgentBlocks[payload.index];
-        if (block) {
-          const rc = block.querySelector(".subagent-reasoning .content");
-          rc.dataset.raw = (rc.dataset.raw || "") + payload.text;
-          rc.textContent += payload.text;
-          block.querySelector(".subagent-reasoning").hidden = false;
+        const out = toolCards[payload.index]?.querySelector(".sa-out");
+        if (out) {
+          out.textContent += payload.text;
           scrollToBottom();
         }
         break;
       }
       case "subagent_finished": {
-        const block = subAgentBlocks[payload.index];
-        if (block) {
-          block.querySelector(".subagent-status").textContent = "✓ done";
-          block.classList.add("done");
-        }
+        const card = toolCards[payload.index];
+        if (card) setActivityStatus(card, "✓ done", "done");
         break;
       }
       case "turn_done": {
         isAgentBusy = false;
         sendBtn.disabled = false;
-        finalizeThinking();
+        endReasoningSegment();
         streamingBubble = null;
         toolCards = {};
-        subAgentBlocks = {};
         setPhase(null);
         refreshHealthLabel(); // idle indicator + final metrics right away
+        refreshSessionRail(); // a new session row may have appeared
+        autosaveSeal(); // task finished — carry it in the exe
         break;
       }
       case "error": {
         const msg = payload.message || payload.error || JSON.stringify(payload);
         addSystemMessage(`Error: ${msg}`);
+        addModelActivity({
+          kind: "error",
+          title: "Error — I need your help",
+          status: "turn failed",
+          state: "attention",
+          body: activityErrorBody(
+            msg,
+            "The agent stopped this turn. Check the console in the sidebar, or send the request again."
+          ),
+        });
         isAgentBusy = false;
         sendBtn.disabled = false;
-        finalizeThinking();
+        endReasoningSegment();
         streamingBubble = null;
         setPhase(null);
         refreshHealthLabel();
@@ -1188,8 +1237,9 @@ function setupListeners() {
 // ----- Message helpers ------------------------------------------------------
 function addUserMessage(text) {
   const div = document.createElement("div");
+  // No role badge: the right-anchored mirrored glass already reads as "you".
   div.className = "message user";
-  div.innerHTML = `<div class="role-badge">You</div><div class="content">${escapeHtml(text)}</div>`;
+  div.innerHTML = `<div class="content">${escapeHtml(text)}</div>`;
   chatMessages.appendChild(div);
   scrollToBottom();
 }
@@ -1203,37 +1253,91 @@ function addAssistantMessage(text) {
   return div;
 }
 
+// ----- Sidebar console -------------------------------------------------------
+// Every functional message + error lands here now (workdir/profile changes,
+// VRAM verdicts, failures…) — the chat stays conversation-only. The console
+// doubles as a user shell in the active workdir.
+
+/** Bounded console command history for ↑/↓ navigation. */
+const consoleHistory = [];
+let consoleHistoryIdx = 0;
+
+/** Append a line to the sidebar console. `kind`: info | warn | err | cmd | dim. */
+function logConsole(text, kind = "info") {
+  if (!consoleOutput) return;
+  const line = document.createElement("div");
+  line.className = `console-line c-${kind}`;
+  line.textContent = text;
+  consoleOutput.appendChild(line);
+  while (consoleOutput.childElementCount > 500) {
+    consoleOutput.firstElementChild.remove();
+  }
+  consoleOutput.scrollTop = consoleOutput.scrollHeight;
+}
+
+/** Run the console input as a shell command in the active workdir. */
+async function runConsoleCommand() {
+  const command = consoleInput.value.trim();
+  if (!command) return;
+  consoleInput.value = "";
+  consoleHistory.push(command);
+  if (consoleHistory.length > 50) consoleHistory.shift();
+  consoleHistoryIdx = consoleHistory.length;
+  if (command.toLowerCase() === "clear" || command.toLowerCase() === "cls") {
+    consoleOutput.innerHTML = "";
+    return;
+  }
+  logConsole(`❯ ${command}`, "cmd");
+  try {
+    const out = await invoke("console_run", { command });
+    if (out.stdout) logConsole(out.stdout.replace(/\n+$/, ""), "info");
+    if (out.stderr) logConsole(out.stderr.replace(/\n+$/, ""), "err");
+    if (out.exit_code !== 0) logConsole(`(exit code ${out.exit_code})`, "err");
+    if (!out.stdout && !out.stderr && out.exit_code === 0) logConsole("(no output)", "dim");
+  } catch (e) {
+    logConsole(String(e), "err");
+  }
+}
+
+/**
+ * Functional message — workdir/profile changes, VRAM verdicts, errors, tool
+ * denials… Since the console rework these render in the SIDEBAR CONSOLE
+ * (color-coded by severity), not as chat bubbles.
+ */
 function addSystemMessage(text) {
-  const div = document.createElement("div");
-  div.className = "message system";
-  div.innerHTML = `<div class="content">${escapeHtml(text)}</div>`;
-  chatMessages.appendChild(div);
-  scrollToBottom();
+  const kind = /^error/i.test(text)
+    ? "err"
+    : /REFUSED|Low VRAM|failed|Failed|timed out|denied/i.test(text)
+      ? "warn"
+      : "info";
+  logConsole(text, kind);
 }
 
 // ----- Reasoning / tool pipeline UI ----------------------------------------
-// Builds the visible step-by-step pipeline: a collapsible thinking block,
-// expandable tool cards (correlated start↔finish), nested sub-agent cards, and
-// a live phase pill. All reuse the glass / role-tint / flame-glow language.
+// Builds the visible step-by-step pipeline: an inline working indicator (the
+// phase label + live reasoning stream, riding the pipeline's tail), collapsible
+// thinking chips it leaves behind, expandable tool cards (correlated
+// start↔finish), and nested sub-agent cards. All reuse the glass / role-tint /
+// flame-glow language.
 
-/** Show / update / hide the live phase pill. `null` hides it. */
+/** Live phase label, shown in the inline working indicator inside the chat.
+ *  `null` (or the answering phase, whose stream is visible on its own) ends
+ *  the indicator; any other label (re)creates it at the END of the chat — the
+ *  pipeline's tail — so it always sits where the next event will land. */
 function setPhase(label) {
-  if (!agentPhase) return;
-  if (!label) {
-    agentPhase.hidden = true;
+  if (!label || label === "Answering…") {
+    removeWorkingBlock();
     return;
   }
-  agentPhase.hidden = false;
-  agentPhase.innerHTML = `<span class="phase-dot"></span><span class="phase-label">${escapeHtml(label)}</span>`;
+  const block = ensureWorkingBlock();
+  setPhaseTitle(label);
 }
 
-/** Icon (emoji) for a tool name. */
-function toolIcon(name) {
-  const map = {
-    read_file: "📖", write_file: "✍️", edit_file: "✎", list_dir: "📁",
-    grep: "🔍", run_command: "⚙️", delegate: "🤖",
-  };
-  return map[name] || "🛠";
+/** Update the working block's header label (no-op when titles match). */
+function setPhaseTitle(label) {
+  if (!workingBlock) return;
+  const title = workingBlock.querySelector(".thinking-title");
+  if (title.textContent !== label) title.textContent = label;
 }
 
 /** Human label for a tool name. */
@@ -1241,25 +1345,44 @@ function toolLabel(name) {
   return (name || "tool").replace(/_/g, " ");
 }
 
-/** Create an expanded, glowing thinking block that receives reasoning deltas. */
-function createThinkingBlock() {
-  const block = document.createElement("div");
-  block.className = "thinking-block active";
-  block.innerHTML = `
-    <div class="thinking-header">
-      <span class="thinking-icon">◷</span>
-      <span class="thinking-title">Thinking</span>
-      <span class="thinking-meta">…</span>
-      <span class="chevron">▾</span>
-    </div>
-    <div class="thinking-body"><div class="content"></div></div>`;
-  block.querySelector(".thinking-header").addEventListener("click", () => {
-    block.classList.toggle("collapsed");
-    block.querySelector(".chevron").textContent = block.classList.contains("collapsed") ? "▸" : "▾";
-  });
-  chatMessages.appendChild(block);
+/** The inline working indicator: a thinking-block variant whose header is a
+ *  pulsing dot + the live phase label, and whose body streams the model's
+ *  reasoning so the user can monitor it in real time. It rides the tail of the
+ *  chat pipeline (appendChild MOVES an existing block to the end, so it always
+ *  follows the latest thinking chip / tool card). */
+function ensureWorkingBlock() {
+  if (!workingBlock) {
+    const block = document.createElement("div");
+    // Same header anatomy as the activity cards (icon chip + title + meta +
+    // chevron) so collapsed rows align across the whole family. Starts
+    // collapsed — click to watch the stream.
+    block.className = "thinking-block working active collapsed";
+    block.innerHTML = `
+      <div class="thinking-header">
+        <span class="activity-icon">◷</span>
+        <span class="thinking-title">Working…</span>
+        <span class="thinking-meta"></span>
+        <span class="chevron">▸</span>
+      </div>
+      <div class="thinking-body"><div class="content"></div></div>`;
+    block.querySelector(".thinking-header").addEventListener("click", () => {
+      block.classList.toggle("collapsed");
+      block.querySelector(".chevron").textContent = block.classList.contains("collapsed") ? "▸" : "▾";
+    });
+    workingBlock = block;
+  }
+  chatMessages.appendChild(workingBlock);
   scrollToBottom();
-  return block;
+  return workingBlock;
+}
+
+/** Drop the inline working indicator (turn over, or answering — the answer
+ *  stream is its own indicator). */
+function removeWorkingBlock() {
+  if (workingBlock) {
+    workingBlock.remove();
+    workingBlock = null;
+  }
 }
 
 /** Update the "N lines · M chars" meta on a thinking block while it streams. */
@@ -1270,133 +1393,414 @@ function updateThinkingMeta(block) {
   block.querySelector(".thinking-meta").textContent = `${lines} line${lines === 1 ? "" : "s"} · ${chars} chars`;
 }
 
-/** Fold the streaming thinking block away (auto-collapse) and render markdown. */
-function finalizeThinking() {
-  if (!streamingThinking) return;
-  const block = streamingThinking;
-  streamingThinking = null;
+/** Freeze the current reasoning segment: with content it becomes the standard
+ *  collapsed "Thinking · N lines" chip IN PLACE (pipeline order preserved);
+ *  empty it stays the live working indicator — the next phase event re-rides
+ *  it to the chat's tail. */
+function endReasoningSegment() {
+  if (!workingBlock) return;
+  const block = workingBlock;
   const content = block.querySelector(".thinking-body .content");
   const raw = content.dataset.raw || "";
-  block.classList.remove("active");
-  if (raw.trim()) {
-    content.innerHTML = renderMarkdown(raw);
-    updateThinkingMeta(block);
-    block.classList.add("collapsed");
-    block.querySelector(".chevron").textContent = "▸";
-  } else {
-    // Nothing was actually reasoned — drop the empty block entirely.
-    block.remove();
+  if (!raw.trim()) return; // nothing reasoned — keep the live indicator
+  workingBlock = null;
+  block.classList.remove("active", "working");
+  block.classList.add("collapsed");
+  // The ◷ icon chip is already in place from ensureWorkingBlock — just
+  // retitle it as the resting "Thinking" chip.
+  const title = block.querySelector(".thinking-title");
+  if (title) title.textContent = "Thinking";
+  content.innerHTML = renderMarkdown(raw);
+  updateThinkingMeta(block);
+  block.querySelector(".chevron").textContent = "▸";
+}
+
+// ----- Tool pipeline → activity cards ----------------------------------------
+// Real agent events render through the activity-card family: file tools →
+// explore cards, write/edit → code cards (language badge + REAL ± counts
+// derived from the call args), run_command → terminal, delegate → sub-agent,
+// unknown/user tools → heuristics (web/image/3D by name) or a generic task
+// card. Cards correlate by tool index, exactly like the old tool cards.
+
+/** Built-in tool → activity kind + title. */
+const TOOL_KINDS = {
+  read_file: { kind: "explore", title: "Reading file" },
+  list_dir: { kind: "explore", title: "Exploring files" },
+  grep: { kind: "explore", title: "Searching files" },
+  write_file: { kind: "code", title: "Writing code" },
+  edit_file: { kind: "code", title: "Editing code" },
+  run_command: { kind: "terminal", title: "Running task" },
+  delegate: { kind: "subagent", title: "Running sub-agent" },
+  update_todo: { kind: "terminal", title: "Updating plan" },
+};
+
+/** Heuristic kind for user-defined tools (name-based). */
+function guessToolKind(name) {
+  const n = (name || "").toLowerCase();
+  if (/web|browse|fetch|url|http/.test(n)) return { kind: "web", title: "Browsing the web" };
+  if (/image|draw|paint|diffuse/.test(n)) return { kind: "image", title: "Generating image" };
+  if (/3d|mesh|cad/.test(n)) return { kind: "model3d", title: "Generating 3D model" };
+  return { kind: "terminal", title: `Running ${toolLabel(name)}` };
+}
+
+/** Body for a tool's live phase, from its parsed args. */
+function buildToolBody(kind, name, args) {
+  switch (kind) {
+    case "explore":
+      return activityFilesBody(String(args.path || args.pattern || "."), []);
+    case "code": {
+      const path = String(args.path || "");
+      const snippet = [];
+      if (args.find) String(args.find).split("\n").slice(0, 6).forEach((l) => snippet.push(`- ${l}`));
+      if (args.replace) String(args.replace).split("\n").slice(0, 6).forEach((l) => snippet.push(`+ ${l}`));
+      if (args.content) String(args.content).split("\n").slice(0, 6).forEach((l) => snippet.push(`+ ${l}`));
+      return activityCodeBody(path, snippet.length ? snippet : ["(new file)"]);
+    }
+    case "terminal":
+      return activityTermBody(String(args.command || toolLabel(name)), []);
+    case "subagent":
+      return activitySubagentBody(String(args.sub_agent || "sub-agent"), "", String(args.task || ""));
+    case "web":
+      return activityWebBody(String(args.query || args.url || args.pattern || ""), []);
+    case "image":
+    case "model3d":
+      return activityProgressBody(0, "starting…");
+    default:
+      return null;
   }
 }
 
-/** Create a tool card in "running" state and register it for its index. */
-function createToolCard(index, name, argsJson) {
+/** Create the activity card for a tool call (running state). */
+function createToolActivityCard(index, name, argsJson) {
+  let args = {};
+  try { args = JSON.parse(argsJson || "{}"); } catch { /* keep {} */ }
+  const spec = TOOL_KINDS[name] || guessToolKind(name);
+  let plus = 0;
+  let minus = 0;
+  if (spec.kind === "code") {
+    // Real diff counts from the call args: edit = replace vs find lines,
+    // write = new content lines.
+    if (args.find) minus = String(args.find).split("\n").length;
+    if (args.replace) plus = String(args.replace).split("\n").length;
+    if (args.content) plus = String(args.content).split("\n").length;
+  }
+  const card = addModelActivity({
+    kind: spec.kind,
+    title: spec.title,
+    status: "running…",
+    state: "live",
+    lang: spec.kind === "code" ? String(args.path || "") : undefined,
+    plus,
+    minus,
+    body: buildToolBody(spec.kind, name, args),
+  });
+  card.dataset.toolName = name;
+  toolCards[index] = card;
+  return card;
+}
+
+/** Transition a card to its approval state with inline Approve/Deny. */
+function setToolActivityApproval(index, name) {
+  const card = toolCards[index];
+  if (!card) return;
+  setActivityStatus(card, "needs approval", "attention");
+  card.querySelector(".activity-body").appendChild(
+    activityQuestionBody(
+      `Approve “${name}”? The agent is waiting to continue.`,
+      () => invoke("approve", { index }).catch((e) => addSystemMessage(`Error: ${e}`)),
+      () => invoke("deny", { index }).catch((e) => addSystemMessage(`Error: ${e}`))
+    )
+  );
+  scrollToBottom();
+}
+
+/** Fill the result, mark done/failed, and collapse. */
+function finishToolActivityCard(index, success, result, durationMs) {
+  let card = toolCards[index];
+  if (!card) {
+    // Defensive: a finish without a start (e.g. denied before start).
+    card = createToolActivityCard(index, "?", "{}");
+  }
+  const dur = durationMs != null ? ` · ${formatDuration(durationMs)}` : "";
+  setActivityStatus(card, success ? `✓ done${dur}` : `✗ failed`, "done");
+  card.classList.toggle("failed", !success);
+  card.querySelector(".activity-question")?.remove();
+  card.querySelector(".t-cursor")?.remove();
+  const pre = document.createElement("pre");
+  pre.className = "activity-result";
+  pre.textContent = String(result ?? "").slice(0, 2000);
+  card.querySelector(".activity-body").appendChild(pre);
+  card.classList.add("collapsed");
+  card.querySelector(".chevron").textContent = "▸";
+  scrollToBottom();
+}
+
+/** Mark a card denied. */
+function denyToolActivityCard(index) {
+  const card = toolCards[index];
+  if (!card) return;
+  setActivityStatus(card, "✗ denied", "done");
+  card.classList.add("failed");
+  card.querySelector(".activity-question")?.remove();
+  card.classList.add("collapsed");
+  card.querySelector(".chevron").textContent = "▸";
+}
+
+// ----- Model activity cards ---------------------------------------------------
+// The message family for "what the model is doing right now" — the states the
+// model reports to the user while it works: exploring files, writing code,
+// running a terminal task, asking validation, erroring out, generating images
+// / 3D models. One anatomy (icon chip + title + status pill + collapsible
+// body, see the .activity CSS family) with a per-kind accent; each card's
+// body is composed by the caller from the small activity*Body helpers.
+// "Thinking" stays its own component (.thinking-block).
+
+/** Per-kind look: glyph icon (tinted by the kind's accent) + default title. */
+const ACTIVITY_KINDS = {
+  explore: { icon: "☰", label: "Exploring files" },
+  code: { icon: "✎", label: "Writing code" },
+  terminal: { icon: ">_", label: "Running task" },
+  approval: { icon: "?", label: "Validation needed" },
+  error: { icon: "⚠", label: "Error" },
+  image: { icon: "▦", label: "Generating image" },
+  model3d: { icon: "⬢", label: "Generating 3D model" },
+  web: { icon: "◎", label: "Browsing the web" },
+  subagent: { icon: "✦", label: "Running sub-agent" },
+};
+
+/** 16×16 colored language badges (inline SVG, brand-colored). Shield shape
+ *  for HTML/CSS mimics the official marks; the rest are rounded monogram
+ *  tiles in the language's brand color. */
+const LANG_BADGES = {
+  rust: { bg: "#CE422B", fg: "#FFFFFF", label: "Rs" },
+  javascript: { bg: "#F7DF1E", fg: "#000000", label: "JS" },
+  typescript: { bg: "#3178C6", fg: "#FFFFFF", label: "TS" },
+  python: { bg: "#3776AB", fg: "#FFFFFF", label: "Py" },
+  html: { bg: "#E34F26", fg: "#FFFFFF", label: "5", shield: true },
+  css: { bg: "#1572B6", fg: "#FFFFFF", label: "3", shield: true },
+  json: { bg: "#6E7B8B", fg: "#FFFFFF", label: "{}", size: 7 },
+  c: { bg: "#A8B9CC", fg: "#0E1420", label: "C" },
+  cpp: { bg: "#00599C", fg: "#FFFFFF", label: "C++", size: 7 },
+  go: { bg: "#00ADD8", fg: "#FFFFFF", label: "Go" },
+  shell: { bg: "#89E051", fg: "#0B2E13", label: ">_", size: 7.5, mono: true },
+  markdown: { bg: "#083FA1", fg: "#FFFFFF", label: "M" },
+  yaml: { bg: "#CB171E", fg: "#FFFFFF", label: "Y" },
+  code: { bg: "#787878", fg: "#E8E8E8", label: "</>", size: 6.5 },
+};
+
+/** Map a file path/extension to a LANG_BADGES key (null when unknown). */
+function detectLangFromPath(path) {
+  const ext = (path || "").split(".").pop().toLowerCase();
+  const map = {
+    rs: "rust", js: "javascript", mjs: "javascript", cjs: "javascript",
+    jsx: "javascript", ts: "typescript", tsx: "typescript", py: "python",
+    html: "html", htm: "html", css: "css", json: "json", c: "c", h: "c",
+    cpp: "cpp", cc: "cpp", cxx: "cpp", hpp: "cpp", go: "go",
+    sh: "shell", bash: "shell", ps1: "shell", bat: "shell", cmd: "shell",
+    md: "markdown", markdown: "markdown", yaml: "yaml", yml: "yaml",
+  };
+  return map[ext] || null;
+}
+
+/** Build the 16×16 colored SVG badge for a language key. */
+function langBadgeSvg(lang) {
+  const b = LANG_BADGES[lang];
+  if (!b) return "";
+  const fs = b.size || 8.5;
+  const fam = b.mono ? "'Cascadia Code', monospace" : "'Exo 2', sans-serif";
+  const shape = b.shield
+    ? `<path d="M2 1h12l-1.1 12L8 15.4 3.1 13z" fill="${b.bg}"/>`
+    : `<rect width="16" height="16" rx="3" fill="${b.bg}"/>`;
+  return `<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="${lang}">${shape}<text x="8" y="${b.shield ? 10.5 : 11.5}" text-anchor="middle" font-family="${fam}" font-size="${fs}" font-weight="700" fill="${b.fg}">${b.label}</text></svg>`;
+}
+
+/**
+ * Add a model-activity card to the chat. `state`: "live" (in progress — the
+ * icon chip pulses) | "attention" (needs the user: approval, error) |
+ * "done". `body` is an element built by the activity*Body helpers (null for
+ * a header-only card). Code cards additionally take `lang` (badge key or a
+ * file path to detect from — colored 16×16 language icon before the status
+ * pill) and `plus`/`minus` (starting diff counts shown after the pill).
+ * Returns the card so callers can update it.
+ */
+function addModelActivity({ kind, title, status, state = "live", body, lang, plus = 0, minus = 0 }) {
+  const spec = ACTIVITY_KINDS[kind] || {};
   const card = document.createElement("div");
-  card.className = "tool-card running";
-  card.dataset.index = String(index);
+  // Cards start COLLAPSED (compact one-line rows); expanding grows the card.
+  card.className = `activity kind-${kind} ${state} collapsed`;
   card.innerHTML = `
-    <div class="tool-card-header">
-      <span class="tool-icon">${toolIcon(name)}</span>
-      <span class="tool-name">${escapeHtml(name)}</span>
-      <span class="tool-status">running…</span>
-      <span class="tool-duration"></span>
-      <span class="chevron">▾</span>
+    <div class="activity-header">
+      <span class="activity-icon">${spec.icon || "●"}</span>
+      <span class="activity-title">${escapeHtml(title || spec.label || "Working…")}</span>
+      <span class="activity-lang-slot"></span>
+      <span class="activity-status"></span>
+      <span class="activity-diff"></span>
+      <span class="chevron">▸</span>
     </div>
-    <div class="tool-card-body">
-      <div class="tool-section tool-args">
-        <span class="tool-section-label">ARGS</span>
-        <pre>${escapeHtml(prettyJson(argsJson))}</pre>
-      </div>
-      <div class="tool-section tool-result" hidden>
-        <span class="tool-section-label">RESULT</span>
-        <pre></pre>
-      </div>
-      <div class="tool-approval" hidden></div>
-      <div class="subagent-stack"></div>
-    </div>`;
-  card.querySelector(".tool-card-header").addEventListener("click", () => {
+    <div class="activity-body"></div>`;
+  if (status) card.querySelector(".activity-status").textContent = status;
+  const langKey = lang ? (LANG_BADGES[lang] ? lang : detectLangFromPath(lang)) : null;
+  if (langKey) {
+    const slot = card.querySelector(".activity-lang-slot");
+    slot.className = "activity-lang";
+    slot.title = langKey;
+    slot.innerHTML = langBadgeSvg(langKey);
+    card.dataset.lang = langKey;
+  }
+  if (plus || minus) setCodeDiff(card, plus, minus);
+  card.querySelector(".activity-header").addEventListener("click", () => {
     card.classList.toggle("collapsed");
     card.querySelector(".chevron").textContent = card.classList.contains("collapsed") ? "▸" : "▾";
   });
+  if (body) card.querySelector(".activity-body").appendChild(body);
   chatMessages.appendChild(card);
-  toolCards[index] = card;
   scrollToBottom();
   return card;
 }
 
-/** Transition a tool card into its approval state with inline Approve/Deny. */
-function setToolApproval(index, name) {
-  const card = toolCards[index];
+/** Set the code card's +/- diff counters absolutely. */
+function setCodeDiff(card, plus, minus) {
   if (!card) return;
-  card.classList.remove("running");
-  card.classList.add("approval");
-  card.querySelector(".tool-status").textContent = "needs approval";
-  const ap = card.querySelector(".tool-approval");
-  ap.hidden = false;
-  ap.innerHTML = `
-    <div class="approval-text">⚠ Approve <b>${escapeHtml(name)}</b>?</div>
+  card.dataset.plus = String(plus);
+  card.dataset.minus = String(minus);
+  const diff = card.querySelector(".activity-diff");
+  diff.innerHTML =
+    `<span class="d-add">${plus > 0 ? `+${plus}` : ""}</span>` +
+    `<span class="d-del">${minus > 0 ? `-${minus}` : ""}</span>`;
+  diff.hidden = !(plus > 0 || minus > 0);
+}
+
+/** Increment the code card's diff counters as the model keeps editing. */
+function bumpCodeDiff(card, dPlus = 0, dMinus = 0) {
+  if (!card) return;
+  setCodeDiff(card, (+(card.dataset.plus || 0)) + dPlus, (+(card.dataset.minus || 0)) + dMinus);
+}
+
+/** Update a card's status pill / state class as the activity progresses. */
+function setActivityStatus(card, status, state) {
+  if (!card) return;
+  if (status != null) card.querySelector(".activity-status").textContent = status;
+  if (state) {
+    card.classList.remove("live", "attention", "done");
+    card.classList.add(state);
+  }
+}
+
+/** File-tree body for explore cards: a path chip + mono entry rows. */
+function activityFilesBody(path, entries) {
+  const div = document.createElement("div");
+  div.className = "activity-files";
+  div.innerHTML = `
+    <div class="activity-path">${escapeHtml(path)}</div>
+    ${entries
+      .map(
+        (e) => `
+    <div class="activity-file${e.dir ? " dir" : ""}">
+      <span>${e.dir ? "▸" : "·"} ${escapeHtml(e.name)}${e.dir ? "/" : ""}</span>
+      <span class="activity-file-size">${escapeHtml(e.size || "")}</span>
+    </div>`
+      )
+      .join("")}`;
+  return div;
+}
+
+/** Code body: file chip + colored +/- diff snippet. */
+function activityCodeBody(file, snippet) {
+  const div = document.createElement("div");
+  div.className = "activity-code";
+  div.innerHTML = `
+    <div class="activity-path">${escapeHtml(file)}</div>
+    <pre>${snippet
+      .map((l) => {
+        const cls = l.startsWith("+") ? "add" : l.startsWith("-") ? "del" : "";
+        return `<span class="dl-${cls}">${escapeHtml(l)}</span>`;
+      })
+      .join("\n")}</pre>`;
+  return div;
+}
+
+/** Terminal body: accent prompt + output lines + blinking cursor. */function activityTermBody(command, lines) {
+  const div = document.createElement("div");
+  div.className = "activity-term";
+  div.innerHTML = `
+    <pre><span class="t-prompt">$</span> ${escapeHtml(command)}
+${lines.map((l) => `<span class="t-out">${escapeHtml(l)}</span>`).join("\n")}
+<span class="t-cursor">▌</span></pre>`;
+  return div;
+}
+
+/** Web browsing body: a URL/search chip + result rows with favicon-style
+ *  letter dots. `pages`: [{ fav, title, domain }]. */
+function activityWebBody(url, pages) {
+  const div = document.createElement("div");
+  div.className = "activity-web";
+  div.innerHTML = `
+    <div class="activity-path">${escapeHtml(url)}</div>
+    <div class="activity-pages">
+      ${(pages || [])
+        .map(
+          (p) => `
+      <div class="activity-page">
+        <span class="p-fav">${escapeHtml((p.fav || "•").slice(0, 1))}</span>
+        <span class="p-title">${escapeHtml(p.title || "")}</span>
+        <span class="p-domain">${escapeHtml(p.domain || "")}</span>
+      </div>`
+        )
+        .join("")}
+    </div>`;
+  return div;
+}
+
+/** Sub-agent body: who was spawned (name + model chips) and the task it was
+ *  given, quoted. */
+function activitySubagentBody(agent, model, task) {
+  const div = document.createElement("div");
+  div.className = "activity-subagent";
+  div.innerHTML = `
+    <div class="sa-row">
+      <span class="activity-path">${escapeHtml(agent)}</span>
+      <span class="sa-model">${escapeHtml(model)}</span>
+    </div>
+    <div class="sa-task">“${escapeHtml(task)}”</div>`;
+  return div;
+}
+
+/** Generation progress body: bar + percentage + context meta. */
+function activityProgressBody(pct, meta) {
+  const div = document.createElement("div");
+  div.className = "activity-progress";
+  const p = Math.max(0, Math.min(100, pct));
+  div.innerHTML = `
+    <div class="activity-bar"><div class="activity-bar-fill" style="width:${p}%"></div></div>
+    <div class="activity-meta"><span class="activity-pct">${Math.round(p)}%</span><span class="activity-sub">${escapeHtml(meta || "")}</span></div>`;
+  return div;
+}
+
+/** Question body for approval cards: text + Approve/Deny. */
+function activityQuestionBody(text, onApprove, onDeny) {
+  const div = document.createElement("div");
+  div.className = "activity-question";
+  div.innerHTML = `
+    <div class="activity-question-text">${escapeHtml(text)}</div>
     <div class="approval-actions">
       <button class="btn-approve">Approve</button>
       <button class="btn-deny">Deny</button>
     </div>`;
-  ap.querySelector(".btn-approve").addEventListener("click", () => {
-    invoke("approve", { index }).catch((e) => addSystemMessage(`Error: ${e}`));
-  });
-  ap.querySelector(".btn-deny").addEventListener("click", () => {
-    invoke("deny", { index }).catch((e) => addSystemMessage(`Error: ${e}`));
-  });
-  scrollToBottom();
+  div.querySelector(".btn-approve").addEventListener("click", () => onApprove?.());
+  div.querySelector(".btn-deny").addEventListener("click", () => onDeny?.());
+  return div;
 }
 
-/** Fill a tool card's result, mark it done/failed, and collapse it. */
-function finishToolCard(index, success, result, durationMs) {
-  let card = toolCards[index];
-  if (!card) {
-    // Defensive: a finish without a start (e.g. denied before start).
-    card = createToolCard(index, "?", "{}");
-  }
-  card.classList.remove("running", "approval");
-  card.classList.add(success ? "done" : "failed");
-  card.querySelector(".tool-status").textContent = success ? "✓ done" : "✗ failed";
-  const res = card.querySelector(".tool-result");
-  res.hidden = false;
-  res.querySelector("pre").textContent = result ?? "";
-  if (durationMs != null) {
-    card.querySelector(".tool-duration").textContent = formatDuration(durationMs);
-  }
-  // Collapse on finish (click header to re-expand).
-  card.classList.add("collapsed");
-  card.querySelector(".chevron").textContent = "▸";
-  const ap = card.querySelector(".tool-approval");
-  if (ap) ap.hidden = true; // decision made
-  scrollToBottom();
+/** Error body: the error text + a dim "what would help" hint. */
+function activityErrorBody(message, hint) {
+  const div = document.createElement("div");
+  div.className = "activity-error";
+  div.innerHTML = `
+    <pre>${escapeHtml(message)}</pre>
+    ${hint ? `<div class="activity-hint">💡 ${escapeHtml(hint)}</div>` : ""}`;
+  return div;
 }
 
-/** Add a nested sub-agent block inside the delegate tool card. */
-function addSubAgentBlock(index, name, model, task) {
-  const card = toolCards[index];
-  if (!card) return;
-  const stack = card.querySelector(".subagent-stack");
-  const block = document.createElement("div");
-  block.className = "subagent";
-  block.innerHTML = `
-    <div class="subagent-header">
-      <span class="subagent-badge">🤖</span>
-      <span class="subagent-name">${escapeHtml(name)}</span>
-      <span class="subagent-model">${escapeHtml(model)}</span>
-      <span class="subagent-status">working…</span>
-    </div>
-    ${task ? `<div class="subagent-task">${escapeHtml(task)}</div>` : ""}
-    <details class="subagent-reasoning" hidden>
-      <summary>thinking…</summary>
-      <div class="content"></div>
-    </details>
-    <div class="subagent-text"></div>`;
-  stack.appendChild(block);
-  subAgentBlocks[index] = block;
-  scrollToBottom();
-  return block;
-}
 
 /** Pretty-print a JSON string; fall back to the raw string if it isn't JSON. */
 function prettyJson(str) {
@@ -1479,21 +1883,26 @@ async function refreshHealthLabel() {
     modelItem.innerHTML = "";
     if (dot) modelItem.appendChild(dot);
     modelItem.appendChild(document.createTextNode(" " + modelLabel));
-    // Live metrics chip from the dispatch layer (works for every backend).
+  }
+  // Live metrics — centered in the health bar, white + bold (dispatch layer,
+  // works for every backend). The first thing users monitor.
+  const metricsBar = $("health-metrics-bar");
+  if (metricsBar) {
     let stats = null;
     try { stats = await invoke("get_runtime_metrics"); } catch { /* pre-unlock */ }
     if (stats) {
-      const chip = document.createElement("span");
-      chip.className = "health-metrics";
       const parts = [];
       if (stats.tokens_per_sec != null) parts.push(`${Number(stats.tokens_per_sec).toFixed(1)} T/s`);
-      if (stats.ttft_ms != null) parts.push(`TTFT ${Math.round(stats.ttft_ms)} ms`);
+      if (stats.ttft_ms != null) parts.push(`TTFT ${(stats.ttft_ms / 1000).toFixed(1)} s`);
       if (stats.tbt_avg_ms != null) parts.push(`TBT ${Number(stats.tbt_avg_ms).toFixed(1)} ms`);
       const busy = !!(stats.busy || isAgentBusy);
-      chip.innerHTML =
-        (parts.length ? ` · ${escapeHtml(parts.join(" · "))}` : "") +
-        ` <span class="metrics-busy${busy ? " busy" : ""}">${busy ? "● generating" : "○ idle"}</span>`;
-      modelItem.appendChild(chip);
+      metricsBar.innerHTML =
+        (parts.length ? escapeHtml(parts.join(" · ")) : "") +
+        (parts.length ? " · " : "") +
+        `<span class="metrics-busy${busy ? " busy" : ""}">${busy ? "● generating" : "○ idle"}</span>`;
+      metricsBar.hidden = false;
+    } else {
+      metricsBar.hidden = true;
     }
   }
 }
@@ -1546,6 +1955,7 @@ function scrollToBottom() {
 /** Populate the sidebar (profile selector + workdir display) after unlock. */
 async function loadSidebar(unlockResult) {
   restoreSidebarWidth();
+  restoreConsoleHeight();
   await loadWorkdir();
   await loadProfiles(unlockResult?.active_profile);
   // Track the active profile id for skills enable/disable.
@@ -1589,42 +1999,37 @@ async function syncModelFromRoute(route) {
   await populateModels();
 }
 
-/** Load + render the working directory display. */
+/** Load + render the ACTIVE PROFILE's working directory. Blank profile →
+ *  the "select a directory" placeholder (the row opens the native picker). */
 async function loadWorkdir() {
   try {
     const wd = await invoke("get_workdir");
-    workdirDisplay.textContent = wd || "—";
-    workdirDisplay.title = wd || "";
+    if (wd && wd.trim()) {
+      workdirDisplay.textContent = wd;
+      workdirDisplay.title = wd;
+      workdirDisplay.classList.remove("placeholder");
+    } else {
+      workdirDisplay.textContent = "Please select a directory for this profile!";
+      workdirDisplay.title = "Click to open the directory picker";
+      workdirDisplay.classList.add("placeholder");
+    }
   } catch (e) {
     console.warn("Workdir load failed:", e);
   }
 }
 
-/** Load profiles into the selector and mark the active one. */
+/** Load the profile list into the cache and track the active one. (The
+ *  selector dropdown is gone — 🏠 jumps to Default, ＋ creates + activates.)
+ *  `activeProfile` is the unlock result's profile when available. */
 async function loadProfiles(activeProfile) {
   try {
     const profiles = await invoke("list_profiles");
-    profileSelect.innerHTML = "";
-    if (profiles.length === 0) {
-      const opt = document.createElement("option");
-      opt.textContent = "(no profiles)";
-      profileSelect.appendChild(opt);
-      return;
-    }
-    let activeId = null;
     if (activeProfile && activeProfile.id != null) {
-      activeId = activeProfile.id;
+      activeProfileId = activeProfile.id;
     } else if (profiles.find((p) => p.is_default)) {
-      activeId = profiles.find((p) => p.is_default).id;
+      activeProfileId = profiles.find((p) => p.is_default).id;
     } else {
-      activeId = profiles[0].id;
-    }
-    for (const p of profiles) {
-      const opt = document.createElement("option");
-      opt.value = p.id;
-      opt.textContent = p.name + (p.is_default ? " (default)" : "");
-      if (p.id === activeId) opt.selected = true;
-      profileSelect.appendChild(opt);
+      activeProfileId = profiles[0]?.id ?? null;
     }
   } catch (e) {
     console.warn("Profile load failed:", e);
@@ -1654,11 +2059,36 @@ async function refreshModelsPanel() {
   refreshHealthLabel();
 }
 
-/** Highlight the box that matches the active route with the flame glow. */
+/** Highlight the active route with the flame glow: the matching runner tab
+ *  (AmberCore | Ollama) or the Provider API box for cloud routes. */
 function highlightActiveBox(route) {
-  icBox.classList.toggle("active", route.kind === "local" && route.backend === "ambercore");
-  olBox.classList.toggle("active", route.kind === "local" && route.backend === "ollama");
+  runnerBox.querySelectorAll(".runner-tab").forEach((tab) => {
+    const matches =
+      route.kind === "local" &&
+      ((tab.dataset.runner === "ambercore" && route.backend === "ambercore") ||
+        (tab.dataset.runner === "ollama" && route.backend === "ollama"));
+    tab.classList.toggle("active-route", matches);
+  });
   prBox.classList.toggle("active", route.kind === "cloud");
+}
+
+/** Switch the models panel's runner: the settings pane, the model-list title,
+ *  the acquire row (Find models vs Ollama pull) and the visible list all
+ *  follow the selected tab. Persisted so the panel reopens as it was left. */
+function setRunnerTab(runner) {
+  activeRunner = runner === "ollama" ? "ollama" : "ambercore";
+  localStorage.setItem("phoenix.runnerTab", activeRunner);
+  runnerBox.querySelectorAll(".runner-tab").forEach((tab) => {
+    tab.classList.toggle("active", tab.dataset.runner === activeRunner);
+  });
+  paneAmberCore.hidden = activeRunner !== "ambercore";
+  paneOllama.hidden = activeRunner !== "ollama";
+  mlTitle.textContent =
+    activeRunner === "ollama" ? "Ollama models" : "AmberCore models";
+  mlAcquireAmberCore.hidden = activeRunner !== "ambercore";
+  mlAcquireOllama.hidden = activeRunner !== "ollama";
+  icList.hidden = activeRunner !== "ambercore";
+  olList.hidden = activeRunner !== "ollama";
 }
 
 /** Render the AmberCore model list (blue box). */
@@ -1672,7 +2102,7 @@ async function renderAmberCore(route) {
     return;
   }
   if (models.length === 0) {
-    icList.innerHTML = '<li class="panel-loading">No AmberCore models found. Pull one by URL above.</li>';
+    icList.innerHTML = '<li class="panel-loading">No AmberCore models found. Pull one with "Find models…".</li>';
     return;
   }
   icList.innerHTML = "";
@@ -1686,33 +2116,480 @@ async function renderAmberCore(route) {
       `<span class="mp-meta">${escapeHtml(m.quantization)}</span>` +
       `<span class="mp-sep">|</span>` +
       `<span class="mp-meta">${escapeHtml(m.downloaded_at)}</span>` +
-      `<button class="btn-run">${isActive ? "Running" : "Run"}</button>`;
+      `<button class="btn-run">${isActive ? "Running" : "Run"}</button>` +
+      `<button class="btn-del" title="Delete model + tokenizer">🗑</button>`;
     li.querySelector(".btn-run").addEventListener("click", () => runAmberCore(m.name));
+    li.querySelector(".btn-del").addEventListener("click", () => deleteAmberCoreModel(m.name));
     if (isActive) li.querySelector(".btn-run").style.borderColor = "var(--phoenix-warm)";
     icList.appendChild(li);
   }
 }
 
-/** Pull a GGUF model (and its tokenizer) from a URL into the AmberCore models directory. */
-async function pullAmberCore() {
-  const url = icUrl.value.trim();
-  if (!url) { addSystemMessage("Enter a model URL first."); return; }
-  const tokenizerUrl = icTokenizerUrl?.value.trim() || null;
-  icProgress.hidden = false;
-  icProgress.querySelector(".mp-progress-text").textContent = "Starting download…";
-  icProgress.querySelector(".mp-progress-bar").style.setProperty("--mp-pct", "0%");
-  icPullBtn.disabled = true;
+/** Pull a GGUF model (and its auto-detected tokenizer) from a URL into the
+ *  AmberCore models directory — the shared path behind the search modal's
+ *  Pull buttons. Progress UI is event-driven (see the pull-bars helpers), so
+ *  several pulls can run at once, each with its own bar. */
+async function pullAmberCoreFromUrl(url) {
   try {
-    const tag = await invoke("pull_ambercore_model", { url, tokenizerUrl });
+    const tag = await invoke("pull_ambercore_model", { url, tokenizerUrl: null });
     addSystemMessage(`Pulled AmberCore model: ${tag} (model + tokenizer ready)`);
-    icUrl.value = "";
-    if (icTokenizerUrl) icTokenizerUrl.value = "";
     await renderAmberCore(await invoke("get_active_route"));
+    return true;
   } catch (e) {
     addSystemMessage(`AmberCore pull failed: ${e}`);
-  } finally {
-    icProgress.hidden = true;
-    icPullBtn.disabled = false;
+    return false;
+  }
+}
+
+// ----- Models-button download progress ring -----------------------------------
+//
+// Tracks each active pull's (completed, total) and shows a thin circular
+// progress ring with the completion percentage inside it at the far right of
+// the Models nav item — visible even with the panel closed, which is the
+// point. The percentage replaced the earlier time-ETA text (byte rates swing
+// too much to be a stable readout).
+
+const pullEta = new Map(); // id -> { total, completed }
+
+/** Feed a progress sample (bytes) for one pull; refresh the nav indicator. */
+function etaTrack(id, completed, total) {
+  let st = pullEta.get(id);
+  if (!st) {
+    st = { total: total ?? null, completed };
+    pullEta.set(id, st);
+  } else {
+    st.completed = completed;
+    if (total != null) st.total = total;
+  }
+  updateNavEta();
+}
+
+function etaDrop(id) {
+  pullEta.delete(id);
+  updateNavEta();
+}
+
+/** Aggregate all active pulls into the ring; hide when idle. */
+function updateNavEta() {
+  if (!navEta) return;
+  const active = [...pullEta.values()];
+  if (!active.length) {
+    navEta.hidden = true;
+    return;
+  }
+  let done = 0, all = 0, known = 0;
+  for (const st of active) {
+    if (st.total != null) {
+      done += st.completed;
+      all += st.total;
+      known++;
+    }
+  }
+  const pct = all > 0 ? (done / all) * 100 : 0;
+  navEta.hidden = false;
+  if (navEtaRing) {
+    navEtaRing.style.setProperty("--eta-pct", known ? pct.toFixed(1) : "0");
+  }
+  if (navEtaPct) {
+    navEtaPct.textContent = known ? `${Math.round(pct)}%` : "";
+  }
+}
+
+// ----- Session history rail ---------------------------------------------------
+// Thin vertical dash list at the chat's left edge: one dash per PAST session
+// (newest top), color = status — green = learned + compacted, orange =
+// learned only, red = wild (never learned). Clicking a dash loads that
+// session read-only into a collapsible container above the live chat, in
+// chronological order (oldest top). The newest session is skipped — it is
+// the live one.
+
+const sessionRail = $("session-rail");
+let sessionSummaries = [];
+const sessionMsgCache = new Map(); // id -> messages
+const sessionViews = new Map(); // id -> container element (currently open)
+
+function sessionDashClass(s) {
+  if (s.learned_at && s.compacted_at) return "learned compacted";
+  if (s.learned_at) return "learned";
+  return ""; // wild — red by default
+}
+
+/** Re-fetch sessions and re-render the rail (colors/order/actives). */
+async function refreshSessionRail() {
+  if (!sessionRail) return;
+  try {
+    sessionSummaries = await invoke("list_sessions");
+  } catch {
+    return; // pre-unlock or transient — keep the rail as-is
+  }
+  const viewable = sessionSummaries.slice(1); // [0] is the live session
+  sessionRail.innerHTML = "";
+  sessionRail.hidden = viewable.length === 0;
+  for (const s of viewable) {
+    const dash = document.createElement("div");
+    dash.className = `session-dash ${sessionDashClass(s)}`.trim();
+    dash.dataset.sessionId = String(s.id);
+    const when = (s.updated_at || "").replace("T", " ").slice(0, 16);
+    dash.title = `${s.title} · ${when} · ${s.message_count} messages`;
+    if (sessionViews.has(String(s.id))) dash.classList.add("active");
+    dash.addEventListener("click", () => toggleSessionView(String(s.id)));
+    sessionRail.appendChild(dash);
+  }
+}
+
+/** Toggle one past session's read-only container in the chat. */
+async function toggleSessionView(id) {
+  const key = String(id);
+  const existing = sessionViews.get(key);
+  if (existing) {
+    existing.remove();
+    sessionViews.delete(key);
+    sessionRail
+      ?.querySelector(`.session-dash[data-session-id="${key}"]`)
+      ?.classList.remove("active");
+    return;
+  }
+  let msgs = sessionMsgCache.get(key);
+  if (!msgs) {
+    try {
+      msgs = await invoke("load_session_messages", { sessionId: Number(key) });
+      sessionMsgCache.set(key, msgs);
+    } catch (e) {
+      addSystemMessage(`Error: ${e}`);
+      return;
+    }
+  }
+  const summary = sessionSummaries.find((s) => String(s.id) === key);
+  const when = (summary?.updated_at || "").replace("T", " ").slice(0, 16);
+  const status = summary?.learned_at && summary?.compacted_at
+    ? '<span class="pill compacted">learned · compacted</span>'
+    : summary?.learned_at
+      ? '<span class="pill learned">learned</span>'
+      : '<span class="pill wild">wild</span>';
+  const view = document.createElement("div");
+  view.className = "session-view";
+  view.dataset.sessionId = key;
+  view.dataset.createdAt = summary?.created_at || "";
+  view.innerHTML = `
+    <div class="session-view-header">
+      <span class="session-view-title">${escapeHtml(summary?.title || `Session #${key}`)}</span>
+      <span class="session-view-meta">${escapeHtml(when)} · ${msgs.length} messages · ${escapeHtml(summary?.model || "")}</span>
+      ${status}
+      <span class="chevron">▾</span>
+    </div>
+    <div class="session-view-body"></div>`;
+  const body = view.querySelector(".session-view-body");
+  for (const m of msgs) {
+    if (m.role === "user") {
+      const d = document.createElement("div");
+      d.className = "message user";
+      d.innerHTML = `<div class="content">${escapeHtml(m.content)}</div>`;
+      body.appendChild(d);
+    } else if (m.role === "assistant") {
+      const d = document.createElement("div");
+      d.className = "message assistant";
+      d.innerHTML = `<div class="content">${renderMarkdown(m.content)}</div>`;
+      body.appendChild(d);
+    } else if (m.role === "tool") {
+      const d = document.createElement("div");
+      d.className = "sv-tool";
+      d.textContent = `⚙ ${m.tool_name || "tool"} — ${(m.content || "").split("\n")[0].slice(0, 90)}`;
+      body.appendChild(d);
+    }
+  }
+  view.querySelector(".session-view-header").addEventListener("click", () => {
+    view.classList.toggle("collapsed");
+    view.querySelector(".chevron").textContent = view.classList.contains("collapsed") ? "▸" : "▾";
+  });
+  // Chronological placement: oldest on top among the leading session-view
+  // block, always above every live element.
+  const views = [...chatMessages.querySelectorAll(":scope > .session-view")];
+  let target = null;
+  for (const v of views) {
+    if ((v.dataset.createdAt || "") > view.dataset.createdAt) { target = v; break; }
+  }
+  const firstLive = [...chatMessages.children].find((c) => !c.classList.contains("session-view"));
+  chatMessages.insertBefore(view, target || firstLive || null);
+  sessionViews.set(key, view);
+  sessionRail
+    ?.querySelector(`.session-dash[data-session-id="${key}"]`)
+    ?.classList.add("active");
+}
+
+// ----- Per-pull download bars -------------------------------------------------
+//
+// One bar row per concurrent pull, keyed by the pull id the backend stamps on
+// every progress event (the GGUF file stem / Ollama model name). Rows live in
+// #ml-pull-bars OUTSIDE the model lists, so list re-renders never clobber
+// them; a terminal done/error event retires the row.
+
+/** Find (or create) the bar row for a pull id. */
+function pullBarItem(id) {
+  const escaped = (window.CSS && CSS.escape) ? CSS.escape(id) : id.replace(/"/g, '\\"');
+  let row = mlPullBars.querySelector(`.mp-pull-item[data-pull-id="${escaped}"]`);
+  if (!row) {
+    row = document.createElement("div");
+    row.className = "mp-pull-item";
+    row.dataset.pullId = id;
+    const name = document.createElement("span");
+    name.className = "mp-pull-name";
+    name.title = id;
+    name.textContent = id;
+    const prog = document.createElement("div");
+    prog.className = "mp-progress";
+    prog.innerHTML = '<div class="mp-progress-bar"></div><span class="mp-progress-text"></span>';
+    row.append(name, prog);
+    mlPullBars.appendChild(row);
+    mlPullBars.hidden = false;
+  }
+  return row;
+}
+
+/** Update a pull's bar: `pct` 0-100 (or null → indeterminate) + status text. */
+function setPullBar(id, pct, text) {
+  const row = pullBarItem(id);
+  const bar = row.querySelector(".mp-progress-bar");
+  const label = row.querySelector(".mp-progress-text");
+  if (bar) bar.style.setProperty("--mp-pct", pct == null ? "100%" : `${pct}%`);
+  if (label) label.textContent = text;
+}
+
+// ----- Encapsulated auto-save -------------------------------------------------
+// After every completed agent task (and finished model pull), seal the state
+// back into the exe: a power break or crash can then never lose more than
+// the current unfinished task. Best-effort and silent.
+let autosaveTimer = null;
+function autosaveSeal() {
+  if (autosaveTimer) return;
+  autosaveTimer = setTimeout(() => {
+    autosaveTimer = null;
+    invoke("seal_capsule").catch(() => {});
+  }, 1200);
+}
+
+/** Retire a pull's bar (done or failed): mark it, then remove it shortly.
+ * This is ALSO the single retirement point for the nav ring — drop the ETA
+ * entry so the aggregate ring vanishes when no pull is active. */
+function retirePullBar(id, ok, text) {
+  etaDrop(id);
+  autosaveSeal();
+  const escaped = (window.CSS && CSS.escape) ? CSS.escape(id) : id.replace(/"/g, '\\"');
+  const row = mlPullBars.querySelector(`.mp-pull-item[data-pull-id="${escaped}"]`);
+  if (!row) return;
+  row.classList.add(ok ? "done" : "error");
+  const bar = row.querySelector(".mp-progress-bar");
+  const label = row.querySelector(".mp-progress-text");
+  if (bar) bar.style.setProperty("--mp-pct", "100%");
+  if (label && text) label.textContent = text;
+  setTimeout(() => {
+    row.remove();
+    if (!mlPullBars.children.length) mlPullBars.hidden = true;
+  }, ok ? 1200 : 3200);
+}
+
+/** AmberCore pull progress → bar row. Payload: { id, phase: model|tokenizer|
+ *  done|error, completed, total, tag?, error? }. */
+function onAmberCorePullProgress(payload) {
+  const id = String(payload?.id ?? "pull");
+  const phase = payload?.phase;
+  if (phase === "done") {
+    retirePullBar(id, true, `✓ ${payload?.tag ?? "done"}`);
+    return;
+  }
+  if (phase === "error") {
+    retirePullBar(id, false, `✗ failed`);
+    return;
+  }
+  const label = phase === "tokenizer" ? "Tokenizer" : "Model";
+  const total = payload?.total ?? null;
+  const completed = payload?.completed ?? 0;
+  etaTrack(id, completed, total);
+  const pct = total ? Math.min(100, Math.round((completed / total) * 100)) : null;
+  setPullBar(
+    id,
+    pct,
+    total
+      ? `${label} · ${pct}% · ${humanBytes(completed)} / ${humanBytes(total)}`
+      : `${label} · ${humanBytes(completed)} downloaded`
+  );
+}
+
+/** Ollama pull progress → bar row. Payload: { id, line } where line is
+ *  `ollama pull`'s NDJSON ({"status","completed","total"}), or { id, phase:
+ *  done|error } terminal events. */
+function onOllamaPullProgress(payload) {
+  const id = String(payload?.id ?? "pull");
+  const phase = payload?.phase;
+  if (phase === "done") {
+    retirePullBar(id, true, "✓ done");
+    return;
+  }
+  if (phase === "error") {
+    retirePullBar(id, false, "✗ failed");
+    return;
+  }
+  const line = String(payload?.line ?? "");
+  let parsed = null;
+  try { parsed = JSON.parse(line); } catch { /* human-readable status line */ }
+  if (parsed && typeof parsed.completed === "number" && typeof parsed.total === "number" && parsed.total > 0) {
+    etaTrack(id, parsed.completed, parsed.total);
+    const pct = Math.min(100, Math.round((parsed.completed / parsed.total) * 100));
+    setPullBar(id, pct, `${pct}% · ${humanBytes(parsed.completed)} / ${humanBytes(parsed.total)}`);
+  } else {
+    const status = (parsed?.status ?? line).slice(0, 60);
+    setPullBar(id, null, status);
+  }
+}
+
+/** Delete an AmberCore model — the bin button next to Run. Removes the GGUF,
+ *  its sibling tokenizer, the per-model pull folder, and the manifest entry
+ *  (after unloading any replica holding the file), behind a confirmation. */
+async function deleteAmberCoreModel(name) {
+  if (!window.confirm(`Delete AmberCore model "${name}" and its tokenizer from disk? This cannot be undone.`)) return;
+  try {
+    await invoke("delete_ambercore_model", { name });
+    addSystemMessage(`Deleted AmberCore model: ${name} (model + tokenizer removed)`);
+    await renderAmberCore(await invoke("get_active_route"));
+  } catch (e) {
+    addSystemMessage(`AmberCore delete failed: ${e}`);
+  }
+}
+
+// ----- Model search modal ----------------------------------------------------
+
+/** Same resident-size estimate the engine's pre-flight check uses:
+ *  file × 1.5 + 300 MiB (weights + KV cache + activations + overhead). */
+function estimatedResidentMb(sizeGb) {
+  return sizeGb * 1024 * 1.5 + 300;
+}
+
+/** Open the model search modal and auto-search the most-downloaded GGUFs
+ *  (empty query) — the fit coloring shows what the user's GPU can run. */
+async function openModelSearch() {
+  modelSearchModal.hidden = false;
+  setMsSource(msActiveSource);
+  await runModelSearch();
+}
+
+/** Switch the search source (Hugging Face / Civitai) and re-run. */
+function setMsSource(source) {
+  msActiveSource = source;
+  document.querySelectorAll(".ms-source").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.source === source);
+  });
+  msQuery.placeholder = source === "civitai"
+    ? "Search Civitai (image-gen models — browsable, not AmberCore-runnable)…"
+    : "Search GGUF models (e.g. qwen3 8b)…";
+}
+
+/** Run a search against the active source, rebuild the filter options, and
+ *  render (the backend already drops models that would spill > 1 GB). */
+async function runModelSearch() {
+  msResults.innerHTML = '<div class="ms-empty">Searching…</div>';
+  try {
+    const resp = await invoke("search_models", {
+      query: msQuery.value.trim(),
+      source: msActiveSource,
+    });
+    msLastResponse = resp;
+    buildMsFilterOptions();
+    applyMsFilters();
+  } catch (e) {
+    msLastResponse = null;
+    msResults.innerHTML = `<div class="ms-empty">Search failed: ${escapeHtml(String(e))}</div>`;
+  }
+}
+
+/** (Re)build the quant + params filter options from the current results. */
+function buildMsFilterOptions() {
+  const fill = (select, values) => {
+    const current = select.value;
+    select.innerHTML = `<option value="">${select.title.startsWith("Filter by quant") ? "Any quant" : "Any params"}</option>`;
+    for (const v of values) {
+      const opt = document.createElement("option");
+      opt.value = v;
+      opt.textContent = v;
+      select.appendChild(opt);
+    }
+    if ([...select.options].some((o) => o.value === current)) select.value = current;
+  };
+  const quants = [...new Set((msLastResponse?.results || []).map((m) => m.quant).filter(Boolean))]
+    .sort((a, b) => Number(a.match(/(\d+)/)?.[1] ?? 0) - Number(b.match(/(\d+)/)?.[1] ?? 0));
+  const params = [...new Set((msLastResponse?.results || []).map((m) => m.params).filter(Boolean))]
+    .sort((a, b) => parseFloat(a) - parseFloat(b));
+  fill(msFilterQuant, quants);
+  fill(msFilterParams, params);
+}
+
+/** Re-render the current results through the size/quant/params filters. */
+function applyMsFilters() {
+  if (!msLastResponse) return;
+  const free = msLastResponse.vram_free_mb; // MiB, null when no GPU / unqueryable
+  const total = msLastResponse.vram_total_mb; // MiB — the GPU's MAX VRAM
+  msVram.textContent = total != null
+    ? `GPU: ${Math.round(total / 1024 * 10) / 10} GB VRAM — green cards fit entirely, orange spill ≤ 1 GB.`
+    : "No GPU detected — fit coloring unavailable.";
+  const maxSize = parseFloat(msFilterSize?.value || "");
+  const list = (msLastResponse.results || []).filter((m) => {
+    if (maxSize && m.size_gb > maxSize) return false;
+    if (msFilterQuant?.value && m.quant !== msFilterQuant.value) return false;
+    if (msFilterParams?.value && m.params !== msFilterParams.value) return false;
+    return true;
+  });
+  renderMsCards(list, free);
+}
+
+/** Render the result cards: [name + size / params + quant] + Pull button,
+ *  glass-green when the model fits the GPU entirely, glass-orange when it
+ *  would spill (≤ 1 GB — bigger spills are filtered out server-side). */
+function renderMsCards(list, free) {
+  msResults.innerHTML = "";
+  if (!list.length) {
+    msResults.innerHTML = '<div class="ms-empty">No models match — try another search or loosen the filters.</div>';
+    return;
+  }
+  for (const m of list) {
+    const known = m.size_gb > 0; // unknown-size cards get no fit tint
+    const fits = free != null && known && estimatedResidentMb(m.size_gb) <= free;
+    const card = document.createElement("div");
+    card.className = "ms-card" + (free == null || !known ? "" : fits ? " fits" : " spills");
+    card.title = m.url;
+    const params = m.params || "—";
+    const quant = m.quant || "—";
+    card.innerHTML = `
+      <div class="ms-card-main">
+        <div class="ms-row ms-row-top">
+          <span class="ms-name">${escapeHtml(m.name)}</span>
+          <span class="ms-size">${known ? Number(m.size_gb).toFixed(1) + " GB" : "size —"}</span>
+        </div>
+        <div class="ms-row ms-row-bottom">
+          <span class="ms-params">${escapeHtml(params)} params</span>
+          <span class="ms-sep">·</span>
+          <span class="ms-quant">${escapeHtml(quant)}</span>
+          ${m.ambercore_compatible ? "" : '<span class="ms-badge" title="Civitai hosts image-generation models — AmberCore runs text-model GGUFs only">image model</span>'}
+        </div>
+      </div>`;
+    const pullBtn = document.createElement("button");
+    pullBtn.className = "ms-pull btn-secondary";
+    pullBtn.textContent = "Pull";
+    if (!m.ambercore_compatible) {
+      pullBtn.disabled = true;
+      pullBtn.title = "Image-gen models can't run on AmberCore";
+    } else {
+      pullBtn.addEventListener("click", async () => {
+        // Keep the modal open so several models can be pulled at once — each
+        // pull gets its own bar in the Models panel (see the pull-bars
+        // helpers); the card's button reflects only its own pull.
+        pullBtn.disabled = true;
+        pullBtn.textContent = "Pulling…";
+        const ok = await pullAmberCoreFromUrl(m.url);
+        pullBtn.textContent = ok ? "Pulled ✓" : "Pull";
+        if (!ok) pullBtn.disabled = false;
+        else setTimeout(() => { pullBtn.textContent = "Pull"; pullBtn.disabled = false; }, 2500);
+      });
+    }
+    card.appendChild(pullBtn);
+    msResults.appendChild(card);
   }
 }
 
@@ -1798,19 +2675,32 @@ async function renderOllama(route) {
       `<span class="mp-name">${escapeHtml(m.name)}</span>` +
       `<span class="mp-sep">|</span>` +
       `<span class="mp-meta">${escapeHtml(m.downloaded_at)}</span>` +
-      `<button class="btn-run">${isActive ? "Running" : "Run"}</button>`;
+      `<button class="btn-run">${isActive ? "Running" : "Run"}</button>` +
+      `<button class="btn-del" title="Delete model">🗑</button>`;
     li.querySelector(".btn-run").addEventListener("click", () => runOllama(m.name));
+    li.querySelector(".btn-del").addEventListener("click", () => deleteOllamaModel(m.name));
     if (isActive) li.querySelector(".btn-run").style.borderColor = "var(--phoenix-warm)";
     olList.appendChild(li);
   }
 }
 
-/** Pull an Ollama-hosted model via `ollama pull`. */
+/** Delete an Ollama model from its store — the bin button next to Run. */
+async function deleteOllamaModel(name) {
+  if (!window.confirm(`Delete Ollama model "${name}" from disk? This cannot be undone.`)) return;
+  try {
+    await invoke("delete_ollama_model", { name });
+    addSystemMessage(`Deleted Ollama model: ${name}`);
+    await renderOllama(await invoke("get_active_route"));
+  } catch (e) {
+    addSystemMessage(`Ollama delete failed: ${e}`);
+  }
+}
+
+/** Pull an Ollama-hosted model via `ollama pull`. Progress streams into the
+ *  shared per-pull bars (see onOllamaPullProgress). */
 async function pullOllama() {
   const name = olPull.value.trim();
   if (!name) { addSystemMessage("Enter a model name first."); return; }
-  olProgress.hidden = false;
-  olProgress.querySelector(".mp-progress-text").textContent = "Pulling…";
   olPullBtn.disabled = true;
   try {
     await invoke("pull_ollama_model", { name });
@@ -1820,7 +2710,6 @@ async function pullOllama() {
   } catch (e) {
     addSystemMessage(`Ollama pull failed: ${e}`);
   } finally {
-    olProgress.hidden = true;
     olPullBtn.disabled = false;
   }
 }
@@ -1915,25 +2804,21 @@ async function runProvider(providerId) {
   }
 }
 
-/** Create a new profile via prompt, then refresh the selector. */
+/** Create a new profile via prompt, then activate it. */
 async function createNewProfile() {
   const name = window.prompt("Profile name:");
   if (!name || !name.trim()) return;
   try {
     const id = await invoke("create_profile", { name: name.trim() });
-    await loadProfiles();
-    // Auto-switch to the freshly created profile.
-    profileSelect.value = String(id);
-    await onProfileChange();
+    await switchToProfile(id);
     addSystemMessage(`Created profile "${name.trim()}".`);
   } catch (e) {
     addSystemMessage(`Create profile failed: ${e}`);
   }
 }
 
-/** Handle a profile selector change. */
-async function onProfileChange() {
-  const id = Number(profileSelect.value);
+/** Switch the active profile by id and refresh everything profile-scoped. */
+async function switchToProfile(id) {
   if (!id) return;
   try {
     const p = await invoke("switch_profile", { id });
@@ -1942,20 +2827,41 @@ async function onProfileChange() {
     updateToolsDot();
     updateContextDot();
     updateMemoryDot();
+    await loadWorkdir(); // workdir is profile-scoped — follow the switch
     addSystemMessage(`Profile switched to "${p.name}".`);
   } catch (e) {
     addSystemMessage(`Profile switch failed: ${e}`);
   }
 }
 
-/** Prompt for a new working directory and apply it live. */
-async function changeWorkdir() {
-  const path = window.prompt("Working directory path:", workdirDisplay.textContent);
-  if (!path || !path.trim()) return;
+/** Jump straight to the Default profile (the 🏠 button). */
+async function goDefaultProfile() {
   try {
-    await invoke("set_workdir", { path: path.trim() });
+    const profiles = await invoke("list_profiles");
+    const def = profiles.find((p) => p.is_default) || profiles[0];
+    if (!def) return;
+    if (activeProfileId === def.id) {
+      await loadWorkdir();
+      return;
+    }
+    await switchToProfile(def.id);
+  } catch (e) {
+    addSystemMessage(`Switch to default profile failed: ${e}`);
+  }
+}
+
+/** Open the OS native directory picker and apply the choice to the active
+ *  profile. Cancelling the dialog is a no-op. */
+async function changeWorkdir() {
+  const path = await window.__TAURI__.dialog.open({
+    directory: true,
+    title: "Select a directory for this profile",
+  });
+  if (!path || typeof path !== "string") return;
+  try {
+    await invoke("set_workdir", { path });
     await loadWorkdir();
-    addSystemMessage(`Working directory set to ${path.trim()}.`);
+    addSystemMessage(`Working directory set to ${path}.`);
   } catch (e) {
     addSystemMessage(`Workdir change failed: ${e}`);
   }
@@ -2654,6 +3560,48 @@ function clampSidebarWidth(px) {
   return Math.max(min, Math.min(max, px));
 }
 
+/** Restore the saved console height (persisted in localStorage). */
+function restoreConsoleHeight() {
+  const saved = localStorage.getItem("phoenix.consoleHeight");
+  if (saved) consoleSection.style.height = saved;
+}
+
+/** Clamp the console height: at least the input row + ~2 lines, never past
+ *  the sidebar's other content (nav + workdir + the profile row itself). */
+function clampConsoleHeight(px) {
+  const min = 70;
+  const max = Math.max(min, sidebar.clientHeight - 240);
+  return Math.max(min, Math.min(max, px));
+}
+
+// Console height drag — the profile row rides on top of the handle (see
+// #sidebar-bottom in index.html) and moves with it as the console resizes.
+(() => {
+  let dragging = false;
+  consoleResizer?.addEventListener("mousedown", (e) => {
+    dragging = true;
+    consoleResizer.classList.add("dragging");
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+    e.preventDefault();
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    // The console spans from the drag point down to the sidebar's bottom.
+    const rect = sidebar.getBoundingClientRect();
+    const px = clampConsoleHeight(rect.bottom - e.clientY);
+    consoleSection.style.height = `${px}px`;
+  });
+  window.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    consoleResizer.classList.remove("dragging");
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    localStorage.setItem("phoenix.consoleHeight", consoleSection.style.height);
+  });
+})();
+
 // ----- Event bindings -------------------------------------------------------
 unlockBtn.addEventListener("click", doUnlock);
 passphraseInput.addEventListener("keydown", (e) => {
@@ -2913,9 +3861,26 @@ modelsCloseBtn?.addEventListener("click", () => { modelsPanel.hidden = true; });
 modelsPanel?.addEventListener("click", (e) => {
   if (e.target === modelsPanel) modelsPanel.hidden = true;
 });
-// Models panel v0.5 — AmberCore / Ollama / Provider API wiring.
-icPullBtn?.addEventListener("click", pullAmberCore);
-icUrl?.addEventListener("keydown", (e) => { if (e.key === "Enter") pullAmberCore(); });
+// Models panel v0.5 — runner tabs + shared model list + Provider API wiring.
+// Runner tabs: switching swaps the settings pane, the list title, the acquire
+//  row (Find models / Ollama pull) and the visible model list.
+runnerBox?.querySelectorAll(".runner-tab").forEach((tab) => {
+  tab.addEventListener("click", () => setRunnerTab(tab.dataset.runner));
+});
+// Restore the last-selected runner (defaults to AmberCore).
+setRunnerTab(localStorage.getItem("phoenix.runnerTab") || "ambercore");
+// Model search modal: open from the list container's Find-models row, search,
+// switch source, and re-slice the results through the size/quant/params filters.
+icSearchBtn?.addEventListener("click", openModelSearch);
+msSearchBtn?.addEventListener("click", runModelSearch);
+msQuery?.addEventListener("keydown", (e) => { if (e.key === "Enter") runModelSearch(); });
+msCloseBtn?.addEventListener("click", () => { modelSearchModal.hidden = true; });
+[msFilterSize, msFilterQuant, msFilterParams].forEach((sel) => {
+  sel?.addEventListener("change", applyMsFilters);
+});
+document.querySelectorAll(".ms-source").forEach((btn) => {
+  btn.addEventListener("click", () => { setMsSource(btn.dataset.source); runModelSearch(); });
+});
 icDirClear?.addEventListener("click", async () => {
   icDir.value = "";
   await setAmberCoreDir();
@@ -2929,29 +3894,38 @@ olPullBtn?.addEventListener("click", pullOllama);
 olPull?.addEventListener("keydown", (e) => { if (e.key === "Enter") pullOllama(); });
 olInstallBtn?.addEventListener("click", installOllama);
 prRegisterBtn?.addEventListener("click", registerProvider);
-// Pull-progress events streamed from the backend.
-listen("ambercore-pull-progress", (e) => {
-  const { completed, total } = e.payload;
-  const label = e.payload?.phase === "tokenizer" ? "Tokenizer" : "Model";
-  const pct = total ? Math.min(100, Math.round((completed / total) * 100)) : 0;
-  const bar = icProgress.querySelector(".mp-progress-bar");
-  if (bar) bar.style.setProperty("--mp-pct", `${pct}%`);
-  const txt = icProgress.querySelector(".mp-progress-text");
-  if (txt) txt.textContent = total
-    ? `${label} · ${pct}% · ${humanBytes(completed)} / ${humanBytes(total)}`
-    : `${label} · ${humanBytes(completed)} downloaded`;
-});
-listen("ollama-pull-progress", (e) => {
-  const txt = olProgress.querySelector(".mp-progress-text");
-  if (txt) txt.textContent = String(e.payload?.line ?? "").slice(0, 80);
-});
+// Pull-progress events streamed from the backend — one bar per concurrent
+// pull (AmberCore and Ollama alike), keyed by the pull id.
+listen("ambercore-pull-progress", (e) => onAmberCorePullProgress(e.payload));
+listen("ollama-pull-progress", (e) => onOllamaPullProgress(e.payload));
 
-// Profile selector + new-profile button.
-profileSelect?.addEventListener("change", onProfileChange);
+// Profile home (Default) + new-profile button.
 profileNewBtn?.addEventListener("click", createNewProfile);
+profileHomeBtn?.addEventListener("click", goDefaultProfile);
 
-// Workdir change.
-workdirChangeBtn?.addEventListener("click", changeWorkdir);
+// Workdir: the whole row opens the native directory picker.
+workdirRow?.addEventListener("click", changeWorkdir);
+
+// Sidebar console: Enter runs, ↑/↓ walks history.
+consoleInput?.addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") {
+    runConsoleCommand();
+  } else if (ev.key === "ArrowUp") {
+    if (consoleHistoryIdx > 0) {
+      consoleHistoryIdx -= 1;
+      consoleInput.value = consoleHistory[consoleHistoryIdx];
+      ev.preventDefault();
+    }
+  } else if (ev.key === "ArrowDown") {
+    if (consoleHistoryIdx < consoleHistory.length - 1) {
+      consoleHistoryIdx += 1;
+      consoleInput.value = consoleHistory[consoleHistoryIdx];
+    } else {
+      consoleHistoryIdx = consoleHistory.length;
+      consoleInput.value = "";
+    }
+  }
+});
 
 // Skills panel: nav open, close, tabs, new/edit form, search.
 skillsNavItem?.addEventListener("click", () => {
@@ -3256,5 +4230,133 @@ totpConfirmBtn?.addEventListener("click", confirmTotp);
 totpCancelBtn?.addEventListener("click", cancelTotpSetup);
 totpDisableBtn?.addEventListener("click", disableTotp);
 
+/** Dev-only demo (`#activity-demo` in the URL): replay the 10 activity
+ *  states through the REAL components, one every ~1.3s — used to eyeball
+ *  message spacing and styling in the running app. No-op unless the hash
+ *  opts in; never part of a normal session. */
+async function playActivityDemo() {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const showThinking = (text) => {
+    workingBlock = null;
+    const block = ensureWorkingBlock();
+    setPhaseTitle("Thinking");
+    const c = block.querySelector(".thinking-body .content");
+    c.dataset.raw = text;
+    c.textContent = text;
+    updateThinkingMeta(block);
+  };
+  const steps = [
+    () => addUserMessage("Fix the model error from yesterday and clean up the old model folders."),
+    () => addModelActivity({
+      kind: "explore", title: "Exploring files", status: "scanning…",
+      body: activityFilesBody("N:\\Phoenix Agent\\phoenix-agent", [
+        { name: "ambercore", dir: true },
+        { name: "src", dir: true },
+        { name: "frontend", dir: true },
+        { name: "app.js", size: "212 KB" },
+        { name: "Cargo.toml", size: "3 KB" },
+      ]),
+    }),
+    () => addModelActivity({
+      kind: "code", title: "Writing code", status: "editing…",
+      lang: "ambercore/src/model/qwen35.rs", plus: 5, minus: 1,
+      body: activityCodeBody("ambercore/src/model/qwen35.rs", [
+        "-        let out = t.broadcast_as((rep, heads, len, d))?;",
+        "+        let out = t.reshape((1, k_heads, len, d))?",
+        "+            .broadcast_as((rep, k_heads, len, d))?",
+        "+            .contiguous()?",
+        "+            .reshape((v_heads, len, d))?;",
+        "         Ok(out)",
+      ]),
+    }),
+    () => addModelActivity({
+      kind: "terminal", title: "Running task", status: "running…",
+      body: activityTermBody("cargo test --release", [
+        "running 88 tests",
+        "test model::qwen35::kv_head_grow_layouts ... ok",
+      ]),
+    }),
+    () => addModelActivity({
+      kind: "approval", title: "Validation needed", status: "waiting for you", state: "attention",
+      body: activityQuestionBody(
+        "I'm about to delete 3 old model folders in models/ (~12.4 GB total). Proceed?"
+      ),
+    }),
+    () => addModelActivity({
+      kind: "error", title: "Error — I need your help", status: "blocked", state: "attention",
+      body: activityErrorBody(
+        "model error: sample: A weight is negative, too large or not a valid number",
+        "The GGUF looks corrupted — I can re-pull it (2.4 GB), or you point me at another file."
+      ),
+    }),
+    () => addModelActivity({
+      kind: "image", title: "Generating image", status: "diffusing…",
+      body: activityProgressBody(64, "logo-concept-3.png · 1024×1024 · step 19/30"),
+    }),
+    () => addModelActivity({
+      kind: "model3d", title: "Generating 3D model", status: "texturing…",
+      body: activityProgressBody(40, "spaceship.glb · phase 2/3 — baking textures"),
+    }),
+    () => addModelActivity({
+      kind: "web", title: "Browsing the web", status: "reading…",
+      body: activityWebBody("search: qwen 3.5 broadcast repeat fix", [
+        { fav: "g", title: "ggml_repeat_4d — tiling semantics", domain: "github.com" },
+        { fav: "g", title: "llama.cpp qwen35.cpp — GDN head grow", domain: "github.com" },
+        { fav: "h", title: "candle broadcast_as — stride-0 views", domain: "hf.co" },
+      ]),
+    }),
+    () => addModelActivity({
+      kind: "subagent", title: "Running sub-agent", status: "researching…",
+      body: activitySubagentBody(
+        "Researcher",
+        "Qwen3.5-0.8B · local",
+        "Find the exact ggml_repeat_4d tiling semantics in llama.cpp and cite the file + line."
+      ),
+    }),
+    () => showThinking(
+      "The error is in the GDN head grow — the 4B is the first model where n_v ≠ n_k, " +
+      "so the broadcast path never ran on a validated model. ACRoad §6b says: check the " +
+      "copy-axis placement before touching anything else…"
+    ),
+  ];
+  for (const step of steps) {
+    step();
+    await sleep(1300);
+  }
+}
+
 // Start.
 init();
+
+// Demo trigger: only when the URL hash opts in (dev harness / manual check).
+if (location.hash === "#activity-demo") {
+  (async () => {
+    for (let i = 0; i < 100 && !(chatScreen && chatScreen.classList.contains("active")); i++) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    await new Promise((r) => setTimeout(r, 400));
+    await playActivityDemo();
+  })();
+}
+
+// Preview/debug hook — lets the browser harness (frontend/_preview.html)
+// render sample UI states through the REAL code paths. Never used by the
+// app itself; harmless if removed.
+window.__phoenix = {
+  chat: () => chatMessages,
+  addUserMessage, addAssistantMessage, addSystemMessage,
+  addModelActivity, setActivityStatus, setCodeDiff, bumpCodeDiff,
+  activityFilesBody, activityCodeBody, activityTermBody, activityWebBody,
+  activitySubagentBody, activityProgressBody, activityQuestionBody, activityErrorBody,
+  showThinking(text) {
+    workingBlock = null;
+    const block = ensureWorkingBlock();
+    setPhaseTitle("Thinking");
+    const content = block.querySelector(".thinking-body .content");
+    content.dataset.raw = text;
+    content.textContent = text;
+    updateThinkingMeta(block);
+    return block;
+  },
+};
+

@@ -24,6 +24,10 @@ pub struct SessionSummary {
     pub created_at: String,
     pub updated_at: String,
     pub message_count: i64,
+    /// When /learn last captured this session (NULL = never learned).
+    pub learned_at: Option<String>,
+    /// When /cc compacted this session's context (NULL = never compacted).
+    pub compacted_at: Option<String>,
 }
 
 /// A named bundle of agent behavior settings (Science Workbench profile).
@@ -237,7 +241,8 @@ impl MemoryStore {
     pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.title, s.model, s.created_at, s.updated_at,
-                    (SELECT count(*) FROM messages m WHERE m.session_id = s.id) AS n
+                    (SELECT count(*) FROM messages m WHERE m.session_id = s.id) AS n,
+                    s.learned_at, s.compacted_at
              FROM sessions s
              ORDER BY s.updated_at DESC",
         )?;
@@ -249,6 +254,8 @@ impl MemoryStore {
                 created_at: row.get(3)?,
                 updated_at: row.get(4)?,
                 message_count: row.get(5)?,
+                learned_at: row.get(6)?,
+                compacted_at: row.get(7)?,
             })
         })?;
         let mut out = Vec::new();
@@ -256,6 +263,33 @@ impl MemoryStore {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// Stamp a session as learned (/cc-less) — powers the rail dash colors.
+    pub fn mark_session_learned(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET learned_at = ?2 WHERE id = ?1",
+            params![id, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    /// Stamp a session as context-compacted (via /cc).
+    pub fn mark_session_compacted(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET compacted_at = ?2 WHERE id = ?1",
+            params![id, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    /// Fold the WAL back into the main DB file so a capsule seal copies a
+    /// self-contained `memory.db` (no -wal/-shm needed). Cheap; safe to call
+    /// while other statements are idle.
+    pub fn checkpoint_wal(&self) -> Result<()> {
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        Ok(())
     }
 
     // ---- messages -------------------------------------------------------
@@ -494,6 +528,22 @@ impl MemoryStore {
     /// Persist the working directory.
     pub fn set_workdir(&self, path: &str) -> Result<()> {
         self.set_setting("workdir", path)
+    }
+
+    // ---- profile-scoped working directories ------------------------------
+    //
+    // Workdir is per-profile (profiles bundle everything, incl. workdir). The
+    // legacy global `workdir` key above is kept for pre-unlock boot resolution
+    // and migrated lazily into the Default profile's key.
+
+    /// Get a profile's working directory (`profile:{id}:workdir`), if set.
+    pub fn get_profile_workdir(&self, profile_id: i64) -> Result<Option<String>> {
+        self.get_setting(&format!("profile:{profile_id}:workdir"))
+    }
+
+    /// Persist a profile's working directory.
+    pub fn set_profile_workdir(&self, profile_id: i64, path: &str) -> Result<()> {
+        self.set_setting(&format!("profile:{profile_id}:workdir"), path)
     }
 
     // ---- TOTP 2FA (settings KV rows) -----------------------------------

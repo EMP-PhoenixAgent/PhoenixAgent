@@ -52,33 +52,61 @@ pub trait DynModel: Send {
 ///   (Qwen3-30B-A3B & friends)
 /// - **Llama family**: `llama` (Llama 1/2/3, Mistral-7B conversions,
 ///   TinyLlama, Yi, SmolLM, ...), `mixtral` (sparse MoE; via llama's MoE path)
-/// - **Gemma**: `gemma`, `gemma2`, `gemma3`
+/// - **Gemma**: `gemma`, `gemma2`, `gemma3`, `gemma4` (E2B/E4B/12B/31B dense,
+///   PLE + cross-layer KV sharing + interleaved SWA)
 /// - **Phi**: `phi2` (Phi-2), `phi3` (Phi-3 **and Phi-4**, which converts
 ///   with the phi3 arch)
 /// - **GLM**: `glm4`
 /// - **Liquid**: `lfm2`
 /// - **Qwen2-layout relatives**: `starcoder2`, `internlm2` (metadata remap)
+/// - **IBM Granite**: `granite` (dense), `granitemoe`, `granite_swa`
+/// - **NVIDIA**: `nemotron` (dense LayerNorm/ReLU² family)
+/// - **MiniMax**: `minimax-m2` (full-attention MoE)
+/// - **Qwen 3.5**: `qwen35` — the hybrid gated-delta-net family (3-of-4
+///   recurrent layers + every-4th full attention, chunked SSD prefill);
+///   **covers Ornith**, which ships on the qwen35 archs
+/// - **DeepSeek & relatives**: `deepseek2` (DeepSeek V2/V2.5/V3/R1 **plus
+///   every model shipping that arch — Kimi K2 Instruct/Thinking, GLM-4.7
+///   Lite, V2-Lite derivatives**) and `deepseek32` (V3.2; DSA indexer
+///   ignored, full attention — llama.cpp's pre-DSA fallback mode). The legacy
+///   `kimi_k2` spelling aliases `deepseek2` for older GGUFs.
 ///
-/// Known-but-unsupported (hybrid attention / MLA MoE — candle lacks the
-/// kernels, same class of gap as qwen35): `qwen35`, `deepseek2`/`deepseek_v3`,
-/// `kimi_k2`/`kimi_linear`, `gemma3n`, `granite`, `olmo`/`olmo2`, `nemotron`,
-/// `exaone`, `hunyuan`, `internlm3`(?), `llama4`, `mistral3`, `starcoder`.
+/// Known-but-unsupported: **hybrid attention / SSM families** (recurrent
+/// kernels candle lacks): `qwen35moe` (the MoE Qwen3.5 variant — no released
+/// GGUF to validate against yet), `kimi-k3`, `kimi-linear`,
+/// `nemotron_h`(+`_moe`), `granitehybrid`, `deepseek4`, `minimax-01`,
+/// `qwen3next`, `graniteswitch`, `llama4`, `gpt-oss` (MXFP4), plus
+/// encoder/diffusion archs (bert/t5/rwkv/dream...). Also unsupported:
+/// `gemma3n` (AltUp/Laurel variant — queued behind gemma4) and gemma4-MoE
+/// sizes (rejected at build with a clear message).
 pub const SUPPORTED_ARCHS: &[&str] = &[
     "qwen2",
     "qwen2_v2",
     "qwen3",
     "qwen3moe",
+    "qwen35",
     "llama",
     "mixtral",
     "gemma",
     "gemma2",
     "gemma3",
+    "gemma4",
     "phi2",
     "phi3",
     "glm4",
     "lfm2",
     "starcoder2",
     "internlm2",
+    "granite",
+    "granitemoe",
+    "granite_swa",
+    "nemotron",
+    "minimax-m2",
+    "deepseek2",
+    "deepseek32",
+    // Legacy alias: early Kimi-K2 GGUFs spelled the arch `kimi_k2` before
+    // converters settled on deepseek2 (the layout is identical).
+    "kimi_k2",
 ];
 
 /// Whether an architecture string (a GGUF's `general.architecture`) can be
@@ -96,21 +124,27 @@ pub fn build(loaded: &mut LoadedModel, device: &Device) -> Result<Box<dyn DynMod
         "qwen2" | "qwen2_v2" | "starcoder2" | "internlm2" => {
             crate::model::qwen2::build(loaded, device)
         }
-        // NOTE: `qwen35` (Qwen3.5 hybrid SSM) is NOT qwen3-compatible — its
-        // tensor layout (`ssm_*`, fused `attn_qkv`, `post_attention_norm`, no
-        // `ffn_norm`) needs kernels candle doesn't have. It must fail as
-        // "unsupported architecture", not crash inside the qwen3 builder.
         "qwen3" => crate::model::qwen3::build(loaded, device),
         "qwen3moe" => crate::model::qwen3_moe::build(loaded, device),
+        // Qwen3.5 hybrid GDN — NOT qwen3-compatible (ssm_* tensors, fused
+        // attn_qkv, post_attention_norm, no ffn_norm); own builder.
+        "qwen35" => crate::model::qwen35::build(loaded, device),
         "llama" => crate::model::llama::build(loaded, device),
         "mixtral" => crate::model::mixtral::build(loaded, device),
         "gemma" | "gemma2" | "gemma3" => crate::model::gemma::build(loaded, device),
+        "gemma4" => crate::model::gemma4::build(loaded, device),
         "phi2" | "phi3" => crate::model::phi::build(loaded, device),
         "glm4" => crate::model::glm4::build(loaded, device),
         "lfm2" => crate::model::lfm2::build(loaded, device),
+        "granite" | "granitemoe" | "granite_swa" => crate::model::granite::build(loaded, device),
+        "nemotron" => crate::model::nemotron::build(loaded, device),
+        "minimax-m2" => crate::model::minimax_m2::build(loaded, device),
+        // One MLA+MoE implementation covers DeepSeek V2/V2.5/V3/R1, V3.2
+        // (`deepseek32`), Kimi K2 and the other deepseek2-arch models.
+        "deepseek2" | "deepseek32" | "kimi_k2" => crate::model::deepseek2::build(loaded, device),
         other => Err(Error::Model(format!(
-            "unsupported architecture: {other} (supported: {}; hybrid/MLA families like \
-             qwen35, deepseek, and kimi are not supported yet — see registry.rs)",
+            "unsupported architecture: {other} (supported: {}; hybrid/SSM families like \
+             kimi-k3, and nemotron_h are not supported yet — see registry.rs)",
             SUPPORTED_ARCHS.join(", ")
         ))),
     }
@@ -145,12 +179,45 @@ mod tests {
         for arch in SUPPORTED_ARCHS {
             assert!(is_supported(arch), "{arch} should be supported");
         }
-        // Spot-check the newly added families.
-        for arch in ["gemma3", "phi3", "glm4", "mixtral", "qwen3moe", "llama", "starcoder2"] {
+        // Spot-check each family.
+        for arch in [
+            "gemma3",
+            "gemma4",
+            "phi3",
+            "glm4",
+            "mixtral",
+            "qwen3moe",
+            "qwen35",
+            "llama",
+            "starcoder2",
+            "granite",
+            "granitemoe",
+            "granite_swa",
+            "nemotron",
+            "minimax-m2",
+            "deepseek2",
+            "deepseek32",
+            "kimi_k2",
+        ] {
             assert!(is_supported(arch), "{arch} should be supported");
         }
-        // Hybrid-SSM / MLA families — deliberately NOT supported (see build's NOTE).
-        for arch in ["qwen35", "deepseek2", "deepseek_v3", "kimi_k2", "kimi_linear", "gemma3n"] {
+        // Hybrid-SSM / exotic families — deliberately NOT supported (see the
+        // SUPPORTED_ARCHS doc). Kimi K3 is `kimi-k3` (K2 rides deepseek2 and
+        // IS supported); qwen35moe waits for a released GGUF to pin its names.
+        for arch in [
+            "qwen35moe",
+            "deepseek4",
+            "kimi-k3",
+            "kimi-linear",
+            "nemotron_h",
+            "granitehybrid",
+            "graniteswitch",
+            "minimax-01",
+            "minimax-m3",
+            "gemma3n",
+            "gpt-oss",
+            "llama4",
+        ] {
             assert!(!is_supported(arch), "{arch} must stay unsupported");
         }
         assert!(!is_supported(""));

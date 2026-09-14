@@ -1,17 +1,28 @@
 # Phoenix Agent
 
-> **ALPHA — v0.8.0.** The reviewed, public source for the Phoenix Agent
-> desktop app: fully local, encrypted at rest, autonomous. Models run through
-> the **embedded AmberCore engine** (compiled in-process; CPU or NVIDIA CUDA),
-> [Ollama](https://ollama.com), or any OpenAI-compatible cloud provider.
+> **ALPHA — v0.8.5.** The reviewed, public source for the Phoenix Agent
+> desktop app: fully local, encrypted at rest, autonomous — and
+> **encapsulated**: the whole app ships as a single launcher exe that carries
+> its own encrypted state. Models run through the **embedded AmberCore
+> engine** (compiled in-process; CPU or NVIDIA CUDA), [Ollama](https://ollama.com),
+> or any OpenAI-compatible cloud provider.
 
 A fully-local, encrypted, autonomous coding & research agent. Everything runs
 on your machine — your code, your conversations, and your memory never leave
 the box. The memory database is AES-256 encrypted (SQLCipher) and unlocks only
-with your launch password.
+with your launch password — and since v0.8.5 the launcher exe *itself* is the
+vault: your private state is sealed into the binary's tail as ciphertext
+(AES-256-GCM), auto-saved after every finished task, wiped from temp on
+close, and rehydrated only behind your launch password.
 
 ## What it does
 
+- **Encapsulated launcher** — one exe, no install. Drop it in any folder and
+  run it: models download into a plain `models/` folder *beside* it (browse,
+  copy, or delete them by hand), while your private state — encrypted memory,
+  settings, keys, logs — is sealed **inside the exe**, updated on every
+  auto-save, and gone from temp the moment you close it. Copy the exe and
+  your whole state travels with it.
 - **Autonomous agent** — a ReAct reasoning loop with an approval gate: the
   agent reads/writes files, searches code, and runs shell commands; anything
   that mutates state asks first.
@@ -58,26 +69,32 @@ file as it downloads, and re-pulls skip files already on disk.
 Pulls are validated before anything is registered:
 
 - The GGUF's header is probed and **unsupported architectures are rejected
-  immediately** with a plain-language error (supported today: `qwen2`,
-  `qwen3`, `llama` — Qwen3.5's hybrid `qwen35` SSM architecture is not yet
-  supported).
+  immediately** with a plain-language error. **25 architectures are supported
+  today** — `qwen2/qwen3` (+MoE), **`qwen35` (Qwen 3.5 hybrid gated-delta-net,
+  incl. the 4B)**, `llama`, `mistral`, `mixtral`, `gemma` 1–4, `phi2/3/4`,
+  `glm4`, `deepseek2/3.2` (+Kimi K2), `granite`, `nemotron`, `minimax-m2`,
+  `lfm2`, `starcoder2`, `internlm2` — plus native **F16/BF16 safetensors**
+  loading (single-file and sharded) for qwen3/qwen3.5.
 - A model **without a tokenizer never registers** — the pull fails listing
   the URLs it tried, and a retry (or a manual tokenizer URL) only downloads
   the missing file.
 
-Models live in `<install folder>/models/` by default (configurable in the
-panel) as per-model subfolders: `<model>/<model>.gguf` +
-`<model>/<model>.tokenizer.json`.
+Models live in the plain `models/` folder **beside the launcher** by default
+(configurable in the panel) as per-model subfolders:
+`<model>/<model>.gguf` + `<model>/<model>.tokenizer.json`.
 
 ### GPU acceleration
 
 The embedded engine **prefers the GPU automatically** — CUDA when compiled
 in, CPU otherwise; there is nothing to configure, and the active backend is
-shown in Main Menu → Telemetry. The default build embeds the portable CPU
-backend; rebuild with `--features ambercore-cuda` (NVIDIA; CUDA toolkit +
-MSVC) or `--features ambercore-metal` (macOS Apple GPU, experimental) for
-hardware acceleration. Ready-made Windows installers ship in both flavors —
-see [`Installers`](../Installers/README.md).
+shown in Main Menu → Telemetry. Before each model load a **VRAM pre-flight**
+estimates the file's resident size and refuses (with guidance) what would
+oversubscribe — the silent 12× WDDM slowdown trap. Ready-made encapsulated
+launchers ship in two flavors, `PhoenixAgent-V0.8.5a-CUDA13.exe` (driver
+580.65+) and `PhoenixAgent-V0.8.5a-CUDA12.exe` (driver 570.51+); non-NVIDIA
+machines fall back to the CPU backend automatically. Build your own with
+`--features ambercore-cuda` (NVIDIA; CUDA toolkit + MSVC) or
+`--features ambercore-metal` (macOS Apple GPU, experimental).
 
 ## Build & run
 

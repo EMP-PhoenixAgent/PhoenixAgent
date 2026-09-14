@@ -6,11 +6,14 @@
 //! `emit()`.
 
 pub mod commands;
+mod shard_pull;
 pub mod events;
 pub mod model_urls;
 pub mod state;
 
 use std::sync::Arc;
+
+use tauri::Manager;
 
 use tokio::sync::Mutex;
 
@@ -26,6 +29,14 @@ pub fn run(config: Config, paths: Paths, workdir: std::path::PathBuf) -> Result<
     let state = state::WebState::new(config, paths, workdir);
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        // Encapsulated: a second copy of the exe would race the seal (and
+        // the staging dir) — refuse to run concurrently.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.set_focus();
+            }
+        }))
         .manage(state)
         .setup(|app| {
             // Spawn the background event/health forwarding tasks. They start
@@ -45,6 +56,7 @@ pub fn run(config: Config, paths: Paths, workdir: std::path::PathBuf) -> Result<
             commands::send_message,
             commands::context_resume,
             commands::learn,
+            commands::compact_context,
             commands::set_mode,
             commands::get_mode,
             // To-do list (shared plan panel)
@@ -62,6 +74,8 @@ pub fn run(config: Config, paths: Paths, workdir: std::path::PathBuf) -> Result<
             commands::deny,
             commands::new_session,
             commands::list_sessions,
+            commands::load_session_messages,
+            commands::seal_capsule,
             commands::list_models,
             commands::get_health,
             commands::get_runtime_metrics,
@@ -75,6 +89,7 @@ pub fn run(config: Config, paths: Paths, workdir: std::path::PathBuf) -> Result<
             commands::set_ambercore_directory,
             commands::get_ambercore_directory,
             commands::pull_ambercore_model,
+            commands::delete_ambercore_model,
             commands::run_ambercore,
             commands::connect_ambercore_remote,
             commands::use_local_ambercore,
@@ -82,6 +97,7 @@ pub fn run(config: Config, paths: Paths, workdir: std::path::PathBuf) -> Result<
             commands::get_hardware_status,
             commands::list_ollama_models,
             commands::pull_ollama_model,
+            commands::delete_ollama_model,
             commands::install_ollama,
             commands::run_ollama,
             commands::list_providers,
@@ -100,6 +116,8 @@ pub fn run(config: Config, paths: Paths, workdir: std::path::PathBuf) -> Result<
             commands::switch_profile,
             commands::get_workdir,
             commands::set_workdir,
+            commands::console_run,
+            commands::search_models,
             // Science Workbench (Panel 2: Skills)
             commands::list_skills,
             commands::list_skills_for_active_profile,
@@ -143,8 +161,21 @@ pub fn run(config: Config, paths: Paths, workdir: std::path::PathBuf) -> Result<
             commands::disable_totp,
             commands::change_passphrase,
         ])
-        .run(tauri::generate_context!())
-        .map_err(|e| crate::error::PhoenixError::Other(format!("tauri: {e}")))?;
+        // Encapsulated exit path: on Exit, checkpoint the DB, stop the
+        // backend processes, and seal the staging dir back INTO the exe
+        // (rename-swap — safe from inside the dying process). This is the
+        // moment the app folder becomes "nothing but the exe" again.
+        .build(tauri::generate_context!())
+        .map_err(|e| crate::error::PhoenixError::Other(format!("tauri: {e}")))?
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                let state = app.state::<crate::web::state::WebState>();
+                match tauri::async_runtime::block_on(commands::seal_capsule_now(&state, true)) {
+                    Ok(note) => tracing::info!("capsule: exit seal — {note}"),
+                    Err(e) => tracing::error!("capsule: exit seal failed: {e} (staging dir keeps the state)"),
+                }
+            }
+        });
 
     Ok(())
 }

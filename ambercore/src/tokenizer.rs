@@ -270,6 +270,17 @@ pub enum ChatTemplate {
     MistralInst,
     /// `<|start_header_id|>role<|end_header_id|>` — Llama-3.
     Llama3,
+    /// `<|start_of_role|>role<|end_of_role|>…<|end_of_text|>` — IBM Granite.
+    Granite,
+    /// `<｜User｜>…<｜Assistant｜>` with `<｜end▁of▁sentence｜>` — DeepSeek
+    /// V2/V3/R1 (the separators are full-width characters, kept verbatim).
+    DeepSeek,
+    /// `<|im_user|>user<|im_middle|>…<|im_end|>` — Kimi K2 (ships on the
+    /// `deepseek2` arch but speaks its own markup).
+    Kimi,
+    /// `]~b]system/user/ai … [e~[` — MiniMax M2's punctuation-soup tokens
+    /// (each is a single vocab entry, not a typo).
+    MiniMax,
 }
 
 impl ChatTemplate {
@@ -278,11 +289,18 @@ impl ChatTemplate {
     /// the `llama` arch) — [`pick_template`] resolves it from the tokenizer.
     pub fn default_for_arch(arch: &str) -> ChatTemplate {
         match arch {
-            "gemma" | "gemma2" | "gemma3" => ChatTemplate::Gemma,
+            "gemma" | "gemma2" | "gemma3" | "gemma4" => ChatTemplate::Gemma,
             "phi3" => ChatTemplate::Phi3,
             "glm4" => ChatTemplate::Glm4,
             "mixtral" => ChatTemplate::MistralInst,
-            // qwen2/qwen2_v2/qwen3/qwen3moe/phi2/starcoder2/internlm2/lfm2 + default
+            "granite" | "granitemoe" | "granite_swa" => ChatTemplate::Granite,
+            // The deepseek2 family splits by tokenizer: Kimi K2 carries
+            // `<|im_middle|>`, DeepSeek does not (see [`pick_template`]).
+            "deepseek2" | "deepseek32" | "kimi_k2" => ChatTemplate::DeepSeek,
+            "minimax-m2" => ChatTemplate::MiniMax,
+            // qwen2/qwen2_v2/qwen3/qwen3moe/phi2/starcoder2/internlm2/lfm2/
+            // nemotron + default — nemotron is disambiguated from the
+            // tokenizer like `llama` (see [`pick_template`]).
             _ => ChatTemplate::ChatMl,
         }
     }
@@ -302,12 +320,20 @@ fn resolve_llama_family(tok: &TokenizerWrapper) -> ChatTemplate {
 }
 
 /// Pick the chat template for a loaded model: per-arch default, with the
-/// ambiguous `llama` arch resolved from the tokenizer's special tokens.
+/// ambiguous archs resolved from the tokenizer's special tokens — `llama` and
+/// `nemotron` (Llama-2/3/ChatML finetunes all report those archs), plus the
+/// `deepseek2` family (DeepSeek vs Kimi K2 markup).
 pub fn pick_template(arch: &str, tok: &TokenizerWrapper) -> ChatTemplate {
-    if arch == "llama" {
-        resolve_llama_family(tok)
-    } else {
-        ChatTemplate::default_for_arch(arch)
+    match arch {
+        "llama" | "nemotron" => resolve_llama_family(tok),
+        "deepseek2" | "deepseek32" | "kimi_k2" => {
+            if tok.token_to_id("<|im_middle|>").is_some() {
+                ChatTemplate::Kimi
+            } else {
+                ChatTemplate::DeepSeek
+            }
+        }
+        _ => ChatTemplate::default_for_arch(arch),
     }
 }
 
@@ -327,6 +353,10 @@ pub fn format_chat_prompt(
         ChatTemplate::Glm4 => format_glm4_chat(turns, default_system),
         ChatTemplate::MistralInst => format_mistral_inst(turns, default_system),
         ChatTemplate::Llama3 => format_llama3_chat(turns, default_system),
+        ChatTemplate::Granite => format_granite_chat(turns, default_system),
+        ChatTemplate::DeepSeek => format_deepseek_chat(turns, default_system),
+        ChatTemplate::Kimi => format_kimi_chat(turns, default_system),
+        ChatTemplate::MiniMax => format_minimax_chat(turns, default_system),
     }
 }
 
@@ -476,6 +506,109 @@ fn format_llama3_chat(turns: &[ChatTurn], default_system: Option<&str>) -> Strin
         ));
     }
     out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    out
+}
+
+/// Granite: `<|start_of_role|>role<|end_of_role|>content<|end_of_text|>` turns,
+/// primed with an open assistant role. BOS is left to the tokenizer's
+/// post-processor, matching the other llama-derived families.
+fn format_granite_chat(turns: &[ChatTurn], default_system: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(sys) = system_text(turns, default_system) {
+        out.push_str(&format!("<|start_of_role|>system<|end_of_role|>{sys}<|end_of_text|>"));
+    }
+    for turn in turns {
+        let role = match turn.role {
+            Role::System => continue,
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+        out.push_str(&format!(
+            "<|start_of_role|>{role}<|end_of_role|>{}<|end_of_text|>",
+            turn.content
+        ));
+    }
+    out.push_str("<|start_of_role|>assistant<|end_of_role|>");
+    out
+}
+
+/// DeepSeek: system text first (no markers), then
+/// `<｜User｜>…`/`<｜Assistant｜>reply<｜end▁of▁sentence｜>` per turn, primed
+/// with `<｜Assistant｜>`. BOS is left to the tokenizer's post-processor. The
+/// separators are full-width Unicode, matching the trained vocab exactly.
+fn format_deepseek_chat(turns: &[ChatTurn], default_system: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(sys) = system_text(turns, default_system) {
+        out.push_str(&sys);
+    }
+    for turn in turns {
+        match turn.role {
+            Role::System => {}
+            Role::User => out.push_str(&format!("<｜User｜>{}", turn.content)),
+            Role::Assistant => out.push_str(&format!(
+                "<｜Assistant｜>{}<｜end▁of▁sentence｜>",
+                turn.content
+            )),
+        }
+    }
+    out.push_str("<｜Assistant｜>");
+    out
+}
+
+/// Kimi K2: `<|im_{role}|>role<|im_middle|>content<|im_end|>` turns over the
+/// `<|im_system|>` header, primed with the assistant header (verbatim from
+/// moonshotai/Kimi-K2-Instruct's chat_template.jinja). Tools ride a dedicated
+/// `tool_declare` turn in the official template; AmberCore injects tools
+/// through `default_system`, which lands in the system header here.
+fn format_kimi_chat(turns: &[ChatTurn], default_system: Option<&str>) -> String {
+    let mut out = String::new();
+    if !turns.iter().any(|t| matches!(t.role, Role::System)) {
+        let sys = default_system
+            .unwrap_or("You are Kimi, an AI assistant created by Moonshot AI.");
+        out.push_str(&format!("<|im_system|>system<|im_middle|>{sys}<|im_end|>\n"));
+    }
+    for turn in turns {
+        match turn.role {
+            Role::System => {
+                out.push_str(&format!(
+                    "<|im_system|>system<|im_middle|>{}<|im_end|>\n",
+                    turn.content
+                ));
+            }
+            Role::User => {
+                out.push_str(&format!("<|im_user|>user<|im_middle|>{}<|im_end|>\n", turn.content));
+            }
+            Role::Assistant => {
+                out.push_str(&format!(
+                    "<|im_assistant|>assistant<|im_middle|>{}<|im_end|>\n",
+                    turn.content
+                ));
+            }
+        }
+    }
+    out.push_str("<|im_assistant|>assistant<|im_middle|>");
+    out
+}
+
+/// MiniMax M2: `]~!b[]~b]system\n…[e~[` header, then `]~b]user/ai\n…[e~[`
+/// turns, primed with `]~b]ai\n` (verbatim from MiniMaxAI/MiniMax-M2's
+/// chat_template.jinja — the punctuation-soup tokens are real single-token
+/// vocab entries). MiniMax always trains with a system block, so the header is
+/// unconditional and empty when no system text is supplied.
+fn format_minimax_chat(turns: &[ChatTurn], default_system: Option<&str>) -> String {
+    let mut out = String::from("]~!b[]~b]system\n");
+    if let Some(sys) = system_text(turns, default_system) {
+        out.push_str(&sys);
+    }
+    out.push_str("[e~[\n");
+    for turn in turns {
+        match turn.role {
+            Role::System => {}
+            Role::User => out.push_str(&format!("]~b]user\n{}[e~[\n", turn.content)),
+            Role::Assistant => out.push_str(&format!("]~b]ai\n{}[e~[\n", turn.content)),
+        }
+    }
+    out.push_str("]~b]ai\n");
     out
 }
 
@@ -631,5 +764,80 @@ mod tests {
         assert!(prompt.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
         // BOS is left to the tokenizer's post-processor.
         assert!(!prompt.contains("<|begin_of_text|>"));
+    }
+
+    #[test]
+    fn granite_template_uses_start_of_role_blocks() {
+        let prompt = format_chat_prompt(
+            ChatTemplate::Granite,
+            &[
+                ChatTurn { role: Role::System, content: "Be terse.".into() },
+                ChatTurn { role: Role::User, content: "Hi".into() },
+            ],
+            None,
+        );
+        assert!(prompt.contains("<|start_of_role|>system<|end_of_role|>Be terse.<|end_of_text|>"));
+        assert!(prompt.contains("<|start_of_role|>user<|end_of_role|>Hi<|end_of_text|>"));
+        assert!(prompt.ends_with("<|start_of_role|>assistant<|end_of_role|>"));
+    }
+
+    #[test]
+    fn deepseek_template_uses_fullwidth_separators() {
+        let prompt = format_chat_prompt(
+            ChatTemplate::DeepSeek,
+            &[
+                ChatTurn { role: Role::System, content: "Be terse.".into() },
+                ChatTurn { role: Role::User, content: "Hi".into() },
+                ChatTurn { role: Role::Assistant, content: "Hello".into() },
+                ChatTurn { role: Role::User, content: "Bye".into() },
+            ],
+            None,
+        );
+        // System text is bare (no markers), before the first turn.
+        assert!(prompt.starts_with("Be terse.<｜User｜>Hi"));
+        // Prior assistant reply closes with the full-width end-of-sentence.
+        assert!(prompt.contains("<｜Assistant｜>Hello<｜end▁of▁sentence｜>"));
+        assert!(prompt.ends_with("<｜Assistant｜>"));
+    }
+
+    #[test]
+    fn kimi_template_uses_im_middle_turns() {
+        let prompt = format_chat_prompt(
+            ChatTemplate::Kimi,
+            &[ChatTurn { role: Role::User, content: "Hi".into() }],
+            None,
+        );
+        // Kimi's own default system, not the generic one.
+        assert!(prompt.contains(
+            "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>"
+        ));
+        assert!(prompt.contains("<|im_user|>user<|im_middle|>Hi<|im_end|>"));
+        assert!(prompt.ends_with("<|im_assistant|>assistant<|im_middle|>"));
+    }
+
+    #[test]
+    fn minimax_template_uses_punctuation_soup_tokens() {
+        let prompt = format_chat_prompt(
+            ChatTemplate::MiniMax,
+            &[ChatTurn { role: Role::User, content: "Hi".into() }],
+            Some("Be terse."),
+        );
+        assert!(prompt.starts_with("]~!b[]~b]system\nBe terse.[e~[\n"));
+        assert!(prompt.contains("]~b]user\nHi[e~[\n"));
+        assert!(prompt.ends_with("]~b]ai\n"));
+    }
+
+    #[test]
+    fn new_families_map_in_default_for_arch() {
+        assert_eq!(ChatTemplate::default_for_arch("gemma4"), ChatTemplate::Gemma);
+        assert_eq!(ChatTemplate::default_for_arch("granite"), ChatTemplate::Granite);
+        assert_eq!(ChatTemplate::default_for_arch("granitemoe"), ChatTemplate::Granite);
+        assert_eq!(ChatTemplate::default_for_arch("granite_swa"), ChatTemplate::Granite);
+        assert_eq!(ChatTemplate::default_for_arch("deepseek2"), ChatTemplate::DeepSeek);
+        assert_eq!(ChatTemplate::default_for_arch("deepseek32"), ChatTemplate::DeepSeek);
+        assert_eq!(ChatTemplate::default_for_arch("kimi_k2"), ChatTemplate::DeepSeek);
+        assert_eq!(ChatTemplate::default_for_arch("minimax-m2"), ChatTemplate::MiniMax);
+        // nemotron falls through to ChatMl but is resolved per-tokenizer.
+        assert_eq!(ChatTemplate::default_for_arch("nemotron"), ChatTemplate::ChatMl);
     }
 }

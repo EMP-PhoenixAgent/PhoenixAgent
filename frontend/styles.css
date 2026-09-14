@@ -43,10 +43,49 @@
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
+/* ---------- Exo 2 — the app typeface (bundled, fully offline) ----------
+ * Faces are mapped to 'Exo 2' per weight; code/terminal contexts keep a
+ * monospace stack (Cascadia Code) since Exo 2 is proportional. */
+@font-face {
+  font-family: 'Exo 2';
+  src: url('fonts/Exo2-Regular.otf') format('opentype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Exo 2';
+  src: url('fonts/Exo2-Italic.otf') format('opentype');
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Exo 2';
+  src: url('fonts/Exo2-Medium.otf') format('opentype');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Exo 2';
+  src: url('fonts/Exo2-SemiBold.otf') format('opentype');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Exo 2';
+  src: url('fonts/Exo2-Bold.otf') format('opentype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
 html, body {
   height: 100%;
   overflow: hidden;
-  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-family: 'Exo 2', 'Segoe UI', system-ui, -apple-system, sans-serif;
   color: var(--text-primary);
   background: var(--bg-color);
 }
@@ -114,18 +153,26 @@ select option {
   margin-bottom: 24px;
 }
 
-#passphrase-input {
+/* Password fields on BOTH gates (setup + unlock) share the dark theme —
+   the setup card's inputs previously had no rule at all and rendered with
+   the browser's default muddy-grey background. */
+.unlock-card input[type="password"] {
   width: 100%;
   padding: 12px 16px;
+  margin-bottom: 12px;
   background: rgba(0,0,0,0.4);
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   font-size: 15px;
   outline: none;
-  transition: border-color 0.2s;
+  transition: border-color 0.2s, box-shadow 0.2s;
 }
-#passphrase-input:focus { border-color: var(--phoenix); }
+.unlock-card input[type="password"]::placeholder { color: var(--text-muted); }
+.unlock-card input[type="password"]:focus {
+  border-color: var(--phoenix);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--phoenix) 18%, transparent);
+}
 
 .error-text {
   color: var(--health-red);
@@ -222,6 +269,53 @@ select option {
   cursor: not-allowed;
   opacity: 0.55;
 }
+
+/* Download progress ring pinned to the far right of the Models nav item — a
+   thin amber ring with the completion percentage inside while pull(s) are
+   active. */
+.nav-eta {
+  margin-left: auto;
+  margin-right: 4px;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+/* display:flex would defeat the hidden attribute (the UA [hidden] rule loses
+   to author CSS) — guard it or the ring renders even when idle. */
+.nav-eta[hidden] { display: none; }
+/* Static ring frame carrying --eta-pct; the sweep child spins so the
+   centered percentage stays upright. */
+.nav-eta-ring {
+  position: relative;
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+}
+.nav-eta-sweep {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  /* Conic-progress ring: the amber sweep is the download's completion.
+     The 68% transparent hole keeps the stroke thin (~4px at 26px). */
+  background:
+    conic-gradient(var(--phoenix-warm) calc(var(--eta-pct, 0%) * 1%), rgba(255, 255, 255, 0.12) 0);
+  -webkit-mask: radial-gradient(farthest-side, transparent 68%, #000 69%);
+          mask: radial-gradient(farthest-side, transparent 68%, #000 69%);
+  animation: eta-spin 1.1s linear infinite;
+}
+@keyframes eta-spin { to { transform: rotate(360deg); } }
+.nav-eta-pct {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 7px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--phoenix-warm);
+}
 .nav-soon {
   margin-left: auto;
   font-size: 9px;
@@ -245,12 +339,14 @@ select option {
 .status-dot.ok { background: var(--health-green); }
 .status-dot.down { background: var(--health-red); }
 
-/* Workdir selector */
+/* Workdir selector — the whole row is the picker trigger */
 #workdir-row {
   display: flex;
   align-items: center;
   gap: 6px;
+  cursor: pointer;
 }
+#workdir-row:hover .workdir-display { border-color: var(--phoenix); }
 .workdir-display {
   flex: 1;
   font-size: 12px;
@@ -263,26 +359,118 @@ select option {
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-sm);
 }
+/* No directory chosen yet for this profile — the prompt to pick one. */
+.workdir-display.placeholder {
+  color: var(--phoenix-warm);
+  font-size: 11px;
+  opacity: 0.9;
+}
 
-/* Profile selector */
+/* Profile row (no selector dropdown): 🏠 jumps to Default, ＋ creates one. */
 #profile-row {
   display: flex;
   align-items: center;
   gap: 6px;
 }
-#profile-select {
+
+/* Bottom group: the profile row glued on top of the console's drag handle.
+ * Pinned to the sidebar's bottom; the whole group grows UPWARD as the console
+ * is resized (the profile row moves with the handle). */
+#sidebar-bottom {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+#console-resizer {
+  height: 5px;
+  flex-shrink: 0;
+  cursor: row-resize;
+  background: transparent;
+  border-radius: 2px;
+  transition: background 0.15s;
+  z-index: 5;
+}
+#console-resizer:hover,
+#console-resizer.dragging {
+  background: var(--phoenix-glow);
+}
+
+/* Sidebar console — height owned by the drag handle (JS sets/persists it;
+ * this is only the first-paint default). Functional messages + errors land
+ * here; the input runs shell commands in the workdir. */
+.sidebar-console {
+  height: 110px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+#console-output {
   flex: 1;
-  padding: 7px 10px;
+  min-height: 0; /* let the inner log scroll instead of growing the sidebar */
+  overflow-y: auto;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: rgba(0,0,0,0.45);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+}
+/* Hover-only scroller: hidden until the cursor is over the log (wheel
+ * scrolling only applies while hovered, by the nature of wheel events). */
+#console-output::-webkit-scrollbar { width: 0; background: transparent; }
+#console-output:hover::-webkit-scrollbar { width: 8px; }
+#console-output::-webkit-scrollbar-track { background: transparent; }
+#console-output::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.14);
+  border-radius: 4px;
+}
+#console-output:hover::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.28); }
+.console-line.c-info { color: var(--text-muted); }
+.console-line.c-warn { color: var(--phoenix-warm); }
+.console-line.c-err { color: var(--health-red); }
+.console-line.c-cmd { color: var(--text-primary); }
+.console-line.c-dim { color: var(--text-dim); }
+#console-input-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   background: rgba(0,0,0,0.4);
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-sm);
-  color: var(--text-primary);
-  font-size: 12px;
-  outline: none;
-  cursor: pointer;
+  padding: 5px 8px;
 }
-#profile-select:focus { border-color: var(--phoenix); }
-#profile-select option { background: #1a1a25; }
+#console-input-row:focus-within { border-color: var(--phoenix); }
+#console-prompt {
+  color: var(--phoenix);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  user-select: none;
+}
+#console-input {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--text-primary);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+}
+
+/* The "invisible wall": while the to-do overlay is up, the chat reserves its
+ * right side (panel 300px + right 20px + breathing room) so messages never
+ * flow under the panel.
+ *
+ * The :has() rule is the AUTHORITATIVE wall — it tracks the panel's ACTUAL
+ * visibility with no JS involvement, so it can never desync (the panel is
+ * shown/hidden from several code paths). The .todo-open variant stays as a
+ * belt-and-braces fallback for engines without :has(). */
+#main-column:has(#todo-panel:not([hidden])) #chat-messages,
+#main-column.todo-open #chat-messages { padding-right: 340px; }
 
 /* Sidebar resize handle */
 #sidebar-resizer {
@@ -359,8 +547,12 @@ select option {
   padding: 20px 24px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 8px;
 }
+/* Messages NEVER compress: without this, flex-column children shrink to fit
+ * the viewport instead of overflowing, so #chat-messages never scrolls and
+ * the card layouts squish. */
+#chat-messages > * { flex-shrink: 0; }
 
 #chat-messages::-webkit-scrollbar { width: 6px; }
 #chat-messages::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
@@ -383,6 +575,11 @@ select option {
   z-index: 40;
   animation: fadeIn 0.3s ease;
 }
+/* Without this, the `display: flex` above (author CSS, higher specificity
+ * than the browser's `[hidden] { display: none }`) DEFEATS the hidden
+ * attribute — the panel could never hide and the chat-wall state desynced
+ * from what the user actually saw. */
+#todo-panel[hidden] { display: none; }
 #todo-header {
   display: flex;
   align-items: center;
@@ -734,18 +931,89 @@ select option {
 
 .message .content { font-size: 14px; line-height: 1.6; }
 
-/* Role-specific styles */
+/* Role-specific styles — the chat bubbles share the reflection-glass recipe
+ * with the activity cards. The USER card is MIRRORED: right-anchored, with
+ * the rim, wash and inner glow entering from the RIGHT edge (the agent's
+ * cards reflect from the left). */
 .message.user {
+  --acc: var(--role-user);
+  position: relative;
+  overflow: hidden;
   align-self: flex-end;
-  background: rgba(86, 156, 214, 0.12);
-  border-left: 3px solid var(--role-user);
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  background:
+    linear-gradient(255deg,
+      color-mix(in srgb, var(--acc) 16%, transparent) 0%,
+      color-mix(in srgb, var(--acc) 4%, transparent) 45%,
+      transparent 75%),
+    rgba(255, 255, 255, 0.055);
+  box-shadow: inset -4px 0 14px -4px color-mix(in srgb, var(--acc) 38%, transparent);
+}
+.message.user::before {
+  content: "";
+  position: absolute;
+  right: 0;
+  top: 4%;
+  bottom: 4%;
+  width: 2.5px;
+  border-radius: 2px;
+  background: linear-gradient(
+    180deg,
+    transparent,
+    color-mix(in srgb, var(--acc) 80%, white 20%) 12%,
+    color-mix(in srgb, var(--acc) 80%, white 20%) 88%,
+    transparent
+  );
+  pointer-events: none;
+}
+.message.user::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent 22%);
+  pointer-events: none;
 }
 .message.user .role-badge { color: var(--role-user); }
 
 .message.assistant {
+  --acc: var(--role-assistant);
+  position: relative;
+  overflow: hidden;
   align-self: flex-start;
-  background: rgba(78, 201, 176, 0.08);
-  border-left: 3px solid var(--role-assistant);
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  background:
+    linear-gradient(105deg,
+      color-mix(in srgb, var(--acc) 16%, transparent) 0%,
+      color-mix(in srgb, var(--acc) 4%, transparent) 45%,
+      transparent 75%),
+    rgba(255, 255, 255, 0.055);
+  box-shadow: inset 4px 0 14px -4px color-mix(in srgb, var(--acc) 38%, transparent);
+}
+.message.assistant::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 4%;
+  bottom: 4%;
+  width: 2.5px;
+  border-radius: 2px;
+  background: linear-gradient(
+    180deg,
+    transparent,
+    color-mix(in srgb, var(--acc) 80%, white 20%) 12%,
+    color-mix(in srgb, var(--acc) 80%, white 20%) 88%,
+    transparent
+  );
+  pointer-events: none;
+}
+.message.assistant::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent 22%);
+  pointer-events: none;
 }
 .message.assistant .role-badge { color: var(--role-assistant); }
 
@@ -804,27 +1072,11 @@ select option {
 }
 
 /* ---------- Reasoning / tool pipeline ---------- */
-/* Live phase pill (shown while the agent works). */
-.agent-phase {
-  align-self: center;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 14px;
-  margin: 0 auto;
-  font-size: 12px;
-  color: var(--text-muted);
-  background: var(--glass-bg);
-  border: 1px solid var(--glass-border);
-  border-radius: 999px;
-  animation: fadeIn 0.3s ease;
-}
-.agent-phase .phase-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: linear-gradient(135deg, var(--phoenix), var(--phoenix-warm));
-  box-shadow: 0 0 6px 1px var(--phoenix-glow);
+/* Inline working indicator (the old floating phase pill, moved INTO the chat):
+ * a .thinking-block.working whose header chip pulses with the live phase
+ * label while its body streams the model's reasoning. Same header anatomy
+ * (icon chip + title + meta + chevron) as the activity cards. */
+.thinking-block.working .activity-icon {
   animation: flame-glow 2.6s ease-in-out infinite;
 }
 
@@ -833,32 +1085,70 @@ select option {
 .thinking-header, .tool-card-header { cursor: pointer; user-select: none; }
 
 /* ---- Thinking block (model reasoning, separate from the answer) ---- */
+/* Same glass recipe as the activity cards: neutral fill, reflection wash
+ * from the left rim, specular top hairline (see the .activity comment).
+ * Cards size to their content — compact when collapsed, grown when open. */
 .thinking-block {
+  --acc: var(--role-assistant);
+  position: relative;
+  overflow: hidden;
   align-self: flex-start;
+  width: fit-content;
+  min-width: 220px;
   max-width: 90%;
-  width: 90%;
   padding: 10px 14px;
-  background: rgba(78, 201, 176, 0.06);
-  border: 1px solid var(--glass-border);
-  border-left: 3px solid var(--role-assistant);
+  background:
+    linear-gradient(105deg,
+      color-mix(in srgb, var(--acc) 16%, transparent) 0%,
+      color-mix(in srgb, var(--acc) 4%, transparent) 45%,
+      transparent 75%),
+    rgba(255, 255, 255, 0.055);
+  border: 1px solid rgba(255, 255, 255, 0.13);
   border-radius: var(--radius-sm);
   animation: fadeIn 0.3s ease;
+  box-shadow: inset 4px 0 14px -4px color-mix(in srgb, var(--acc) 38%, transparent);
+}
+.thinking-block::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 4%;
+  bottom: 4%;
+  width: 2.5px;
+  border-radius: 2px;
+  background: linear-gradient(
+    180deg,
+    transparent,
+    color-mix(in srgb, var(--acc) 80%, white 20%) 15%,
+    color-mix(in srgb, var(--acc) 80%, white 20%) 85%,
+    transparent
+  );
+  pointer-events: none;
+}
+.thinking-block::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent 22%);
+  pointer-events: none;
 }
 .thinking-block.active { animation: flame-glow 2.6s ease-in-out infinite; }
 .thinking-header {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 12px;
+  gap: 9px;
+  font-size: 13px;
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
-.thinking-icon { color: var(--role-assistant); }
 .thinking-title { font-weight: 600; color: var(--role-assistant); }
 .thinking-meta { font-size: 11px; color: var(--text-dim); text-transform: none; letter-spacing: 0; }
-.thinking-body { margin-top: 8px; font-size: 13px; line-height: 1.6; color: var(--text-muted); }
+.thinking-body { margin-top: 9px; min-width: 320px; font-size: 13px; line-height: 1.6; color: var(--text-muted); }
 .thinking-body .content { white-space: pre-wrap; word-wrap: break-word; }
 .thinking-block.collapsed .thinking-body { display: none; }
+/* Slim, uniform collapsed row — shared metrics with the activity cards. */
+.thinking-block.collapsed { padding: 4px 12px; }
 
 /* ---- Tool card (correlated start↔finish) ---- */
 .tool-card {
@@ -905,7 +1195,7 @@ select option {
   color: var(--text-dim);
   margin-bottom: 3px;
 }
-.tool-card pre, .thinking-block pre, .subagent pre {
+.tool-card pre, .thinking-block pre, .subagent pre, .activity pre {
   background: rgba(0,0,0,0.5) !important;
   border-radius: 6px;
   padding: 10px;
@@ -1209,18 +1499,28 @@ select option {
   color: var(--text-muted);
 }
 
-/* Live runtime metrics chip appended to the model health item. */
-.health-metrics {
-  color: var(--text-dim);
-  font-size: 10px;
+/* Live runtime metrics — dead-center of the health bar, white + bold for
+ * maximum visibility (the first thing users monitor). Absolutely positioned
+ * so the middle is the VISUAL middle regardless of side-item widths. */
+#health-bar { position: relative; }
+.health-metrics-center {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #fff;
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+  pointer-events: none;
 }
 .metrics-busy {
-  color: var(--health-green);
-  opacity: 0.8;
+  font-weight: 700;
 }
 .metrics-busy.busy {
-  color: var(--phoenix-warm);
-  font-weight: 600;
   animation: metrics-pulse 1.6s ease-in-out infinite;
 }
 @keyframes metrics-pulse {
@@ -1282,6 +1582,134 @@ select option {
   animation: fadeIn 0.2s ease;
 }
 .panel-overlay[hidden] { display: none; }
+
+/* ---------- Model search modal ---------- */
+/* Opened from the AmberCore box ("Find models…"). Rectangular cards colored
+ * by GPU fit: glass-green = fits entirely, glass-orange = would spill. */
+.ms-modal {
+  align-self: center;
+  width: min(880px, 92vw);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px 20px;
+  border-radius: var(--radius);
+}
+.ms-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.ms-title { font-size: 15px; font-weight: 700; color: var(--text-primary); }
+.ms-sources { display: flex; gap: 6px; margin-left: auto; }
+.ms-source {
+  padding: 5px 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: rgba(0,0,0,0.35);
+  border: 1px solid var(--glass-border);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+.ms-source.active {
+  color: var(--text-primary);
+  border-color: var(--phoenix);
+}
+.ms-search-row { display: flex; gap: 8px; }
+#ms-query {
+  flex: 1;
+  padding: 8px 12px;
+  background: rgba(0,0,0,0.4);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 13px;
+  outline: none;
+}
+#ms-query:focus { border-color: var(--phoenix); }
+/* Client-side filter bar (size / quant / params) over the current results. */
+.ms-filters { display: flex; gap: 8px; }
+.ms-filters select {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  background: rgba(0,0,0,0.4);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: 12px;
+  outline: none;
+  cursor: pointer;
+}
+.ms-filters select:focus { border-color: var(--phoenix); }
+.ms-filters select option { background: #1a1a25; color: var(--text-primary); }
+.ms-vram { font-size: 11.5px; color: var(--text-dim); }
+.ms-results {
+  flex: 1;
+  min-height: 200px;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 10px;
+  align-content: start;
+  padding-right: 4px;
+}
+.ms-empty {
+  grid-column: 1 / -1;
+  padding: 30px 10px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.ms-card {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  animation: fadeIn 0.2s ease;
+}
+/* Fits entirely on the GPU — glass green. */
+.ms-card.fits {
+  background: rgba(46, 160, 100, 0.12);
+  border-color: rgba(74, 222, 148, 0.35);
+}
+/* Would spill to system RAM — glass orange. */
+.ms-card.spills {
+  background: rgba(217, 119, 6, 0.12);
+  border-color: rgba(251, 146, 60, 0.35);
+}
+.ms-card-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.ms-row { display: flex; align-items: baseline; gap: 8px; }
+.ms-row-top { justify-content: space-between; }
+.ms-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ms-size { font-size: 12.5px; font-weight: 600; color: var(--text-muted); flex-shrink: 0; }
+.ms-row-bottom { font-size: 11.5px; color: var(--text-dim); }
+.ms-params, .ms-quant { color: var(--text-muted); }
+.ms-sep { opacity: 0.5; }
+.ms-badge {
+  margin-left: auto;
+  padding: 1px 8px;
+  font-size: 10px;
+  color: var(--phoenix-warm);
+  border: 1px solid rgba(251, 146, 60, 0.4);
+  border-radius: 999px;
+}
+.ms-pull { flex-shrink: 0; align-self: center; }
+.ms-open-btn { flex: 1; padding: 9px 12px; }
 
 .panel {
   /* Stretch from top to bottom of the viewport (overlay content-box). The
@@ -1454,12 +1882,52 @@ select option {
   animation: flame-glow 2.6s ease-in-out infinite;
 }
 
+/* Runner tabs — segmented control at the top of the settings container
+   (AmberCore | Ollama); the selected tab swaps the pane below it and the
+   model list's acquire row. */
+.runner-tabs {
+  display: flex;
+  gap: 8px;
+}
+.runner-tab {
+  flex: 1;
+  padding: 7px 10px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.runner-tab:hover { color: var(--text-primary); }
+.runner-tab.active {
+  background: var(--phoenix-glow);
+  border-color: var(--phoenix);
+  color: var(--text-primary);
+}
+/* The tab matching the ACTIVE backend carries the dancing-flame glow the
+   whole boxes used to have. */
+.runner-tab.active-route {
+  animation: flame-glow 2.6s ease-in-out infinite;
+}
+
 /* Shared input/button rows across the three boxes. */
 .mp-dir-row,
 .mp-pull-row,
 .mp-register-row {
   display: flex;
   gap: 10px;
+}
+/* `display:flex` above beats the UA's `[hidden]{display:none}` (same trap as
+   the to-do panel) — the tab-swapped acquire rows, model lists and settings
+   panes need an explicit guard. */
+#ml-acquire-ambercore[hidden],
+#ml-acquire-ollama[hidden],
+.mp-list[hidden],
+.runner-pane[hidden] {
+  display: none;
 }
 .mp-register-row {
   flex-wrap: wrap;
@@ -1526,6 +1994,37 @@ select option {
   transition: width 0.2s;
 }
 
+/* Per-pull download bars — one row per concurrent pull (AmberCore and Ollama
+   alike), stacked above the model list. Each row = model name + the shared
+   .mp-progress bar/text. */
+#ml-pull-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+#ml-pull-bars[hidden] { display: none; }
+.mp-pull-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.2);
+  font-size: 11.5px;
+}
+.mp-pull-item .mp-pull-name {
+  max-width: 38%;
+  flex-shrink: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+.mp-pull-item .mp-progress { flex: 1; margin: 0; }
+.mp-pull-item.done { border-color: var(--health-green); }
+.mp-pull-item.error { border-color: var(--phoenix-warm); }
+
 /* Model list + rows. */
 .mp-list {
   list-style: none;
@@ -1580,6 +2079,25 @@ select option {
 .btn-run:hover {
   background: var(--phoenix-glow);
   box-shadow: 0 0 8px 1px rgba(232, 93, 60, 0.3);
+}
+
+/* Delete (bin) button next to Run — quiet until hovered, then danger-amber.
+   Deleting is confirmed by a dialog before anything leaves the disk. */
+.btn-del {
+  padding: 4px 9px;
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text-dim);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  flex-shrink: 0;
+}
+.btn-del:hover {
+  background: rgba(232, 93, 60, 0.18);
+  border-color: var(--phoenix-warm);
+  color: var(--text-primary);
 }
 
 /* Provider API key: blurred until hovered. */
@@ -2297,4 +2815,376 @@ select option {
 #totp-input {
   letter-spacing: 4px;
   text-align: center;
+}
+
+/* ---------- Model activity cards ---------- */
+/* "What the model is doing" message family: exploring, writing code, running
+ * a task, validation, error, image / 3D generation, web. One anatomy (icon
+ * chip + title + status pill + collapsible body), per-kind accent via --acc.
+ * Glass treatment: near-neutral fill + a thin accent "reflection" washing in
+ * from the left rim (no fat solid border) + a faint specular top hairline.
+ * "Thinking" keeps its own .thinking-block component (same glass recipe). */
+.activity {
+  --acc: var(--role-assistant);
+  position: relative;
+  overflow: hidden;
+  align-self: flex-start;
+  width: fit-content;
+  min-width: 220px;
+  max-width: 90%;
+  padding: 10px 14px;
+  background:
+    linear-gradient(105deg,
+      color-mix(in srgb, var(--acc) 16%, transparent) 0%,
+      color-mix(in srgb, var(--acc) 4%, transparent) 45%,
+      transparent 75%),
+    rgba(255, 255, 255, 0.055);
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: var(--radius-sm);
+  animation: fadeIn 0.3s ease;
+}
+.activity.kind-explore  { --acc: #4EC9B0; }
+.activity.kind-code     { --acc: #569CD6; }
+.activity.kind-terminal { --acc: #D7BA7D; }
+.activity.kind-approval { --acc: #FF8C42; }
+.activity.kind-error    { --acc: #E85D3C; }
+.activity.kind-image    { --acc: #C586C0; }
+.activity.kind-model3d  { --acc: #7C8CF8; }
+.activity.kind-web      { --acc: #38BDF8; }
+.activity.kind-subagent { --acc: #F472B6; }
+/* Left rim: light reflecting off the glass edge — a thin gradient line,
+ * slightly whitened, fading only at its very ends. */
+.activity::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 4%;
+  bottom: 4%;
+  width: 2.5px;
+  border-radius: 2px;
+  background: linear-gradient(
+    180deg,
+    transparent,
+    color-mix(in srgb, var(--acc) 80%, white 20%) 12%,
+    color-mix(in srgb, var(--acc) 80%, white 20%) 88%,
+    transparent
+  );
+  pointer-events: none;
+}
+/* Light bleeding through the glass from the rim + the edge itself. */
+.activity {
+  box-shadow: inset 4px 0 14px -4px color-mix(in srgb, var(--acc) 38%, transparent);
+}
+/* Specular hairline along the top edge — the glass catching the light. */
+.activity::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent 22%);
+  pointer-events: none;
+}
+/* Attention states (validation / error): a transparent accent breath. */
+.activity.attention {
+  box-shadow: inset 4px 0 14px -4px color-mix(in srgb, var(--acc) 38%, transparent),
+              0 0 0 1px color-mix(in srgb, var(--acc) 28%, transparent),
+              0 0 24px -8px color-mix(in srgb, var(--acc) 40%, transparent);
+}
+.activity-header {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+.activity-icon {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'Segoe UI Symbol', 'Segoe UI', sans-serif;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--acc);
+  background: color-mix(in srgb, var(--acc) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--acc) 30%, transparent);
+  border-radius: 7px;
+}
+.activity.live .activity-icon { animation: flame-glow 2.6s ease-in-out infinite; }
+.activity-title {
+  font-weight: 600;
+  color: var(--text-primary);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.activity-status {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.activity.live .activity-status,
+.activity.attention .activity-status { color: var(--acc); font-weight: 600; }
+.activity-body { margin-top: 9px; display: flex; flex-direction: column; gap: 8px; min-width: 320px; }
+.activity.collapsed .activity-body { display: none; }
+/* Slim, uniform collapsed row for EVERY card (activities + thinking):
+ * tighter padding + a smaller icon chip → one consistent header height. */
+.activity.collapsed, .thinking-block.collapsed { padding: 4px 12px; }
+.activity.collapsed .activity-icon, .thinking-block.collapsed .activity-icon {
+  width: 18px;
+  height: 18px;
+  font-size: 10px;
+  border-radius: 5px;
+}
+
+/* Path chip (explore / code bodies). */
+.activity-path {
+  align-self: flex-start;
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  font-size: 11.5px;
+  color: var(--acc);
+  background: color-mix(in srgb, var(--acc) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--acc) 22%, transparent);
+  border-radius: 6px;
+  padding: 2px 8px;
+}
+/* File rows (explore body). */
+.activity-files { display: flex; flex-direction: column; gap: 2px; }
+.activity-file {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.activity-file.dir > span:first-child { color: var(--acc); }
+.activity-file-size { color: var(--text-dim); flex-shrink: 0; }
+/* Code diff lines (code body). */
+.activity-code .dl-add { color: var(--health-green); }
+.activity-code .dl-del { color: var(--health-red); }
+.activity-code .dl-    { color: var(--text-dim); }
+/* Terminal body. */
+.activity-term pre { padding: 8px 10px; }
+.activity-term .t-prompt { color: var(--acc); font-weight: 700; }
+.activity-term .t-out { color: var(--text-muted); }
+.activity-term .t-cursor { color: var(--acc); animation: activity-blink 1.1s step-end infinite; }
+@keyframes activity-blink { 50% { opacity: 0; } }
+/* Generation progress (image / 3D bodies). */
+.activity-progress { display: flex; flex-direction: column; gap: 6px; }
+.activity-bar {
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+.activity-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--acc) 55%, transparent), var(--acc));
+  transition: width 0.25s ease;
+}
+/* While live, a light band sweeps the fill — reads as "in progress". */
+.activity.live .activity-bar-fill {
+  background-image: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.35), transparent);
+  background-size: 45% 100%;
+  background-repeat: no-repeat;
+  animation: activity-shimmer 1.6s linear infinite;
+}
+@keyframes activity-shimmer { from { background-position: -60% 0; } to { background-position: 220% 0; } }
+.activity-meta { display: flex; align-items: baseline; gap: 10px; font-size: 11.5px; min-width: 0; }
+.activity-pct { color: var(--acc); font-weight: 700; font-variant-numeric: tabular-nums; }
+.activity-sub { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Question body (approval). */
+.activity-question-text { font-size: 13px; line-height: 1.55; color: var(--text-primary); margin-bottom: 2px; }
+.activity-question .approval-actions { display: flex; gap: 10px; }
+/* Error body. */
+.activity-error pre { color: var(--health-red); }
+.activity-hint { font-size: 12px; line-height: 1.5; color: var(--text-muted); }
+
+/* Language badge + live diff counters (code activity header). */
+.activity-lang {
+  flex: 0 0 auto;
+  display: inline-flex;
+  margin-left: 2px;
+  line-height: 0;
+}
+.activity-lang svg { width: 16px; height: 16px; display: block; }
+.activity-diff {
+  display: inline-flex;
+  gap: 6px;
+  margin-left: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.activity-diff .d-add { color: var(--health-green); }
+.activity-diff .d-del { color: var(--health-red); }
+.activity-diff[hidden] { display: none; }
+
+/* Web browsing kind + result rows (web activity body). */
+.activity.kind-web { --acc: #38BDF8; background: rgba(56, 189, 248, 0.07); }
+.activity-pages { display: flex; flex-direction: column; gap: 5px; }
+.activity-page { display: flex; align-items: center; gap: 8px; font-size: 12px; min-width: 0; }
+.activity-page .p-fav {
+  flex: 0 0 auto;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 8px; font-weight: 700; line-height: 1;
+  color: var(--acc);
+  background: color-mix(in srgb, var(--acc) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--acc) 25%, transparent);
+}
+.activity-page .p-title { color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.activity-page .p-domain {
+  margin-left: auto; flex-shrink: 0;
+  color: var(--text-dim); font-size: 11px;
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+}
+
+/* Sub-agent body (delegated agent card). */
+.activity-subagent .sa-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.activity-subagent .sa-model {
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  padding: 2px 8px;
+}
+.activity-subagent .sa-task { font-size: 13px; line-height: 1.55; color: var(--text-muted); font-style: italic; }
+
+/* Tool-pipeline extras: failed pills + sub-agent streamed output. */
+.activity.failed .activity-status { color: var(--health-red); }
+.activity-subagent .sa-out {
+  margin-top: 2px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+/* ---------- Session history rail ---------- */
+/* Thin vertical dash list pinned to the chat's left edge (same overlay
+ * recipe as #todo-panel). One dash per past session; color = status:
+ * green = learned + compacted, orange = learned only, red = wild. */
+#session-rail {
+  position: absolute;
+  left: 4px;
+  top: 60px;
+  bottom: 110px;
+  width: 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: none;
+  z-index: 5;
+}
+#session-rail::-webkit-scrollbar { display: none; }
+#session-rail[hidden] { display: none; }
+/* Give the chat room for the rail without shifting the composition. */
+#main-column:has(#session-rail:not([hidden])) #chat-messages { padding-left: 30px; }
+.session-dash {
+  flex: 0 0 auto;
+  width: 5px;
+  height: 3px;
+  border-radius: 2px;
+  cursor: pointer;
+  background: var(--health-red); /* wild default */
+  opacity: 0.22; /* pale, almost invisible at rest */
+  transition: opacity 0.15s ease, width 0.15s ease, box-shadow 0.15s ease;
+}
+.session-dash:hover { opacity: 0.95; }
+/* A dash whose session view is open stays lit and grows a little. */
+.session-dash.active {
+  opacity: 1;
+  width: 8px;
+  box-shadow: 0 0 8px -1px currentColor;
+}
+.session-dash.learned { background: var(--health-yellow); }
+.session-dash.learned.compacted { background: var(--health-green); }
+
+/* Collapsible read-only container for a loaded past session, stacked above
+ * the live chat (oldest on top, chronological). */
+.session-view {
+  --acc: var(--text-dim);
+  position: relative;
+  overflow: hidden;
+  align-self: stretch;
+  width: 100%;
+  padding: 8px 14px;
+  background:
+    linear-gradient(105deg, rgba(255, 255, 255, 0.045) 0%, transparent 55%),
+    rgba(255, 255, 255, 0.02);
+  border: 1px dashed rgba(255, 255, 255, 0.14);
+  border-radius: var(--radius-sm);
+  animation: fadeIn 0.3s ease;
+}
+.session-view::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 5%; bottom: 5%;
+  width: 2px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, transparent, rgba(255, 255, 255, 0.35) 20%, rgba(255, 255, 255, 0.35) 80%, transparent);
+  pointer-events: none;
+}
+.session-view-header {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 12.5px;
+  cursor: pointer;
+  user-select: none;
+  min-width: 0;
+}
+.session-view-title { font-weight: 600; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.session-view-meta { font-size: 11px; color: var(--text-dim); white-space: nowrap; }
+.session-view .pill {
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  white-space: nowrap;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-muted);
+}
+.session-view .pill.learned { color: var(--health-yellow); }
+.session-view .pill.compacted { color: var(--health-green); }
+.session-view .pill.wild { color: var(--health-red); }
+.session-view-body {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.session-view.collapsed .session-view-body { display: none; }
+.session-view .message.user { padding: 7px 12px; }
+.session-view .message.assistant { padding: 7px 12px; }
+.session-view .sv-tool {
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 2px 4px;
 }

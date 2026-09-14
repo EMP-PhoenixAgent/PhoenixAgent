@@ -150,7 +150,7 @@ async fn probe_all(
                         detail.push_str(&format!(" · {tps:.1} T/s"));
                     }
                     if let Some(ttft) = stats.ttft_ms {
-                        detail.push_str(&format!(" · TTFT {ttft:.0} ms"));
+                        detail.push_str(&format!(" · TTFT {:.1} s", ttft / 1000.0));
                     }
                     if let Some(tbt) = stats.tbt_avg_ms {
                         detail.push_str(&format!(" · TBT {tbt:.1} ms"));

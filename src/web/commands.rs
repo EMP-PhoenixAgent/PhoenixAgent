@@ -15,7 +15,7 @@ use crate::agent::{AgentRuntime, Command, GithubSkillHit};
 use crate::config::{save_config, ApprovalPolicy};
 use crate::crypto::totp as totp_lib;
 use crate::crypto::{
-    derive_key, load_or_create_salt, rotate_salt, DerivedKey, KeyBundle,
+    derive_key, load_or_create_salt, random_key, rotate_salt, DerivedKey, KeyBundle, KEY_LEN,
 };
 use crate::db::{
     open_encrypted, ContextFile, MemoryStore, Profile, Provider, ProfileContext, ProfileSkill,
@@ -34,10 +34,73 @@ pub struct UnlockResult {
     pub active_profile: Option<Profile>,
 }
 
+// ===== Encapsulated: capsule key plumbing ======================================
+//
+// v2 capsules are encrypted under a random capsule key that lives ONLY
+// inside the key bundle's wraps. The bundle is read from staging (`keys.phx`)
+// when it exists — and, because a v2 exit wipes staging (the exe carries
+// everything), from the exe's own tail header when it doesn't. Both copies
+// are identical: every bundle save updates staging, and every seal re-embeds
+// the current staging bundle as the new tail header.
+
+use zeroize::Zeroizing;
+
+/// The current exe path, or a descriptive error.
+fn current_exe() -> Result<std::path::PathBuf, String> {
+    std::env::current_exe().map_err(|e| format!("current exe: {e}"))
+}
+
+/// Load the key bundle from staging, falling back to the v2 capsule tail
+/// header (pre-hydration, when staging is empty). `Ok(None)` = no bundle
+/// anywhere (a fresh install).
+fn load_bundle_anywhere(state: &WebState) -> Result<Option<KeyBundle>, String> {
+    if state.paths.key_bundle_path.exists() {
+        return KeyBundle::load(&state.paths.key_bundle_path)
+            .map(Some)
+            .map_err(|e| format!("Read key bundle: {e}"));
+    }
+    if let Ok(Some(header)) = crate::capsule::read_header(&current_exe()?) {
+        let text = String::from_utf8(header).map_err(|e| format!("capsule header: {e}"))?;
+        return KeyBundle::parse(&text)
+            .map(Some)
+            .map_err(|e| format!("capsule header bundle: {e}"));
+    }
+    Ok(None)
+}
+
+/// Hydrate staging from the exe's capsule (missing files only). For a v2
+/// capsule this is the ONLY hydration point — the tail is ciphertext until
+/// the key arrives (post-gate). Errors propagate: a partial hydration must
+/// not silently fall through to "fresh install" (which would re-create an
+/// empty DB over the user's sealed state).
+fn hydrate_capsule(state: &WebState, capsule_key: &[u8; KEY_LEN]) -> Result<usize, String> {
+    let exe = current_exe()?;
+    match crate::capsule::Capsule::open(&exe, Some(capsule_key)) {
+        Ok(Some(cap)) => cap
+            .extract_missing(&exe, &state.paths.data_dir)
+            .map_err(|e| format!("capsule hydration: {e}")),
+        Ok(None) => Ok(0),
+        Err(e) => Err(format!("capsule open: {e}")),
+    }
+}
+
 /// Whether the encrypted DB exists yet (controls setup vs. unlock screen).
+/// A sealed (v2) capsule carries the DB even when staging was wiped at the
+/// last exit — the unlock gate must still show.
 #[tauri::command]
 pub async fn is_initialized(state: State<'_, WebState>) -> Result<bool, String> {
-    Ok(state.paths.db_path.exists())
+    if state.paths.db_path.exists() {
+        return Ok(true);
+    }
+    if let Ok(exe) = current_exe() {
+        if matches!(
+            crate::capsule::probe(&exe),
+            Ok(Some(crate::capsule::CapsuleVer::V2))
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether the app was built in debug/dev mode. The frontend uses this to
@@ -99,12 +162,17 @@ pub async fn setup(
     let conn = open_encrypted(&state.paths.db_path, &db_key)
         .map_err(|e| format!("Failed to create database: {e}"))?;
 
-    // 4. Wrap the DB key under the launch password and persist the bundle.
-    let bundle = KeyBundle::create(&db_key, &launch_password)
+    // 4. Wrap the DB key AND a fresh capsule key (encrypts the exe's sealed
+    //    state tail — see capsule.rs) under the launch password and persist
+    //    the bundle. From this install's first seal on, everything the exe
+    //    carries is ciphertext.
+    let capsule_key = random_key();
+    let bundle = KeyBundle::create(&db_key, &launch_password, Some(&capsule_key))
         .map_err(|e| format!("Wrap DB key: {e}"))?;
     bundle
         .save(&state.paths.key_bundle_path)
         .map_err(|e| format!("Save key bundle: {e}"))?;
+    *state.capsule_key.lock().await = Some(Zeroizing::new(capsule_key));
 
     // 5. Boot the runtime (shared with unlock).
     boot_runtime(app, state, conn, db_key).await
@@ -113,14 +181,44 @@ pub async fn setup(
 /// Unlock by typing the **launch password**, which unwraps the DB key from the
 /// on-disk key bundle. The DB password is never asked for on a normal launch —
 /// the app uses it autonomously once unwrapped.
+/// Encapsulated: the same password also unwraps the **capsule key** (the
+/// bundle may come from the exe's tail header — staging can be empty after a
+/// wiped exit). A v2 capsule hydrates ONLY here, behind the gate. A v1 exe
+/// (pre-Phase-C plaintext capsule, or no capsule wrap yet) MINTS a capsule
+/// key wrapped under this password — the migration; its first seal after
+/// this turn re-encrypts the whole tail.
 #[tauri::command]
 pub async fn unlock(
     app: AppHandle,
     state: State<'_, WebState>,
     launch_password: String,
 ) -> Result<UnlockResult, String> {
-    let bundle = KeyBundle::load(&state.paths.key_bundle_path)
-        .map_err(|e| format!("Read key bundle: {e}"))?;
+    let mut bundle = load_bundle_anywhere(&state)?
+        .ok_or("No key bundle found — the app is not initialized.")?;
+
+    // Capsule key: unwrap (v2) or mint+wrap (v1 migration / fresh install).
+    let capsule_key = if bundle.has_capsule_key() {
+        bundle
+            .unwrap_capsule_key(&launch_password)
+            .map_err(|_| "Wrong launch password.".to_string())?
+    } else {
+        let k = random_key();
+        bundle
+            .set_capsule_key(&k, &launch_password)
+            .map_err(|e| format!("Capsule wrap: {e}"))?;
+        bundle
+            .save(&state.paths.key_bundle_path)
+            .map_err(|e| format!("Save key bundle: {e}"))?;
+        k
+    };
+    // Hydrate staging from the exe (v2: decrypts only now; v1: already
+    // hydrated at boot, so this no-ops). Fail hard — see hydrate_capsule.
+    let hydrated = hydrate_capsule(&state, &capsule_key)?;
+    if hydrated > 0 {
+        tracing::info!("capsule: hydrated {hydrated} file(s) from the exe");
+    }
+    *state.capsule_key.lock().await = Some(Zeroizing::new(capsule_key));
+
     let db_key = bundle
         .unwrap_primary(&launch_password)
         .map_err(|_| "Wrong launch password.".to_string())?;
@@ -131,11 +229,12 @@ pub async fn unlock(
 }
 
 /// Whether a launch password is set (i.e. a key bundle exists with a primary
-/// wrap). Callable before unlock so the startup screen knows to show the launch
-/// gate.
+/// wrap). Callable before unlock so the startup screen knows to show the
+/// launch gate. Reads the exe tail header when staging has no bundle (a
+/// wiped v2 exit).
 #[tauri::command]
 pub async fn has_launch_password(state: State<'_, WebState>) -> Result<bool, String> {
-    Ok(state.paths.key_bundle_path.exists())
+    Ok(load_bundle_anywhere(&state)?.is_some())
 }
 
 /// Change the launch password. Requires the current launch password to prove
@@ -154,14 +253,23 @@ pub async fn set_launch_password(
     if new_password != confirm {
         return Err("New launch passwords do not match.".into());
     }
-    let mut bundle = KeyBundle::load(&state.paths.key_bundle_path)
-        .map_err(|e| format!("Read key bundle: {e}"))?;
-    // Prove ownership by unwrapping with the current password.
+    let mut bundle = load_bundle_anywhere(&state)?
+        .ok_or("No key bundle found — the app is not initialized.")?;
+    // Prove ownership by unwrapping BOTH wraps with the current password.
     let db_key = bundle
         .unwrap_primary(&current_password)
         .map_err(|_| "Current launch password is incorrect.".to_string())?;
+    let capsule_key = if bundle.has_capsule_key() {
+        Some(
+            bundle
+                .unwrap_capsule_key(&current_password)
+                .map_err(|_| "Current launch password is incorrect.".to_string())?,
+        )
+    } else {
+        None
+    };
     bundle
-        .change_primary(&db_key, &new_password)
+        .change_primary(&db_key, capsule_key.as_ref(), &new_password)
         .map_err(|e| format!("Re-wrap: {e}"))?;
     bundle
         .save(&state.paths.key_bundle_path)
@@ -187,8 +295,8 @@ pub async fn recover_launch_via_totp(
     if new_launch_password.len() < 8 {
         return Err("New launch password must be at least 8 characters.".into());
     }
-    let mut bundle = KeyBundle::load(&state.paths.key_bundle_path)
-        .map_err(|e| format!("Read key bundle: {e}"))?;
+    let mut bundle = load_bundle_anywhere(&state)?
+        .ok_or("No key bundle found — the app is not initialized.")?;
     if !bundle.has_recovery() {
         return Err("Recovery is not available: 2FA is not enabled.".into());
     }
@@ -200,9 +308,24 @@ pub async fn recover_launch_via_totp(
     let db_key = bundle
         .unwrap_recovery()
         .map_err(|_| "Recovery unwrap failed.".to_string())?;
-    // Set a new launch password (re-wrap the DB key under it).
+    // The capsule key recovers the same way (a v1 exe without a capsule wrap
+    // mints one here — the recovery-path migration).
+    let capsule_key = if bundle.has_capsule_key() {
+        bundle
+            .unwrap_capsule_recovery()
+            .map_err(|_| "Recovery unwrap failed.".to_string())?
+    } else {
+        random_key()
+    };
+    // Hydrate BEFORE opening the DB — a wiped v2 exit leaves staging empty.
+    let hydrated = hydrate_capsule(&state, &capsule_key)?;
+    if hydrated > 0 {
+        tracing::info!("capsule: hydrated {hydrated} file(s) from the exe");
+    }
+    *state.capsule_key.lock().await = Some(Zeroizing::new(capsule_key));
+    // Set a new launch password (re-wrap both keys under it).
     bundle
-        .change_primary(&db_key, &new_launch_password)
+        .change_primary(&db_key, Some(&capsule_key), &new_launch_password)
         .map_err(|e| format!("Re-wrap after recovery: {e}"))?;
     bundle
         .save(&state.paths.key_bundle_path)
@@ -257,13 +380,20 @@ async fn boot_runtime(
         cfg.context_window = p.context_window as u32;
     }
 
-    // Resolve the working directory: prefer the persisted DB setting, else the
+    // Resolve the working directory: the ACTIVE PROFILE's own directory first
+    // (workdir is profile-scoped), then the legacy global setting, else the
     // launch workdir. Update WebState so commands see the resolved value.
     let workdir = {
         let s = store.lock().await;
-        match s.get_workdir().map_err(|e| e.to_string())? {
-            Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
-            _ => state.workdir.lock().await.clone(),
+        let profile_wd = s
+            .get_active_profile_id()
+            .ok()
+            .flatten()
+            .and_then(|id| s.get_profile_workdir(id).ok().flatten())
+            .filter(|p| !p.is_empty());
+        match profile_wd.or_else(|| s.get_workdir().ok().flatten().filter(|p| !p.is_empty())) {
+            Some(p) => std::path::PathBuf::from(p),
+            None => state.workdir.lock().await.clone(),
         }
     };
     *state.workdir.lock().await = workdir.clone();
@@ -470,8 +600,10 @@ async fn boot_runtime(
     if warm_embedded_model {
         let provider = state.provider.clone();
         let model = model_name.clone();
+        let app = app.clone();
         tokio::spawn(async move {
             provider.warm_ambercore_model(&model).await;
+            emit_vram_status(&app, &provider);
         });
     }
 
@@ -561,16 +693,25 @@ pub async fn context_resume(state: State<'_, WebState>) -> Result<(), String> {
     }
 }
 
-/// `/learn` — compact the current conversation into a dense memory note (via the
-/// active model), then save it as a context file enabled for the active profile
-/// so it's re-injected into the system prompt next session (the agent "doesn't
-/// forget"). Intended to be run before closing the app. Returns a confirmation
-/// string for the UI. Uses Phoenix's native context-file memory (no external MCP
-/// server needed).
+/// `/learn` — update the agent's PROJECT MEMORY: one living context file,
+/// auto-maintained, holding what the agent has to do (open tasks,
+/// requirements, standing constraints, user preferences) and what it has
+/// done (completed work, decisions, outcomes). The previous memory note is
+/// merged with the current conversation into an updated note written back
+/// to the SAME file — the memory stays one compact note instead of piling
+/// up per-run copies. Distinct from `/cc`: /cc snapshots the conversation
+/// into a new timestamped compact and rotates the session to free the
+/// context window; /learn is memory management and keeps the session
+/// running. Uses Phoenix's native context-file memory (no external MCP).
 #[tauri::command]
 pub async fn learn(state: State<'_, WebState>) -> Result<String, String> {
-    // 1. Most-recent session = the "current context". Lock config + store
-    //    separately (never nested) to avoid lock-order deadlocks.
+    // Fixed name so the memory file is found and updated in place every run.
+    const MEMORY_NAME: &str = "Project Memory";
+    const MEMORY_DESC: &str = "Auto-maintained by /learn — the agent's project memory: \
+                               what has to be done and what has been done.";
+
+    // 1. Most-recent session = the conversation to learn from. Lock config +
+    //    store separately (never nested) to avoid lock-order deadlocks.
     let model = state.config.lock().await.model.clone();
     let session_id = {
         let store = state.store.lock().await;
@@ -584,12 +725,14 @@ pub async fn learn(state: State<'_, WebState>) -> Result<String, String> {
             .id
     };
 
-    // 2. Load recent messages and build a transcript (user/assistant turns).
+    // 2. Build the transcript (user/assistant turns). Full session: anything
+    //    older is already carried inside the previous memory note, which is
+    //    merged in below.
     let messages = {
         let store = state.store.lock().await;
         let store = store.as_ref().ok_or("Not unlocked yet")?;
         let s = store.lock().await;
-        s.load_messages(session_id, 50)
+        s.load_messages(session_id, u32::MAX)
             .map_err(|e| e.to_string())?
     };
     let mut transcript = String::new();
@@ -604,17 +747,42 @@ pub async fn learn(state: State<'_, WebState>) -> Result<String, String> {
         return Err("No conversation to learn from yet.".into());
     }
 
-    // 3. Ask the active model to compact it (one-shot, no tools, no chat echo).
+    // 3. The existing memory note (fixed-name file), if this isn't the first
+    //    /learn run.
+    let pid = active_profile_id(&state).await?;
+    let previous = {
+        let store = state.store.lock().await;
+        let store = store.as_ref().ok_or("Not unlocked yet")?;
+        let s = store.lock().await;
+        s.list_context_for_profile(pid)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|pc| pc.context.name == MEMORY_NAME)
+            .map(|pc| pc.context)
+    };
+    let old_body = previous
+        .as_ref()
+        .map(|c| c.body.trim().to_string())
+        .unwrap_or_default();
+
+    // 4. One-shot merge (no tools, no chat echo): previous memory + new
+    //    conversation -> updated memory.
     let request = ChatRequest {
         messages: vec![
             ChatMessage::system(
-                "You are a memory compactor. Read the conversation and produce a concise, \
-                 dense memory note capturing: key facts, decisions made, the current task and \
-                 its state, open questions, and anything needed to resume work later. Output \
-                 ONLY the note in markdown.",
+                "You maintain an AI agent's project memory — one dense note the agent \
+                 re-reads every session. Merge the previous memory with the new conversation \
+                 into the UPDATED memory. It must answer two questions: (1) WHAT HAS TO BE \
+                 DONE — open tasks, bugs, requirements, standing constraints and user \
+                 preferences; (2) WHAT HAS BEEN DONE — completed work, decisions with their \
+                 rationale, and the current state of each effort. Carry forward anything \
+                 still relevant, drop what is obsolete or superseded, add what is new. Be \
+                 specific — names, paths, numbers. Output ONLY the updated memory in \
+                 markdown, no commentary.",
             ),
             ChatMessage::user(format!(
-                "# Conversation transcript\n{transcript}\n\n# Task\nWrite the memory note now."
+                "# Previous project memory\n{}\n\n# New conversation transcript\n{transcript}\n\n# Task\nWrite the updated project memory now.",
+                if old_body.is_empty() { "(none yet)" } else { &old_body },
             )),
         ],
         tools: Vec::new(),
@@ -635,9 +803,122 @@ pub async fn learn(state: State<'_, WebState>) -> Result<String, String> {
         return Err("The model returned an empty memory note — nothing to save.".into());
     }
 
-    // 4. Save as a context file + enable it for the active profile.
+    // 5. Write back to the SAME file (created on first run) and keep it
+    //    enabled for the active profile.
+    {
+        let store = state.store.lock().await;
+        let store = store.as_ref().ok_or("Not unlocked yet")?;
+        let s = store.lock().await;
+        let id = match &previous {
+            Some(ctx) => {
+                s.update_context(ctx.id, MEMORY_NAME, MEMORY_DESC, &note)
+                    .map_err(|e| e.to_string())?;
+                ctx.id
+            }
+            None => s
+                .create_context(MEMORY_NAME, MEMORY_DESC, &note)
+                .map_err(|e| e.to_string())?,
+        };
+        s.set_context_enabled_for_profile(pid, id, true)
+            .map_err(|e| e.to_string())?;
+        // Stamp the session for the history-rail colors (learned → orange/green).
+        s.mark_session_learned(session_id).map_err(|e| e.to_string())?;
+    }
+    reload_context(&state).await?;
+
+    Ok(if previous.is_some() {
+        "Project memory updated — what has to be done and what has been done, re-injected each session."
+    } else {
+        "Project memory created and enabled — what has to be done and what has been done, re-injected each session."
+    }
+    .to_string())
+}
+
+/// `/cc` — Context Compacting: snapshot the WHOLE current conversation (via
+/// the active model) into a new timestamped context file capturing what has
+/// been done, what is going to happen next and the topics under discussion,
+/// then rotate to a fresh session so the long history is replaced by the
+/// compact (freeing the context window). The old session stays in the DB —
+/// nothing is deleted, just no longer loaded. The compacting counterpart to
+/// `/learn`, which maintains the agent's living project memory instead and
+/// keeps the session running.
+#[tauri::command]
+pub async fn compact_context(state: State<'_, WebState>) -> Result<String, String> {
+    let model = state.config.lock().await.model.clone();
+    let session_id = {
+        let store = state.store.lock().await;
+        let store = store.as_ref().ok_or("Not unlocked yet")?;
+        let s = store.lock().await;
+        s.list_sessions()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .next()
+            .ok_or("No conversation yet — nothing to compact.")?
+            .id
+    };
+
+    // Full history (u32::MAX = no practical cap), not /learn's last-50.
+    let messages = {
+        let store = state.store.lock().await;
+        let store = store.as_ref().ok_or("Not unlocked yet")?;
+        let s = store.lock().await;
+        s.load_messages(session_id, u32::MAX)
+            .map_err(|e| e.to_string())?
+    };
+    let mut transcript = String::new();
+    for m in &messages {
+        match m.role {
+            ChatRole::User => transcript.push_str(&format!("User: {}\n", m.content)),
+            ChatRole::Assistant => transcript.push_str(&format!("Assistant: {}\n", m.content)),
+            _ => {}
+        }
+    }
+    if transcript.trim().is_empty() {
+        return Err("No conversation to compact yet.".into());
+    }
+
+    // One-shot compaction (no tools, no chat echo) — tuned to carry work
+    // state, not just facts: the compact REPLACES the history it summarizes.
+    let request = ChatRequest {
+        messages: vec![
+            ChatMessage::system(
+                "You are a context compactor. The conversation below is being archived and \
+                 replaced by your summary — the agent continues from your note alone, in a \
+                 fresh session. Capture, in dense markdown: (1) WHAT HAS BEEN DONE in this \
+                 conversation — work completed, decisions with their rationale, errors \
+                 encountered and their fixes, and every file path, command, model or setting \
+                 used or changed; (2) WHAT IS GOING TO HAPPEN NEXT — planned work, pending \
+                 items and the concrete next steps; (3) THE TOPICS under discussion between \
+                 the user and the agent — the subject threads and directions the user is \
+                 following — so the next session picks up exactly where this one left off. \
+                 Be specific — names, paths, numbers — not generic. Output ONLY the note.",
+            ),
+            ChatMessage::user(format!(
+                "# Conversation transcript\n{transcript}\n\n# Task\nWrite the compact note now."
+            )),
+        ],
+        tools: Vec::new(),
+        temperature: 0.2,
+    };
+    let mut rx = state
+        .provider
+        .chat(&model, request)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut note = String::new();
+    while let Some(ev) = rx.recv().await {
+        if let ChatEvent::Delta(d) = ev {
+            note.push_str(&d);
+        }
+    }
+    if note.trim().is_empty() {
+        return Err("The model returned an empty compact — nothing to save.".into());
+    }
+
+    // New timestamped context file (kept each run, per user preference),
+    // enabled for the active profile and re-injected into the system prompt.
     let when = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
-    let name = format!("Learned Memory — {when}");
+    let name = format!("Context Compact — {when}");
     let pid = active_profile_id(&state).await?;
     {
         let store = state.store.lock().await;
@@ -646,25 +927,38 @@ pub async fn learn(state: State<'_, WebState>) -> Result<String, String> {
         let id = s
             .create_context(
                 &name,
-                "Auto-saved by /learn — compacted conversation memory, re-injected each session.",
+                "Auto-saved by /cc — compacted conversation replacing the prior session's history.",
                 &note,
             )
             .map_err(|e| e.to_string())?;
         s.set_context_enabled_for_profile(pid, id, true)
             .map_err(|e| e.to_string())?;
+        // Stamp the session for the history-rail colors BEFORE the rotation
+        // (session_id is pre-rotation; the NewSession below clears it).
+        s.mark_session_compacted(session_id).map_err(|e| e.to_string())?;
     }
     reload_context(&state).await?;
 
-    Ok(format!(
-        "Saved a memory note as context file “{name}” and enabled it for this profile — the agent will reuse it next session."
-    ))
+    // Rotate to a fresh session so the compacted history leaves the context
+    // window; the old session remains in the DB for reference.
+    {
+        let tx = state.cmd_tx.lock().await;
+        match tx.as_ref() {
+            Some(sender) => sender
+                .send(Command::NewSession)
+                .await
+                .map_err(|e| format!("Agent channel closed: {e}"))?,
+            None => return Err("Not unlocked yet".into()),
+        }
+    }
+
+    Ok(name)
 }
 
 /// Mode selector (Plan/Think/Auto) — apply the mode's approval-policy preset
 /// live. The selector in the chatbox's send row calls this.
 #[tauri::command]
-pub async fn set_mode(state: State<'_, WebState>, mode: String) -> Result<(), String> {
-    let m = crate::config::Mode::parse(&mode)
+pub async fn set_mode(state: State<'_, WebState>, mode: String) -> Result<(), String> {    let m = crate::config::Mode::parse(&mode)
         .ok_or_else(|| format!("Unknown mode '{mode}' (use plan, think, or auto)"))?;
     *state.mode.lock().await = m;
     let tx = state.cmd_tx.lock().await;
@@ -847,6 +1141,30 @@ pub async fn list_sessions(state: State<'_, WebState>) -> Result<Vec<SessionSumm
     }
 }
 
+/// One past session's messages for the history viewer (read-only rendering
+/// in the chat). System rows are skipped — they're prompt plumbing, not
+/// conversation.
+#[tauri::command]
+pub async fn load_session_messages(
+    state: State<'_, WebState>,
+    session_id: i64,
+) -> Result<Vec<ChatMessage>, String> {
+    let store = state.store.lock().await;
+    match store.as_ref() {
+        Some(s) => {
+            let s = s.lock().await;
+            let msgs = s
+                .load_messages(session_id, u32::MAX)
+                .map_err(|e| e.to_string())?;
+            Ok(msgs
+                .into_iter()
+                .filter(|m| m.role != ChatRole::System)
+                .collect())
+        }
+        None => Err("Not unlocked yet".into()),
+    }
+}
+
 /// List available Ollama models (for the model selector dropdown).
 #[tauri::command]
 pub async fn list_models(state: State<'_, WebState>) -> Result<Vec<String>, String> {
@@ -905,7 +1223,7 @@ pub struct GgufFile {
 fn is_gguf_path(p: &std::path::Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
-        .map(|s| s.eq_ignore_ascii_case("gguf"))
+        .map(|s| s.eq_ignore_ascii_case("gguf") || s.eq_ignore_ascii_case("safetensors"))
         .unwrap_or(false)
 }
 
@@ -913,19 +1231,35 @@ fn is_gguf_path(p: &std::path::Path) -> bool {
 /// (the pull layout is `<model-name>/<model>.gguf`; flat files keep working).
 /// Deeper nesting is not traversed — the models dir is user-owned, not a tree.
 fn collect_gguf_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    // Sharded safetensors checkpoints list only their first shard — the
+    // engine stitches the rest via index.json.
+    let listable = |p: &std::path::Path| -> bool {
+        if !is_gguf_path(p) {
+            return false;
+        }
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else { return true };
+        let lower = name.to_ascii_lowercase();
+        if !lower.ends_with(".safetensors") {
+            return true;
+        }
+        match lower.rfind("-of-") {
+            None => true,
+            Some(_) => lower.contains("-00001-of-"),
+        }
+    };
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else {
         return out;
     };
     for entry in rd.flatten() {
         let p = entry.path();
-        if is_gguf_path(&p) {
+        if listable(&p) {
             out.push(p);
         } else if p.is_dir() {
             if let Ok(sub) = std::fs::read_dir(&p) {
                 for e in sub.flatten() {
                     let sp = e.path();
-                    if is_gguf_path(&sp) {
+                    if listable(&sp) {
                         out.push(sp);
                     }
                 }
@@ -1061,14 +1395,14 @@ pub struct AmberCoreModel {
 }
 
 /// Resolve the AmberCore models directory: the configured override, else the
-/// portable default (`<install folder>/models`).
+/// Encapsulated default — a plain `models` folder BESIDE THE EXE (models are
+/// public artifacts: they live on disk next to the app, never inside the
+/// encrypted capsule, never in temp).
 fn resolve_ambercore_dir(cfg: &crate::config::Config) -> Option<std::path::PathBuf> {
     if let Some(d) = cfg.ambercore_models_dir_path() {
         return Some(d);
     }
-    // Portable default: `<install folder>/models` — same resolution order as
-    // `Paths::default_data_dir` (env override → dev → executable folder).
-    Some(crate::config::default_models_dir(
+    Some(crate::config::encaps_models_dir(
         &crate::config::Paths::default_data_dir(),
     ))
 }
@@ -1215,6 +1549,390 @@ pub async fn get_ambercore_directory(state: State<'_, WebState>) -> Result<Optio
     Ok(state.config.lock().await.ambercore_models_dir.clone())
 }
 
+/// Delete an AmberCore model (the models panel's bin button): unload any
+/// pooled replica (releasing the GGUF mmap so Windows allows the delete),
+/// drop every catalog spelling of the tag (persisting to `manifest.json`),
+/// then remove the GGUF, its sibling `<stem>.tokenizer.json`, and — when the
+/// model lives in its own per-model pull folder with no other GGUFs — the
+/// folder itself. Refused in remote-server mode (no such API over HTTP).
+#[tauri::command]
+pub async fn delete_ambercore_model(
+    state: State<'_, WebState>,
+    name: String,
+) -> Result<(), String> {
+    let cfg = state.config.lock().await.clone();
+    if cfg.ambercore_remote {
+        return Err(
+            "Remote AmberCore servers can't be deleted from Phoenix — remove \
+             the model on the server itself."
+                .into(),
+        );
+    }
+    let Some(models_dir) = resolve_ambercore_dir(&cfg) else {
+        return Err("No AmberCore models directory is configured.".into());
+    };
+    // The panel lists file stems, so match the GGUF by stem.
+    let gguf = collect_gguf_paths(&models_dir)
+        .into_iter()
+        .find(|p| p.file_stem().and_then(|s| s.to_str()) == Some(name.as_str()))
+        .ok_or_else(|| format!("No GGUF found for '{name}' in {}", models_dir.display()))?;
+
+    // 1. Engine side first: unload replicas + catalog removal (manifest).
+    state
+        .provider
+        .embedded()
+        .remove_model(&name)
+        .await
+        .map_err(|e| format!("AmberCore unload/remove: {e}"))?;
+
+    // 2. File deletion (blocking thread — GGUFs are GBs).
+    let moved_gguf = gguf.clone();
+    let moved_root = models_dir.clone();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        std::fs::remove_file(&moved_gguf)?;
+        let folder = moved_gguf.parent().unwrap_or(std::path::Path::new("."));
+        let stem = moved_gguf
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        // Model-specific tokenizer (the pull layout always writes this name).
+        let _ = std::fs::remove_file(folder.join(format!("{stem}.tokenizer.json")));
+        // A shared generic tokenizer.json is only safe to remove when it sits
+        // inside the model's OWN folder (per-model pull layout) — flat models
+        // may share it with siblings. Removing that folder removes it too.
+        let is_own_folder = folder != moved_root;
+        if is_own_folder
+            && std::fs::read_dir(folder)
+                .map(|rd| {
+                    rd.flatten()
+                        .all(|e| !is_gguf_path(&e.path()))
+                })
+                .unwrap_or(false)
+        {
+            let _ = std::fs::remove_dir_all(folder);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("delete task join: {e}"))?
+    .map_err(|e| format!("delete files: {e}"))?;
+
+    // 3. Refresh the engine's catalog so the tag disappears everywhere.
+    if let Err(e) = state.provider.embedded().reload_catalog(models_dir).await {
+        tracing::warn!("embedded AmberCore catalog reload after delete failed: {e}");
+    }
+    Ok(())
+}
+
+// ---- Model search (the AmberCore "find models" modal) ----------------------
+
+/// One downloadable model file, as shown on a search card.
+#[derive(Serialize)]
+pub struct ModelSearchResult {
+    /// Display name (repo / model name — the file's quant is separate).
+    pub name: String,
+    /// The GGUF (or downloadable) file name.
+    pub file_name: String,
+    /// File size in GiB (rounded) — drives the fit coloring with the ×1.5 + 300 MiB
+    /// resident estimate the engine's pre-flight check uses.
+    pub size_gb: f64,
+    /// Parameter count as displayed (e.g. "8B"), parsed from the names.
+    pub params: Option<String>,
+    /// Quantization factor (e.g. "Q4_K_M"), parsed from the file name.
+    pub quant: Option<String>,
+    /// Direct download URL (feeds `pull_ambercore_model`).
+    pub url: String,
+    /// "huggingface" | "civitai".
+    pub source: String,
+    /// Civitai hosts image-gen models (Flux/SD checkpoints + LoRAs) — they are
+    /// GGUFs sometimes, but NOT text-model GGUFs AmberCore can run. The card
+    /// shows them with a badge and Pull disabled.
+    pub ambercore_compatible: bool,
+}
+
+/// Search response: results + live VRAM (MiB) — the TOTAL powers the modal's
+/// "GPU: … GB" line, the FREE amount drives the fit coloring (fits → green,
+/// ≤ 1 GiB spill → orange) with the same estimate the engine's pre-flight
+/// refusal uses.
+#[derive(Serialize)]
+pub struct ModelSearchResponse {
+    pub vram_total_mb: Option<u64>,
+    pub vram_free_mb: Option<u64>,
+    pub results: Vec<ModelSearchResult>,
+}
+
+/// Search Hugging Face (GGUF LLMs — sizes via the repo tree API, fetched
+/// concurrently) or Civitai (image-gen models, browsable but not
+/// AmberCore-runnable). An empty query lists the most-downloaded GGUFs.
+#[tauri::command]
+pub async fn search_models(
+    query: String,
+    source: String,
+) -> Result<ModelSearchResponse, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("Phoenix-Agent/0.8 model-search")
+        .build()
+        .map_err(|e| format!("build client: {e}"))?;
+    let mut results = match source.as_str() {
+        "civitai" => search_civitai(&client, &query).await?,
+        _ => search_huggingface(&client, &query).await?,
+    };
+    let (vram_total_mb, vram_free_mb) =
+        ambercore::backend::query_vram_mb().map(|(t, f)| (Some(t), Some(f))).unwrap_or((None, None));
+    // Relevance tuning: the modal is for models the user's GPU can REALISTICALLY
+    // run — drop anything that would spill more than 1 GiB (a small spill is a
+    // deliberate concession; a big one is the WDDM crawl). Uses the same
+    // ×1.5 + 300 MiB resident estimate as the pre-flight refusal. Unknown
+    // sizes (blocked size lookups) are kept — the card shows no tint.
+    const MAX_SPILL_MB: u64 = 1024;
+    if let Some(free) = vram_free_mb {
+        results.retain(|m| {
+            let size_mb = (m.size_gb * 1024.0).round() as u64;
+            size_mb == 0 || size_mb * 3 / 2 + 300 <= free + MAX_SPILL_MB
+        });
+    }
+    Ok(ModelSearchResponse {
+        vram_total_mb,
+        vram_free_mb,
+        results,
+    })
+}
+
+/// Hugging Face: `/api/models?filter=gguf` (sorted by downloads), then per-repo
+/// tree lookups for the GGUF file sizes — spawned concurrently, top repos only.
+async fn search_huggingface(
+    client: &reqwest::Client,
+    query: &str,
+) -> Result<Vec<ModelSearchResult>, String> {
+    let mut url =
+        reqwest::Url::parse("https://huggingface.co/api/models").map_err(|e| e.to_string())?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("filter", "gguf");
+        q.append_pair("sort", "downloads");
+        q.append_pair("direction", "-1");
+        q.append_pair("limit", "12");
+        q.append_pair("expand[]", "siblings");
+        if !query.trim().is_empty() {
+            q.append_pair("search", query.trim());
+        }
+    }
+    let resp: serde_json::Value = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Hugging Face search request failed: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Hugging Face search failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("Hugging Face search parse failed: {e}"))?;
+
+    // Repo -> its GGUF file names (single-file only — shards are rejected at
+    // pull time; prefer the common quants, cap 3 per repo).
+    let mut repos: Vec<(String, Vec<String>)> = Vec::new();
+    for item in resp.as_array().into_iter().flatten() {
+        let id = item["id"].as_str().unwrap_or_default().to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let mut files: Vec<String> = item["siblings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s["rfilename"].as_str())
+            .filter(|f| f.to_ascii_lowercase().ends_with(".gguf") && !is_shard_gguf(f))
+            .map(str::to_string)
+            .collect();
+        files.sort_by_key(|f| quant_preference(f));
+        files.truncate(3);
+        if !files.is_empty() {
+            repos.push((id, files));
+        }
+    }
+
+    // Concurrent size lookups: one task per repo resolves its GGUF sizes
+    // (best-effort — Hugging Face blocks the tree endpoint from some
+    // networks/VPNs; unknown sizes render as "—" cards with no fit tint).
+    let mut handles = Vec::new();
+    for (repo, files) in repos {
+        let client = client.clone();
+        handles.push(tokio::spawn(async move {
+            let sizes = fetch_hf_gguf_sizes(&client, &repo, &files).await;
+            (repo, files, sizes)
+        }));
+    }
+    let mut out = Vec::new();
+    for handle in handles {
+        let (repo, files, sizes) = handle
+            .await
+            .map_err(|e| format!("size lookup task failed: {e}"))?;
+        for file in files {
+            let size_bytes = sizes.get(&file).copied().unwrap_or(0);
+            let display = file
+                .rsplit('/')
+                .next()
+                .unwrap_or(&file)
+                .trim_end_matches(".gguf")
+                .to_string();
+            out.push(ModelSearchResult {
+                name: repo.clone(),
+                file_name: display.clone(),
+                size_gb: (size_bytes as f64 / 1_073_741_824.0 * 10.0).round() / 10.0,
+                params: parse_params(&format!("{repo}/{file}")),
+                quant: {
+                    let q = parse_quant(&file);
+                    (q != "—").then_some(q)
+                },
+                url: format!("https://huggingface.co/{repo}/resolve/main/{file}"),
+                source: "huggingface".into(),
+                ambercore_compatible: true,
+            });
+        }
+    }
+    out.sort_by(|a, b| b.size_gb.partial_cmp(&a.size_gb).unwrap_or(std::cmp::Ordering::Equal));
+    out.truncate(36);
+    Ok(out)
+}
+
+/// `…-00001-of-00002.gguf` — split/sharded GGUF. AmberCore loads single-file
+/// GGUFs only (rejected at pull time), so search never offers them.
+fn is_shard_gguf(name: &str) -> bool {
+    let stem = name.trim_end_matches(".gguf");
+    stem.rsplit_once("-of-")
+        .map(|(_, tail)| tail.len() == 5 && tail.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or(false)
+}
+
+/// Smaller = more likely what a user wants to see first (the common quants).
+fn quant_preference(file: &str) -> u8 {
+    let f = file.to_ascii_uppercase();
+    for (i, label) in [
+        "Q4_K_M", "Q4_K_S", "Q5_K_M", "Q6_K", "Q8_0", "Q4_0", "Q3_K_M", "IQ4",
+    ]
+    .iter()
+    .enumerate()
+    {
+        if f.contains(label) {
+            return i as u8;
+        }
+    }
+    9
+}
+
+/// Fetch the sizes of the given GGUF files from a HF repo's tree.
+async fn fetch_hf_gguf_sizes(
+    client: &reqwest::Client,
+    repo: &str,
+    files: &[String],
+) -> std::collections::HashMap<String, u64> {
+    let mut sizes = std::collections::HashMap::new();
+    let Ok(resp) = client
+        .get(format!("https://huggingface.co/api/models/{repo}/tree/main"))
+        .send()
+        .await
+    else {
+        return sizes;
+    };
+    let Ok(tree) = resp.json::<serde_json::Value>().await else {
+        return sizes;
+    };
+    for entry in tree.as_array().into_iter().flatten() {
+        let path = entry["path"].as_str().unwrap_or_default().to_string();
+        if files.iter().any(|f| *f == path) {
+            if let Some(size) = entry["size"].as_u64() {
+                sizes.insert(path, size);
+            }
+        }
+    }
+    sizes
+}
+
+/// Civitai: image-gen models (checkpoints/LoRAs — browsable, but NOT
+/// AmberCore-runnable; cards carry the badge + Pull stays disabled).
+async fn search_civitai(
+    client: &reqwest::Client,
+    query: &str,
+) -> Result<Vec<ModelSearchResult>, String> {
+    let mut url =
+        reqwest::Url::parse("https://civitai.com/api/v1/models").map_err(|e| e.to_string())?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("limit", "24");
+        if !query.trim().is_empty() {
+            q.append_pair("query", query.trim());
+        }
+    }
+    let resp: serde_json::Value = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Civitai search request failed: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Civitai search failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("Civitai search parse failed: {e}"))?;
+
+    let mut out = Vec::new();
+    for item in resp["items"].as_array().into_iter().flatten() {
+        let name = item["name"].as_str().unwrap_or_default().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        // Newest version's files (the API returns newest first).
+        let Some(version) = item["modelVersions"].as_array().and_then(|v| v.first()) else {
+            continue;
+        };
+        for file in version["files"].as_array().into_iter().flatten().take(2) {
+            let Some(download) = file["downloadUrl"].as_str() else { continue };
+            let file_name = file["name"].as_str().unwrap_or(&name).to_string();
+            let size_kb = file["sizeKB"].as_f64().unwrap_or(0.0);
+            if size_kb <= 0.0 {
+                continue;
+            }
+            out.push(ModelSearchResult {
+                name: name.clone(),
+                file_name: file_name.clone(),
+                size_gb: (size_kb / 1_048_576.0 * 10.0).round() / 10.0,
+                params: parse_params(&format!("{name} {file_name}")),
+                quant: {
+                    let q = parse_quant(&file_name);
+                    (q != "—").then_some(q)
+                },
+                url: download.to_string(),
+                source: "civitai".into(),
+                ambercore_compatible: false,
+            });
+        }
+    }
+    out.truncate(36);
+    Ok(out)
+}
+
+/// Pull a parameter count like "8B" / "0.5B" / "14B" out of model/file names.
+fn parse_params(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    for i in 0..chars.len() {
+        if chars[i].is_ascii_digit() {
+            let mut j = i;
+            while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.') {
+                j += 1;
+            }
+            // "8B", "0.5B" — a unit B right after the number (case-insensitive).
+            if j < chars.len() && (chars[j] == 'B' || chars[j] == 'b') {
+                // Avoid matching inside words like "Q4B" quants or hex-ish runs.
+                let prev_ok = i == 0 || !chars[i - 1].is_ascii_alphanumeric();
+                let num: String = chars[i..j].iter().collect();
+                if prev_ok && num.parse::<f64>().map(|n| n > 0.0 && n < 2000.0).unwrap_or(false) {
+                    return Some(format!("{num}B"));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Download a GGUF model **and its tokenizer** from a URL into the AmberCore
 /// models directory, then register it with AmberCore. The tokenizer is fetched
 /// automatically for Hugging Face URLs (same repo, then the base model repo);
@@ -1231,12 +1949,6 @@ pub async fn pull_ambercore_model(
     tokenizer_url: Option<String>,
 ) -> Result<String, String> {
     use tauri::Emitter;
-    let emit = |phase: &'static str, completed: u64, total: Option<u64>| {
-        let payload =
-            serde_json::json!({ "phase": phase, "completed": completed, "total": total });
-        let _ = app.emit("ambercore-pull-progress", payload);
-    };
-
     let cfg = state.config.lock().await.clone();
     let dir = resolve_ambercore_dir(&cfg).ok_or_else(|| {
         "No AmberCore models directory configured and home dir unknown".to_string()
@@ -1252,127 +1964,219 @@ pub async fn pull_ambercore_model(
 
     // Split/sharded GGUFs (e.g. `-00001-of-00003.gguf`) can never load in
     // AmberCore (single-file loader) — fail BEFORE the multi-GB download.
-    if super::model_urls::is_split_gguf(&filename) {
+    // Sharded SAFETENSORS repos are fine: the engine's multi-region reader
+    // stitches them via the repo's index.json.
+    let is_safetensors = filename.to_ascii_lowercase().ends_with(".safetensors");
+    if super::model_urls::is_split_gguf(&filename) && !is_safetensors {
         return Err(format!(
-            "`{filename}` is one shard of a split GGUF. AmberCore loads single-file \
-             GGUFs only — pick a quant that is one file (no `-00001-of-000NN` \
-             shards) and Pull again."
+            "`{filename}` is one shard of a split GGUF. AmberCore loads single-file              GGUFs only — pick a quant that is one file (no `-00001-of-000NN`              shards) and Pull again."
         ));
     }
 
-    // Per-model folder: `<models_dir>/<model-name>/` holds the GGUF + its
-    // tokenizer (and any future per-model files) so models can never pick up
-    // each other's tokenizer. Flat files already on disk keep working.
-    let folder = super::model_urls::model_folder_name(&filename);
-    let model_dir = dir.join(&folder);
-    std::fs::create_dir_all(&model_dir)
-        .map_err(|e| format!("create model folder {}: {e}", model_dir.display()))?;
-    let dest = model_dir.join(&filename);
-
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(|e| format!("build client: {e}"))?;
-
-    // 1. Model — skip the (multi-GB) download when the file is already on
-    //    disk, so a retry after a failed tokenizer fetch is instant.
-    let model_present = dest.is_file()
-        && std::fs::metadata(&dest).map(|m| m.len() > 0).unwrap_or(false);
-    if model_present {
-        tracing::info!(?dest, "AmberCore pull: model already on disk, skipping download");
-    } else {
-        download_to_file(&client, &model_url, &dest, "model", &emit).await?;
-    }
-
-    // 2. Architecture check — read the GGUF header and reject architectures
-    //    AmberCore can't run, BEFORE spending time on the tokenizer or
-    //    registering an unloadable model. (Learned the hard way: a Qwen3.5
-    //    hybrid `qwen35` GGUF pulls fine and then dies at load time deep inside
-    //    the qwen3 builder with a missing-tensor error.)
-    let arch = ambercore::model::gguf::probe_arch(&dest)
-        .map_err(|e| format!("downloaded file is not a loadable GGUF: {e}"))?;
-    if !ambercore::model::registry::is_supported(&arch) {
-        return Err(format!(
-            "AmberCore can't run the `{arch}` architecture yet (supported: {}). \
-             The model was kept at {} — it will work here if support is added later.",
-            ambercore::model::registry::SUPPORTED_ARCHS.join(", "),
-            dest.display(),
-        ));
-    }
-
-    // 3. Tokenizer — AmberCore looks for `<stem>.tokenizer.json` (or a
-    //    generic `tokenizer.json`) next to the GGUF, i.e. inside the model's
-    //    own folder. The model-specific name lets multiple quants of the same
-    //    model share the folder without collisions.
-    let stem = dest
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
+    // Every progress event carries the pull's id (the file stem) so several
+    // concurrent pulls each drive their own bar in the Models panel; a final
+    // done/error event retires the bar without relying on the invoke result.
+    let pull_id = filename
+        .trim_end_matches(".gguf")
+        .trim_end_matches(".GGUF")
         .to_string();
-    let tok_dest = model_dir.join(format!("{stem}.tokenizer.json"));
-    let have_tokenizer = tok_dest.is_file() || model_dir.join("tokenizer.json").is_file();
-    if !have_tokenizer {
-        // Explicit URL first, then whatever the model URL implies.
-        let mut candidates: Vec<String> = Vec::new();
-        if let Some(explicit) = tokenizer_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            candidates.push(explicit.to_string());
-        }
-        candidates.extend(super::model_urls::tokenizer_candidates(&model_url));
+    let app_progress = app.clone();
+    let emit = |phase: &'static str, completed: u64, total: Option<u64>| {
+        let payload = serde_json::json!({
+            "id": pull_id,
+            "phase": phase,
+            "completed": completed,
+            "total": total,
+        });
+        let _ = app_progress.emit("ambercore-pull-progress", payload);
+    };
 
-        let mut failures: Vec<String> = Vec::new();
-        for cand in &candidates {
-            match download_to_file(&client, cand, &tok_dest, "tokenizer", &emit).await {
-                Ok(()) => {
-                    tracing::info!(cand, "AmberCore pull: tokenizer downloaded");
-                    break;
-                }
-                Err(e) => {
-                    // Drop any partial file so the next candidate starts clean.
-                    let _ = tokio::fs::remove_file(&tok_dest).await;
-                    failures.push(format!("{cand} → {e}"));
+    // Sharded-safetensors metadata: folder/tag from the checkpoint base stem
+    // + repo name, and the repo base for index.json / sibling fetches.
+    let shard_info: Option<(String, Option<String>, String)> =
+        if is_safetensors && super::model_urls::is_split_gguf(&filename) {
+            let base_stem = super::model_urls::shard_base_stem(
+                filename.trim_end_matches(".safetensors"),
+            )
+            .unwrap_or_else(|| "model".into());
+            let repo_base = model_url
+                .split("/resolve/")
+                .next()
+                .map(str::to_string)
+                .unwrap_or_else(|| model_url.clone());
+            let repo_name = repo_base
+                .rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            Some((base_stem, repo_name, repo_base))
+        } else {
+            None
+        };
+
+    // The whole flow runs inside one block so every exit path (download
+    // failure, unsupported arch, missing tokenizer, register error) can retire
+    // the pull's progress bar with a terminal done/error event.
+    let outcome: Result<String, String> = async {
+        if let Some((base_stem, repo_name, repo_base)) = &shard_info {
+            return super::shard_pull::pull_sharded_safetensors(
+                &state,
+                &dir,
+                &model_url,
+                &filename,
+                base_stem,
+                repo_name.clone(),
+                repo_base,
+                &pull_id,
+                &app,
+            )
+            .await;
+        }
+        // Per-model folder: `<models_dir>/<model-name>/` holds the GGUF + its
+        // tokenizer (and any future per-model files) so models can never pick up
+        // each other's tokenizer. Flat files already on disk keep working.
+        let folder = super::model_urls::model_folder_name(&filename);
+        let model_dir = dir.join(&folder);
+        std::fs::create_dir_all(&model_dir)
+            .map_err(|e| format!("create model folder {}: {e}", model_dir.display()))?;
+        let dest = model_dir.join(&filename);
+
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| format!("build client: {e}"))?;
+
+        // 1. Model — skip the (multi-GB) download when the file is already on
+        //    disk, so a retry after a failed tokenizer fetch is instant.
+        let model_present = dest.is_file()
+            && std::fs::metadata(&dest).map(|m| m.len() > 0).unwrap_or(false);
+        if model_present {
+            tracing::info!(?dest, "AmberCore pull: model already on disk, skipping download");
+        } else {
+            download_to_file(&client, &model_url, &dest, "model", &emit).await?;
+        }
+
+        // 1b. F16 safetensors models load through the content shim, which
+        //     needs the repo's config.json next to the weights.
+        let is_st = filename
+            .to_ascii_lowercase()
+            .ends_with(".safetensors");
+        if is_st {
+            let cfg_dest = model_dir.join("config.json");
+            if !cfg_dest.is_file() {
+                let repo = model_url
+                    .rsplit_once('/')
+                    .and_then(|(base, _)| base.rsplit_once('/'))
+                    .map(|(root, repo)| format!("{root}/{repo}"))
+                    .unwrap_or_else(|| model_url.clone());
+                let cfg_url = format!("{}/resolve/main/config.json", repo.trim_end_matches('/'));
+                if let Err(e) = download_to_file(&client, &cfg_url, &cfg_dest, "config", &emit).await {
+                    tracing::warn!("config.json download failed ({e}) — F16 load will fail without it");
                 }
             }
         }
-        if !tok_dest.is_file() {
+
+        // 2. Architecture check — read the GGUF header (or the safetensors
+        //    config.json) and reject architectures AmberCore can't run, BEFORE
+        //    spending time on the tokenizer or registering an unloadable
+        //    model. (Learned the hard way: a Qwen3.5 hybrid `qwen35` GGUF
+        //    pulls fine and then dies at load time deep inside the qwen3
+        //    builder with a missing-tensor error.)
+        let arch = ambercore::model::gguf::probe_arch(&dest)
+            .map_err(|e| format!("downloaded file is not a loadable GGUF: {e}"))?;
+        if !ambercore::model::registry::is_supported(&arch) {
             return Err(format!(
-                "model downloaded to {}, but no tokenizer was found. Tried:\n  {}\n\
-                 Paste a direct tokenizer.json URL in the Tokenizer field and Pull \
-                 again (the model will not re-download), or place a \
-                 `{stem}.tokenizer.json` next to the GGUF in {}.",
+                "AmberCore can't run the `{arch}` architecture yet (supported: {}). \
+                 The model was kept at {} — it will work here if support is added later.",
+                ambercore::model::registry::SUPPORTED_ARCHS.join(", "),
                 dest.display(),
-                if failures.is_empty() {
-                    "nothing — the URL is not a Hugging Face link and no \
-                     tokenizer URL was given"
-                        .to_string()
-                } else {
-                    failures.join("\n  ")
-                },
-                model_dir.display(),
             ));
         }
-    }
 
-    // Register the model with the embedded engine's catalog — in-process
-    // (persists to the dir's manifest.json); no `ambercore` binary involved.
-    // The manifest `file` is folder-relative (resolved against the models dir).
-    let tag = derive_ambercore_tag(&filename);
-    let rel_path = format!("{folder}/{filename}");
-    state
-        .provider
-        .embedded()
-        .register_model(&tag, &rel_path)
-        .await
-        .map_err(|e| format!("register model: {e}"))?;
-    tracing::info!(%tag, path = %rel_path, "registered AmberCore model (embedded catalog)");
-    Ok(tag)
+        // 3. Tokenizer — AmberCore looks for `<stem>.tokenizer.json` (or a
+        //    generic `tokenizer.json`) next to the GGUF, i.e. inside the model's
+        //    own folder. The model-specific name lets multiple quants of the same
+        //    model share the folder without collisions.
+        let stem = dest
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let tok_dest = model_dir.join(format!("{stem}.tokenizer.json"));
+        let have_tokenizer = tok_dest.is_file() || model_dir.join("tokenizer.json").is_file();
+        if !have_tokenizer {
+            // Explicit URL first, then whatever the model URL implies.
+            let mut candidates: Vec<String> = Vec::new();
+            if let Some(explicit) = tokenizer_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                candidates.push(explicit.to_string());
+            }
+            candidates.extend(super::model_urls::tokenizer_candidates(&model_url));
+
+            let mut failures: Vec<String> = Vec::new();
+            for cand in &candidates {
+                match download_to_file(&client, cand, &tok_dest, "tokenizer", &emit).await {
+                    Ok(()) => {
+                        tracing::info!(cand, "AmberCore pull: tokenizer downloaded");
+                        break;
+                    }
+                    Err(e) => {
+                        // Drop any partial file so the next candidate starts clean.
+                        let _ = tokio::fs::remove_file(&tok_dest).await;
+                        failures.push(format!("{cand} → {e}"));
+                    }
+                }
+            }
+            if !tok_dest.is_file() {
+                return Err(format!(
+                    "model downloaded to {}, but no tokenizer was found. Tried:\n  {}\n\
+                     Paste a direct tokenizer.json URL in the Tokenizer field and Pull \
+                     again (the model will not re-download), or place a \
+                     `{stem}.tokenizer.json` next to the GGUF in {}.",
+                    dest.display(),
+                    if failures.is_empty() {
+                        "nothing — the URL is not a Hugging Face link and no \
+                         tokenizer URL was given"
+                            .to_string()
+                    } else {
+                        failures.join("\n  ")
+                    },
+                    model_dir.display(),
+                ));
+            }
+        }
+
+        // Register the model with the embedded engine's catalog — in-process
+        // (persists to the dir's manifest.json); no `ambercore` binary involved.
+        // The manifest `file` is folder-relative (resolved against the models dir).
+        let tag = derive_ambercore_tag(&filename);
+        let rel_path = format!("{folder}/{filename}");
+        state
+            .provider
+            .embedded()
+            .register_model(&tag, &rel_path)
+            .await
+            .map_err(|e| format!("register model: {e}"))?;
+        tracing::info!(%tag, path = %rel_path, "registered AmberCore model (embedded catalog)");
+        Ok(tag)
+    }
+    .await;
+    {
+        use tauri::Emitter;
+        let payload = match &outcome {
+            Ok(tag) => serde_json::json!({ "id": pull_id, "phase": "done", "tag": tag }),
+            Err(e) => serde_json::json!({ "id": pull_id, "phase": "error", "error": e }),
+        };
+        let _ = app.emit("ambercore-pull-progress", payload);
+    }
+    outcome
 }
 
 /// Stream a URL to a file, emitting `phase`-tagged pull-progress events.
 /// Fails on non-success HTTP status before touching the destination file.
-async fn download_to_file<F>(
+pub(super) async fn download_to_file<F>(
     client: &reqwest::Client,
     url: &str,
     dest: &std::path::Path,
@@ -1412,7 +2216,10 @@ where
 
 /// Derive an Ollama-style tag from a GGUF filename.
 fn derive_ambercore_tag(filename: &str) -> String {
-    let stem = filename.trim_end_matches(".gguf").trim_end_matches(".GGUF");
+    let stem = filename
+        .trim_end_matches(".gguf")
+        .trim_end_matches(".GGUF")
+        .trim_end_matches(".safetensors");
     // If the stem already looks like `name-Nunit` (e.g. `qwen2-7b`), use it; else
     // append `:latest`.
     if stem.contains('-') {
@@ -1465,11 +2272,29 @@ pub async fn run_ambercore(
     //    GGUF so the first message doesn't pay the cold-start). No-op remotely.
     if !remote {
         let provider = state.provider.clone();
+        let app = app.clone();
         tokio::spawn(async move {
             provider.warm_ambercore_model(&model_tag).await;
+            emit_vram_status(&app, &provider);
         });
     }
     Ok(())
+}
+
+/// Surface the engine's VRAM verdict as a chat status message — either the
+/// pre-flight REFUSAL (model would spill; loading was blocked) or the
+/// "contained in VRAM" confirmation. No-op when the check couldn't run.
+fn emit_vram_status(app: &AppHandle, provider: &std::sync::Arc<crate::model::dispatch::DispatchProvider>) {
+    let state = provider.embedded().state();
+    let message = state
+        .last_vram_warning()
+        .or_else(|| state.last_vram_info());
+    if let Some(message) = message {
+        let _ = app.emit(
+            "agent-event",
+            serde_json::json!({ "type": "status", "message": message }),
+        );
+    }
 }
 
 /// Link a **remote** AmberCore server (e.g. an AmberCore-Server installed on a
@@ -1629,15 +2454,18 @@ pub async fn pull_ollama_model(
     let mut child = cmd.spawn().map_err(|e| format!("spawn ollama pull: {e}"))?;
 
     // Ollama streams progress on stderr as NDJSON like
-    // {"status":"pulling ...","completed":N,"total":M}. Forward each line.
+    // {"status":"pulling ...","completed":N,"total":M}. Forward each line,
+    // tagged with the pull's id (the model name) so concurrent pulls each
+    // drive their own bar in the Models panel.
     let stderr = child.stderr.take();
     if let Some(stderr) = stderr {
         let app2 = app.clone();
+        let id2 = name.clone();
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let payload = serde_json::json!({ "line": line });
+                let payload = serde_json::json!({ "id": id2, "line": line });
                 let _ = app2.emit("ollama-pull-progress", payload);
             }
         });
@@ -1646,24 +2474,62 @@ pub async fn pull_ollama_model(
     let stdout = child.stdout.take();
     if let Some(stdout) = stdout {
         let app2 = app.clone();
+        let id2 = name.clone();
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let payload = serde_json::json!({ "line": line });
+                let payload = serde_json::json!({ "id": id2, "line": line });
                 let _ = app2.emit("ollama-pull-progress", payload);
             }
         });
     }
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| format!("ollama pull wait: {e}"))?;
-    if !status.success() {
-        return Err(format!("ollama pull exited with {status}"));
+    let outcome: Result<String, String> = async {
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| format!("ollama pull wait: {e}"))?;
+        if !status.success() {
+            return Err(format!("ollama pull exited with {status}"));
+        }
+        Ok(name.clone())
     }
-    Ok(name)
+    .await;
+    {
+        use tauri::Emitter;
+        let payload = match &outcome {
+            Ok(_) => serde_json::json!({ "id": name, "phase": "done" }),
+            Err(e) => serde_json::json!({ "id": name, "phase": "error", "error": e }),
+        };
+        let _ = app.emit("ollama-pull-progress", payload);
+    }
+    outcome
+}
+
+/// Delete an Ollama model (the models panel's bin button) via the server's
+/// `DELETE /api/delete`. Frees the model's blobs from Ollama's store.
+#[tauri::command]
+pub async fn delete_ollama_model(
+    state: State<'_, WebState>,
+    name: String,
+) -> Result<(), String> {
+    let cfg = state.config.lock().await;
+    let url = format!("{}/api/delete", cfg.ollama_url.trim_end_matches('/'));
+    drop(cfg);
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .delete(&url)
+        .json(&serde_json::json!({ "model": name }))
+        .send()
+        .await
+        .map_err(|e| format!("Ollama not running? DELETE {url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("DELETE {url} returned {}", resp.status()));
+    }
+    Ok(())
 }
 
 /// Auto-install Ollama on Windows by running the bundled installer. Returns the
@@ -2054,17 +2920,67 @@ pub async fn switch_profile(
             .await
             .map_err(|e| format!("Agent channel closed: {e}"))?;
     }
+    drop(tx);
+
+    // Apply the profile's OWN working directory (profile-scoped since the
+    // sidebar rework). A profile with no directory chosen leaves the runtime's
+    // current cwd in place — the UI's placeholder drives the user to pick one.
+    let profile_wd = {
+        let store = state.store.lock().await;
+        let store = store.as_ref().ok_or("Not unlocked yet")?;
+        let s = store.lock().await;
+        s.get_profile_workdir(id)
+            .map_err(|e| e.to_string())?
+            .filter(|p| !p.is_empty())
+    };
+    if let Some(p) = profile_wd {
+        let workdir = std::path::PathBuf::from(&p);
+        *state.workdir.lock().await = workdir.clone();
+        let tx = state.cmd_tx.lock().await;
+        if let Some(sender) = tx.as_ref() {
+            let _ = sender.send(Command::SetWorkdir { workdir }).await;
+        }
+    }
     Ok(profile)
 }
 
-/// Get the current working directory (as the frontend should display it).
+/// Get the ACTIVE PROFILE's working directory for display — empty string when
+/// the profile has none chosen yet (the UI shows its "select a directory"
+/// placeholder). The runtime keeps a cwd fallback for execution.
 #[tauri::command]
 pub async fn get_workdir(state: State<'_, WebState>) -> Result<String, String> {
-    Ok(state.workdir.lock().await.display().to_string())
+    let store = state.store.lock().await;
+    let Some(s) = store.as_ref() else {
+        return Ok(String::new());
+    };
+    let s = s.lock().await;
+    let id = s
+        .get_active_profile_id()
+        .map_err(|e| e.to_string())?
+        .ok_or("No profiles")?;
+    if let Some(p) = s.get_profile_workdir(id).map_err(|e| e.to_string())? {
+        return Ok(p);
+    }
+    // Lazy one-time migration: attribute the legacy global workdir to the
+    // Default profile so existing installs keep their directory.
+    let is_default = s
+        .get_profile(id)
+        .map_err(|e| e.to_string())?
+        .map(|p| p.is_default)
+        .unwrap_or(false);
+    if is_default {
+        if let Some(legacy) = s.get_workdir().map_err(|e| e.to_string())? {
+            if !legacy.is_empty() {
+                let _ = s.set_profile_workdir(id, &legacy);
+                return Ok(legacy);
+            }
+        }
+    }
+    Ok(String::new())
 }
 
-/// Change the working directory live. Persists the choice and notifies the
-/// runtime so the new directory applies from the next user turn.
+/// Change the ACTIVE PROFILE's working directory live. Persists it under the
+/// profile and notifies the runtime so it applies from the next user turn.
 #[tauri::command]
 pub async fn set_workdir(
     state: State<'_, WebState>,
@@ -2073,12 +2989,16 @@ pub async fn set_workdir(
     let workdir = std::path::PathBuf::from(&path);
     *state.workdir.lock().await = workdir.clone();
 
-    // Persist in the encrypted settings table.
+    // Persist under the active profile (+ keep the legacy global in sync so
+    // pre-unlock boot resolution stays deterministic).
     {
         let store = state.store.lock().await;
         if let Some(s) = store.as_ref() {
             let s = s.lock().await;
-            let _ = s.set_workdir(&path);
+            if let Some(id) = s.get_active_profile_id().map_err(|e| e.to_string())? {
+                let _ = s.set_profile_workdir(id, &path);
+                let _ = s.set_workdir(&path);
+            }
         }
     }
 
@@ -2091,6 +3011,59 @@ pub async fn set_workdir(
             .map_err(|e| format!("Agent channel closed: {e}"))?;
     }
     Ok(())
+}
+
+// ---- Sidebar console -------------------------------------------------------
+
+/// Output of one sidebar-console command.
+#[derive(serde::Serialize)]
+pub struct ConsoleOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+}
+
+/// Run a one-shot shell command in the active workdir for the SIDEBAR CONSOLE.
+/// This is the USER typing — not the agent acting — so there is no approval
+/// gate. Mirrors the agent's shell tool's execution shape: `cmd /C` on Windows
+/// / `sh -c` elsewhere, combined-capture stdout+stderr, 60 s timeout, 20k-char
+/// cap per stream.
+#[tauri::command]
+pub async fn console_run(
+    state: State<'_, WebState>,
+    command: String,
+) -> Result<ConsoleOutput, String> {
+    const TIMEOUT_SECS: u64 = 60;
+    const MAX_CHARS: usize = 20_000;
+    let cwd = state.workdir.lock().await.clone();
+    let (program, flag) = if cfg!(target_os = "windows") {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.arg(flag).arg(&command).current_dir(&cwd);
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null());
+    let child = cmd.spawn().map_err(|e| format!("spawn {program}: {e}"))?;
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(TIMEOUT_SECS),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| format!("command timed out after {TIMEOUT_SECS}s and was killed"))?
+    .map_err(|e| format!("wait: {e}"))?;
+    let clip = |raw: &[u8]| -> String {
+        let mut text = String::from_utf8_lossy(raw).into_owned();
+        text.truncate(MAX_CHARS);
+        text
+    };
+    Ok(ConsoleOutput {
+        stdout: clip(&out.stdout),
+        stderr: clip(&out.stderr),
+        exit_code: out.status.code().unwrap_or(-1),
+    })
 }
 
 // ---- Science Workbench: skills (Panel 2) ---------------------------------
@@ -2736,9 +3709,16 @@ pub async fn test_memory_connection(
 /// screen can decide whether to show the code field without opening the DB).
 #[tauri::command]
 pub async fn has_totp(state: State<'_, WebState>) -> Result<bool, String> {
-    Ok(std::fs::read_to_string(&state.paths.totp_flag_path)
+    if std::fs::read_to_string(&state.paths.totp_flag_path)
         .map(|s| s.trim() == "1")
-        .unwrap_or(false))
+        .unwrap_or(false)
+    {
+        return Ok(true);
+    }
+    // After a wiped v2 exit the staging flag is gone — the tail header's
+    // bundle still says whether a recovery wrap exists (2FA on), so the
+    // unlock screen can keep offering recovery.
+    Ok(load_bundle_anywhere(&state)?.is_some_and(|b| b.has_recovery()))
 }
 
 /// Begin 2FA setup: generate a TOTP secret + otpauth URL for the user to add to
@@ -2805,9 +3785,10 @@ pub async fn confirm_totp(
     std::fs::write(&state.paths.totp_flag_path, "1")
         .map_err(|e| format!("write 2fa flag: {e}"))?;
 
-    // Establish the recovery wrap: encrypt the DB key under a key derived from
-    // the TOTP seed, so a forgotten launch password can be recovered via a
-    // current TOTP code. The seed is stored in the bundle for verification.
+    // Establish the recovery wraps: encrypt the DB key AND the capsule key
+    // under a key derived from the TOTP seed, so a forgotten launch password
+    // can be recovered via a current TOTP code. The seed is stored in the
+    // bundle for verification.
     {
         let db_key = state
             .db_key
@@ -2815,11 +3796,16 @@ pub async fn confirm_totp(
             .await
             .clone()
             .ok_or("Not unlocked yet")?;
-        let mut bundle = KeyBundle::load(&state.paths.key_bundle_path)
-            .map_err(|e| format!("Read key bundle for recovery wrap: {e}"))?;
+        let mut bundle = load_bundle_anywhere(&state)?
+            .ok_or("No key bundle found — the app is not initialized.")?;
         bundle
             .set_recovery(&db_key, &secret)
             .map_err(|e| format!("set recovery wrap: {e}"))?;
+        if let Some(k) = state.capsule_key.lock().await.clone() {
+            bundle
+                .set_recovery_capsule(&k)
+                .map_err(|e| format!("set capsule recovery wrap: {e}"))?;
+        }
         bundle
             .save(&state.paths.key_bundle_path)
             .map_err(|e| format!("save key bundle: {e}"))?;
@@ -2904,9 +3890,11 @@ pub async fn change_passphrase(
 
     // 4. Re-wrap the new DB key under the launch password so unlock keeps
     //    working. Verify the launch password first by loading the bundle.
+    //    (The capsule wraps ride along untouched — the capsule key does not
+    //    change with a DB rekey.)
     {
-        let mut bundle = KeyBundle::load(&state.paths.key_bundle_path)
-            .map_err(|e| format!("Read key bundle for re-wrap: {e}"))?;
+        let mut bundle = load_bundle_anywhere(&state)?
+            .ok_or("No key bundle found — the app is not initialized.")?;
         // Prove the launch password is correct (unwrap would yield the OLD key).
         let _ = bundle
             .unwrap_primary(&launch_password)
@@ -2933,4 +3921,115 @@ pub async fn change_passphrase(
         .map_err(|e| format!("reopen after rekey: {e}"))?;
     boot_runtime(app, state, conn, new_key).await?;
     Ok(())
+}
+
+// ===== Encapsulated: capsule sealing ==========================================
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// One seal in flight at a time (turn_done auto-save, pulls, and exit can
+/// race each other).
+static SEAL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Checkpoint the DB, then seal the staging dir into the exe and swap it in
+/// (safe while running). Used by the auto-save path and the exit handler.
+/// `final_seal = true` additionally stops the backend server processes,
+/// closes the DB, and — after a SEALED swap — wipes the staging copy (the
+/// exe carries everything; the temp folder keeps only the webview cache).
+pub async fn seal_capsule_now(state: &WebState, final_seal: bool) -> Result<String, String> {
+    if SEAL_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return Ok("seal already in flight".into());
+    }
+    let result = async {
+        // 1. Fold the WAL so the sealed memory.db is self-contained.
+        {
+            let store = state.store.lock().await;
+            if let Some(s) = store.as_ref() {
+                let s = s.lock().await;
+                s.checkpoint_wal().map_err(|e| e.to_string())?;
+            }
+        }
+        // 2. Pick the seal mode. The capsule key in memory decides: present →
+        //    v2 sealed (header = the CURRENT bundle from staging — every
+        //    bundle-touching command keeps it fresh); absent on an exe that
+        //    is already sealed → SKIP (never downgrade, never wipe — staging
+        //    is the only state copy until the next unlocked session); absent
+        //    on a v1/fresh exe → legacy plaintext seal.
+        let exe = current_exe()?;
+        let ver = crate::capsule::probe(&exe).map_err(|e| e.to_string())?;
+        let key = state.capsule_key.lock().await.clone();
+        let mut header_text = String::new();
+        let mode = match key.as_ref() {
+            Some(k) => {
+                let bundle = load_bundle_anywhere(state)?
+                    .ok_or("capsule key in memory but no key bundle found")?;
+                if !bundle.has_capsule_key() {
+                    return Err("key bundle lost its capsule wrap — refusing to seal".into());
+                }
+                header_text = bundle.to_text().map_err(|e| e.to_string())?;
+                crate::capsule::SealMode::Sealed {
+                    key: &*k,
+                    header: header_text.as_bytes(),
+                }
+            }
+            None => match ver {
+                Some(crate::capsule::CapsuleVer::V2) => {
+                    return Ok(
+                        "sealed capsule is locked (no key this session) — exe kept as-is; \
+                         staging retains the state"
+                            .into(),
+                    );
+                }
+                _ => crate::capsule::SealMode::Plain,
+            },
+        };
+        // 3. Seal + swap (store lock released — the db file is idle).
+        let outcome =
+            crate::capsule::seal_and_swap(&exe, &state.paths.data_dir, &mode)
+                .map_err(|e| e.to_string())?;
+        let mut note = format!(
+            "sealed {} entries (+{} bytes, {})",
+            outcome.entries,
+            outcome.appended,
+            if outcome.sealed { "encrypted" } else { "plain v1" }
+        );
+        if final_seal {
+            state.process_mgr.stop_all().await;
+            // Release our handles so the wipe can delete what it sealed:
+            // the store (open memory.db) and the runtime task (holds the
+            // store clone), then the engine's model replicas (mmap'd GGUFs).
+            *state.store.lock().await = None;
+            *state.cmd_tx.lock().await = None;
+            let engine = state.provider.embedded().state();
+            for tag in engine.tags().await {
+                let _ = engine.remove_model(&tag).await;
+            }
+            // Wipe the staging copy — only after a SEALED swap that really
+            // landed, never in the portable layout (the exe lives in that
+            // folder — wiping it would delete the app itself), and never in
+            // debug builds (cargo rewrites the dev exe, so its capsule tail
+            // cannot be trusted to rehydrate — dev keeps its staging).
+            if outcome.sealed && !cfg!(debug_assertions) {
+                let swapped =
+                    crate::capsule::wait_for_swap(&exe.with_extension("exe.new"), 4000);
+                let exe_dir = exe.parent().map(|p| p.to_path_buf());
+                if swapped && exe_dir.is_some_and(|d| d != state.paths.data_dir) {
+                    note.push_str("; ");
+                    note.push_str(&crate::capsule::wipe_staging(&state.paths.data_dir));
+                }
+            }
+        }
+        Ok(note)
+    }
+    .await;
+    SEAL_IN_FLIGHT.store(false, Ordering::SeqCst);
+    result
+}
+
+/// Auto-save — the frontend invokes this on `turn_done` and after model
+/// pulls, so the exe always carries at least the previous finished task
+/// (power-break / crash safeguard).
+#[tauri::command]
+pub async fn seal_capsule(state: State<'_, WebState>) -> Result<String, String> {
+    seal_capsule_now(&state, false).await
 }

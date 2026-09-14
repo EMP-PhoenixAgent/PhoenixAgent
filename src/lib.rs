@@ -3,6 +3,7 @@
 //! Library crate: the binary ([`main.rs`]) is a thin shell over these modules.
 
 pub mod agent;
+pub mod capsule;
 pub mod backend;
 pub mod config;
 pub mod crypto;

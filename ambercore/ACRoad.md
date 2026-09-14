@@ -4,7 +4,7 @@
 > session to restore full context. Update it whenever a milestone lands or a decision
 > changes. Mirrors the role of `PROJECT_CONTEXT.md` for Phoenix Agent itself.
 
-**Last updated:** 2026-08-22
+**Last updated:** 2026-08-27
 **Version:** v0.8.0 (M5b replica pool + qwen3 KV-reset fix; M6 CUDA; M7 Metal; M8 AMD)
 **Status:** **M6 CUDA verified on GPU + M7/M8 landed.** The `cuda` feature propagates to all
 three candle crates and **builds green against CUDA 13.3 + MSVC** (`CL=/Zc:preprocessor /std:c++17`
@@ -204,7 +204,165 @@ The `cuda` Cargo feature gates CUDA backend support (M4).
 
 ---
 
+## 6b. Adapter Authoring Rules — broadcast views, strides, and head-count forks
+
+*(Born from the 2026-09-05 Qwen3.5-4B incident: the model NaN'd at sample on
+CUDA and derailed on every device past ~10 tokens, while the validated 0.8B
+was perfect. Two silent stride bugs + one convention mismatch, all invisible
+to the synthetic tests. Check EVERY item below before calling an adapter
+done.)*
+
+1. **`broadcast_as` views are stride-0. Never hand one to `reshape` or
+   `matmul` without `.contiguous()`.** When you must reshape through a
+   broadcast view, remember the flatten follows the LOGICAL dim order: where
+   you put the copy axis changes the result. Growing k-heads to v-heads via
+   `(h, t, 1, d) → broadcast (h, t, rep, d) → reshape (h·rep, t, d)` silently
+   interleaves the copy axis with TIME; the axis must go where the target
+   layout says (see rule 5).
+2. **`.contiguous()` is lenient — it no-ops on tensors that merely LOOK
+   row-major.** Extent-1 dims (seq == 1 on every decode step!) make even
+   reversed strides pass candle's check, and a `cat` of strided inputs can
+   come back with head-interleaved strides on CUDA. After any
+   `narrow → cat` (partial rope is the classic), force `.contiguous()` on
+   BOTH the inputs and the result. Cheap insurance; prefill is unaffected.
+3. **CPU and CUDA disagree on bad strides: CPU matmul silently copies
+   (wrong-but-finite numbers), CUDA either hard-errors
+   ("matmul is only supported for contiguous tensors") or reads garbage
+   into NaN logits that surface at `sample: A weight is negative…`
+   (rand_distr rejecting NaN softmax weights).** So a CPU-validated adapter
+   proves nothing about its CUDA path — validate BOTH devices, and generate
+   past ~30 tokens: the 4B looked fine for 8 tokens and derailed after.
+   Fastest coherence oracle: `--raw --prompt "The capital of France is"`
+   must yield " Paris".
+4. **Config forks only run on the first model that has that shape.** The
+   n_k ≠ n_v head-grow path never executed on any validated model until the
+   4B shipped it. When an adapter branches on head counts, groups, MoE,
+   tied/untied heads, SWA intervals… pick a REAL validation model that
+   exercises every branch — synthetic tests use the symmetric case by
+   default (that's how they're simplest to write).
+5. **GGUF and safetensors speak different repeat conventions.** llama.cpp's
+   `ggml_repeat` TILES (`k0..kN, k0..kN` — and the HF→GGUF converter
+   permutes the v/z channel order to match its runtime), while
+   transformers' `repeat_interleave` BLOCKS (`k0, k0, k1, k1`). A GGUF-fed
+   adapter must use the tiled layout, a safetensors-fed one the block
+   layout — with equal head counts the two coincide, which is exactly why
+   the 0.8B couldn't catch it. Carry the weight source (GGUF vs HF) into
+   the adapter and branch on it at the repeat site.
+6. **Debug playbook that worked, in order:** (a) env-gated per-stage
+   `tensor.layout().stride()` prints — one run pinpoints the exact op that
+   corrupts the layout (do it at decode, seq == 1, where extent-1 dims
+   hide); (b) the raw factual completion as the cheap end-to-end oracle;
+   (c) a second quant of the same model to rule the file out; (d) the
+   llama.cpp source for that arch (`src/models/<arch>.cpp`) as the
+   GGUF-layout ground truth — transformers source only for safetensors.
+7. **Windows CUDA builds: `cargo build --release --features cuda` from a VS
+   developer prompt** (vcvars64 — nvcc needs `cl.exe`); a bare Git-Bash
+   build fails with a bare "nvcc error" on `affine.cu`, and a running
+   `ambercore.exe` locks the link ("failed to remove file … os error 5") —
+   kill the server first. And check binary-vs-source timestamps before
+   trusting a repro (today's first "repro failure" was a stale exe).
+
+---
+
 ## 7. Development Log
+
+### 2026-08-27 (final) — VRAM pre-flight REFUSAL + iGPU render pin + admin elevation
+
+**Spec evolution:** the headroom warning became a **hard pre-flight refusal**
+(`backend::check_vram` → `VramCheck { fits: Option<bool>, needed_mb, free_mb, message }`,
+run in `build_loaded_entry` BEFORE the build takes its share, on a blocking thread):
+`fits == Some(false)` → the load is refused with the actionable message (estimate =
+file ×1.5 + 300 MiB, deliberately overshooting so borderline refusals err safe);
+`Some(true)` → a "contained in VRAM — needs ~X, Y free" line; `None` (no nvidia-smi /
+CPU backend) → proceeds unjudged. Both verdicts are stored (`last_vram_warning` /
+`last_vram_info`) and Phoenix emits whichever is set to the chat as a status message
+after warm-up/`run_ambercore` (`emit_vram_status`) — the user sees contained-or-refused
+in every case.
+
+**iGPU: what's real and what isn't.** "Use the iGPU for the spill" is not implementable
+and would gain nothing: CUDA allocations live only on NVIDIA devices (no candle iGPU
+backend), and iGPU memory is system RAM on the far side of the same PCIe — identical
+bandwidth to the driver's own spill. What IS real on hybrid systems: move RENDERING off
+the dGPU. So (1) the refusal message detects a secondary adapter
+(`detect_secondary_gpu`, pub — Win32_VideoController / lspci) and advises moving the
+display + GPU-heavy apps to it; (2) **Phoenix pins its own UI to the iGPU**
+(`main.rs::pin_rendering_to_igpu`, GUI launch, pre-runtime): Chromium's
+`--prefer-integrated-gpu` via `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` (set before
+WebView2 spawns; CUDA unaffected — device enumeration ignores DXGI adapter preference)
++ the persistent per-exe Windows GPU preference (`reg add HKCU\...\UserGpuPreferences
+→ GpuPreference=1;`). The chat UI needs nothing from the RTX; the model gets the VRAM.
+Remaining fixed cost: if the monitor is cabled to the dGPU, DWM keeps ~0.5 GiB there —
+plug the display into the motherboard output to reclaim that too.
+
+**Admin elevation** (`phoenix-agent/app.manifest` via tauri-build
+`WindowsAttributes::app_manifest`, `build.rs`): `requireAdministrator` permanently marks
+the exe — Windows always launches it elevated (the OS-side "remembering"; the UAC
+consent dialog itself still appears per launch unless UAC is set to elevate silently —
+apps cannot opt out, by design). Needed because per-process GPU memory via nvidia-smi
+is only readable elevated. RUN-PA.bat self-elevates (`net session` check +
+`Start-Process -Verb RunAs`) — plain `cargo run` would die with error 740 on a
+requireAdministrator exe. All 58 engine tests + app `cargo check` +
+`cargo check --features cuda` green; mirrors synced.
+
+### 2026-08-27 (later) — reasoning streams during tool turns + VRAM headroom warning
+
+**Why:** with tools active (every Phoenix agent call), `/api/chat` buffered the WHOLE
+generation — so the UI's working indicator showed nothing for the entire think, TTFT
+measured "full generation time" (154 s observed), and a qwen3-8b run that crawled at
+2.2 tok/s (vs the 26.6 the CLI had verified) gave no hint WHY.
+
+**(1) Reasoning now streams live even with tools** (`server/chat.rs`): a `<think>` block
+can never contain a `<tool_call>`, so the streaming `ThinkSplitter` routes Think pieces to
+`GenEvent::Reasoning` immediately; only CONTENT stays buffered (tool calls must be parsed
+post-hoc, never leaked as text). The splitter's end-of-stream flush now emits Reasoning in
+both paths, and the post-gen think re-emit was removed (it would duplicate). TTFT is real
+again (first reasoning delta) and the Phoenix working indicator shows the model thinking
+throughout tool turns.
+
+**(2) VRAM headroom warning** (`backend.rs::vram_headroom_warning`, wired in
+`server/mod.rs::build_loaded_entry`): before each replica build, estimate resident size
+(file × 1.5 + 300 MiB — calibrated on qwen3-8b Q4_K_M: 4.7 GiB file → 7.1 GiB resident on
+the RTX 3050) and compare against free VRAM via **`nvidia-smi`** (context-free — unlike
+`mem_get_info` it needs no current CUDA context, so async load threads can call it; no new
+dependency, deliberately not nvml-wrapper per the telemetry note). Oversized → a
+human-readable warning (needs vs free + top-3 GPU processes) is logged AND stored in
+`ServerState::last_vram_warning` (surfaced via `hardware_status().vram_warning`). Phoenix's
+boot warm-up + `run_ambercore` emit it to the chat as a status message. Rationale: under
+WDDM an oversized CUDA allocation never fails — it spills to system RAM and pages over
+PCIe per step (the observed 26.6 → 2.2 tok/s, ~12x). `GpuInfo` gained `vram_free_mb`
+(mem_get_info now yields both free + used). 58/58 engine tests + app `cargo check` green;
+mirrors synced.
+
+### 2026-08-27 — CUDA mid-generation `INVALID_CONTEXT` fix: one shared stream, not per-thread
+
+**Symptom (v0.8.4 CUDA installers, RTX 3050):** the embedded engine loads + warms on GPU fine,
+streams a generation for ~2–4 minutes, then dies with
+`candle error: DriverError(CUDA_ERROR_INVALID_CONTEXT, "invalid device context")`
+(logged by `server::chat` as "generation failed mid-stream"). No TDR events in the Windows System
+log, so not a driver reset; not OOM or PTX skew either (different errors, and the model had been
+running fine).
+
+**Root cause:** candle 0.11's `Device::new_cuda` builds its `CudaDevice` on the CUDA
+**per-thread default stream** (`cudaStreamPerThread`, cudarc's `per_thread_stream()`). In that
+mode every OS thread submits on its own stream and cudarc's cross-stream event tracking is off —
+its docs require callers to guarantee no cross-stream tensor lifetime overlap. But AmberCore
+boots/warm-ups, loads models, and runs each generation on **different tokio `spawn_blocking`
+threads** (boot thread ≠ `build_loaded_entry` thread ≠ generation thread): weights allocated on
+the load thread's stream get read, re-allocated around (KV-cache growth, temporaries) and freed on
+the generation thread's stream with no cross-stream ordering. The stream-ordered allocator
+eventually frees/reuses memory another stream still depends on → the context goes invalid from
+then on. Matches the timing (fine for minutes, dies once a cross-thread realloc/free pattern
+hits) and both qwen2-0.5b + qwen3-8b.
+
+**Fix:** `CudaBackend::new` now uses `Device::new_cuda_with_stream` — ONE cudarc-managed
+non-blocking stream shared by every thread, with cudarc's event tracking inserting the
+alloc/free cross-stream dependencies. One line (plus the comment) in `backend.rs`; costs nothing
+in practice since the default replica count is 1 anyway. Belt-and-braces follow-up if it ever
+resurfaces: pin load + generation to one dedicated engine thread.
+
+**Also note (context, not a bug here):** candle 0.11's new `ug` GGUF path pulls a **second cudarc
+copy (0.17.8)** alongside candle-core's 0.19.9 — both retain the same device primary context, so
+they interoperate, but the version skew is worth remembering when debugging context/stream issues.
 
 ### 2026-08-12 — M5b: replica pool + fair scheduler (and a qwen3 KV-reset bug fix)
 
@@ -967,3 +1125,323 @@ manifest) alongside flat files. Phoenix pulls (v0.8.2+) create the subfolder
 per model, so models with different vocabularies can never share a tokenizer;
 flat layouts keep working. Split/sharded GGUFs are rejected at pull time.
 Tests: 58 (engine) / 31 (Phoenix) green.
+
+---
+
+### 2026-08-28 — the architecture expansion: 9 new archs (gemma4, granite×3, nemotron, minimax-m2, deepseek2×2)
+
+**Trigger:** `Error: Model error: ambercore: not found: model tag
+'gemma-4-E2B-it-Q4_K_M' not in catalog`. Root cause chain: Phoenix's
+`pull_ambercore_model` probes the GGUF arch → `is_supported("gemma4")` was
+false → pull aborted before registering → tag never entered `manifest.json` →
+chat failed with NotFound. The fix is real adapters, not tag tricks.
+
+**New pattern (#4 — hand-built):** the first three patterns are direct use /
+remap / port of candle-transformers models. These nine are built from
+llama.cpp's reference graphs (`llama-graph.cpp` per-arch build functions)
+directly over `QMatMul` + `ConcatKvCache`, sharing two new modules:
+- `model/common.rs` — causal mask (optional sliding window), namespaced GGUF
+  metadata reader (`Meta`), RoPE scaling parse (linear + YaRN/llama3 blend;
+  llama3 `low/high_freq_factor` keys take priority over YaRN betas), cos/sin
+  tables with both apply conventions (interleaved `rope_i` = GGUF
+  pre-permuted Q/K for granite/deepseek/nemotron; half-split `rope` = neoX
+  for gemma4/minimax), and a test-only synthetic-GGUF writer.
+- `model/moe.rs` — routed MoE (softmax/sigmoid gating, optional route bias,
+  top-k renorm/scale) over grouped expert stacks. **Discovery:** candle's
+  `moe_gemm_gguf` is CUDA-only — meaning the pre-existing qwen3_moe adapter
+  never worked on CPU builds. Fixed here with a per-expert path that slices
+  each expert's quantized bytes straight out of the 3D stack via
+  `QStorage::from_data` + `QTensor::new` (stays quantized, no dequant blowup),
+  then gathers routed tokens per expert and scatter-adds with `index_add`.
+
+**The adapters** (each with synthetic-GGUF end-to-end tests — write tiny
+Q8_0/F32 GGUF → `LoadedModel::load` → registry build → forward+decode pass):
+1. `granite.rs` — granite / granitemoe / granite_swa: llama layout + IBM's
+   scale multipliers (embedding×emb_scale, attn/ffn outputs ×residual_scale
+   before the residual add, logits ÷logit_scale, optional attention.scale
+   overriding 1/√d). Interleaved rope. Optional per-layer sliding window.
+2. `nemotron.rs` — LayerNorm (weights+bias, F32) attention + squared-ReLU FFN
+   (no gate tensor). Interleaved rope. The "Super" latent-FFN variant
+   (narrow→wide up-proj then expand) is rejected with a clear message.
+3. `minimax_m2.rs` — QK-norm over the FULL projected dim before head split
+   (not per-head like qwen3), half-split rope, sigmoid-gated MoE with the
+   required `ffn_exp_probs_b.bias`, no shared expert.
+4. `gemma4.rs` — the arch from the bug report. Embeddings ×√hidden;
+   per-layer embeddings (PLE): `per_layer_tok_embd` stays quantized and rows
+   are fetched lazily per forward via `QTensor::embedding` (dequantizing a
+   6B-token-scale PLE table would blow RAM); mixed =
+   (proj_norm(model_proj(x)/√h) + √ple_dim·embd)/√2; per-layer
+   inp_gate→gelu→proj ×ple_l + post_norm sandwich. Cross-layer KV sharing
+   (`attention.shared_kv_layers`: layers ≥ n reuse slot n-1 full / n-2 swa)
+   implemented with a custom `KvSlot` (ConcatKvCache has no read-without-
+   append). Dual head dims + dual rope bases (1M global / 10k SWA) with the
+   `sliding_window_pattern` bool-array. Weightless RMSNorm on V, tanh
+   softcapping via `1 − 2/(e²ˣ+1)`. gemma4-MoE (ffn_gate_inp present)
+   rejected cleanly for now.
+5. `deepseek2.rs` — MLA in absorbed form: q_nope absorbed through a
+   dequantized `wk_b` (n_head, kv_lora, qk_nope); one shared latent KV head
+   [kv_cmpr | k_pe]; V = kv_cmpr decompressed by `wv_b` after attention;
+   kq_scale = mscale²/√key_length_mla with YaRN mscale compensation from
+   `rope.yarn_log_mul`. Q-projection via q_lora (wq_a→norm→wq_b) or direct.
+   Leading dense blocks (`leading_dense_block_count`, V3.1+), sigmoid/softmax
+   MoE + shared expert, `ffn_exp_probs_b.bias`. Covers `deepseek2` (V2/V3/R1
+   distilled + **Kimi K2**, whose GGUFs report deepseek2) and `deepseek32`
+   (V3.2 — its DSA sparse-attention indexer tensors are detected, warned,
+   and ignored; full DSA support deferred).
+
+**Registry:** `SUPPORTED_ARCHS` 15 → 24. Chat templates: new Granite,
+DeepSeek (full-width `<｜User｜>`/`<｜Assistant｜>`/`<｜end▁of▁sentence｜>`),
+Kimi (`<|im_user|>user<|im_middle|>…<|im_end|>`, disambiguated from
+deepseek2 arch by probing the tokenizer for `<|im_middle|>`) and MiniMax
+(`]~!b[]~b]system … [e~[` punctuation-soup tokens) — all verified verbatim
+against the vendors' chat_template.jinja files. gemma4→Gemma template,
+nemotron resolved llama-style by tokenizer probe. Stop markers extended for
+every new family.
+
+**Tag-spelling fix:** Phoenix registers pulled models under the bare file
+stem while the catalog scan derives `<stem>:latest` — a `:latest`-less
+lookup could miss a scan-registered model (the error message above reads
+exactly like that failure mode). `Catalog::resolve` now tries exact → stem
+→ `:latest`; the server canonicalizes tags before pooling so alias
+spellings share one replica pool, and the NotFound error lists known tags.
+
+**Deliberately unsupported** (clean error, documented in the registry test):
+hybrid/SSM families whose recurrent kernels candle lacks — qwen35/qwen35moe
+(**this is where Ornith ships**), kimi-k3, kimi-linear, nemotron_h(+moe),
+granitehybrid, graniteswitch, deepseek4, minimax-01, minimax-m3 (DSA
+indexer), qwen3next, gpt-oss (MXFP4), llama4, gemma3n. These need new
+kernel work in candle itself, not adapters.
+
+**Known follow-ups:** gemma4-MoE, qwen2moe/glm4moe over the new RoutedMoe,
+gemma3n, minimax-m3 DSA. Kimi/MiniMax template exactness validated against
+their published jinja; worth a smoke-test against a real pull.
+
+Tests: 79 (engine, all 4 trees synced and green) / cargo check --features
+cuda clean.
+
+---
+
+### 2026-08-30 — qwen35: the hybrid gated-delta-net adapter (Qwen 3.5, incl. Ornith)
+
+**Pattern #4's hardest resident.** Qwen 3.5 mixes two layer kinds per
+`attention.recurrent_layers` / `full_attention_interval` (every 4th layer is
+full attention — 6 of 24 on the 0.8B): GDN **gated delta net** recurrent
+layers (fused `attn_qkv` + `attn_gate` z-gate, causal depthwise `ssm_conv1d`
++ silu, L2-normalized per-head q/k, per-head scalar decay
+`softplus(α(x)+dt)·ssm_a`, `β = sigmoid`, per-head gated RMSNorm, `ssm_out`)
+and full-attention layers (fused **Q+gate** `attn_q` — 2·head_dim per head —
+with `sigmoid(gate)` output scaling, GQA 8/2 heads × 256 dims, per-head q/k
+norms, partial rope over 64 of 256 dims, base 1e7; the MRoPE sections
+degenerate to one contiguous rope for text). Post-norm sandwich
+(`attn_norm → mix → +res → post_attention_norm → FFN → +res`); tied
+embedding/output head kept quantized (`QTensor::embedding` lazy rows).
+
+**Two bugs found by real-model validation** (synthetic tests passed both —
+the oracle GGUF was unsloth's `Qwen3.5-0.8B-Q4_K_M`, plus Qwen's config.json
+and the transformers `Qwen3_5` kernel as ground truth):
+
+1. **The recurrence is a DELTA RULE, not an additive SSM.** The state update
+   subtracts what the old state already predicts — `S ← exp(g)·S +
+   k⊗((v − Sᵀk)·β)` — and q is scaled by `head_dim^-½`. My first version used
+   the Mamba-style additive form (`S ← exp(g)·S + β·k⊗v`): loads fine,
+   generates pure garbage. Prefill runs the chunked **UT-transform kernel**
+   (WY representation from the FLA/transformers reference):
+   `(I+M)⁻¹ = Σ(−M)^k` via log₂(L) nilpotent doublings, `v_new = u −
+   k_cumdecay·S`, `o = exp(G)·(QS) + ((QKᵀ)⊙D)·v_new`,
+   `S ← exp(G_L)·S + k_decayᵀ·v_new`. Decode = the stepwise form (the
+   `len == 1` branch). `chunked_delta_rule_matches_stepwise` pins the two
+   paths equal on random data.
+2. **`eye(n).cumsum(1)` is UPPER-triangular.** Causal needs `cumsum(0)`
+   (1 where j ≤ i). One argument, total garbage out.
+
+Plus the sneaky one: a stride-0 `broadcast_as` view of the identity fed into
+**batched matmul** silently corrupts all heads but the first —
+`.contiguous()` before `broadcast_matmul` (single-head probes all passed
+while batched runs diverged; that cost an hour).
+
+**Numbers (0.8B Q4_K_M, CPU):** debug 0.95 tok/s → **release 23.9 tok/s**
+decode; coherent chat with proper `<think>` block handling and clean
+`<|im_end|>` stops; model+tokenizer pulled straight from HF into
+`~/.ambercore-dev/models` for the validation. Registry: `SUPPORTED_ARCHS` 24
+→ **25** (`qwen35`; `qwen35moe` still rejected — no released GGUF to pin its
+FFN names). `KvSlot` promoted from gemma4 into `common.rs` (sparse hybrid KV:
+only the 6 full-attention layers allocate). Template: ChatML (verified
+against the GGUF's embedded template). MTP/NextN tensors warned + ignored.
+Engine tests **83** ×4 trees green; `cargo check --features cuda` clean.
+
+---
+
+### 2026-09-05 — native F16 safetensors loading (the content shim)
+
+**Zero-rewrite F16 path.** Instead of a parallel dense-weight surface for
+every adapter, loading a `.safetensors` model synthesizes an in-memory GGUF
+`Content` whose tensor entries point **straight at the safetensors mmap**
+(`st_shim.rs`): weights stay F16/BF16 in place, `QMatMul` handles unquantized
+GGUF dtypes natively, and every adapter works unchanged. Hparams come from the
+sibling `config.json` (synthesized into the arch's usual metadata keys), with
+per-arch HF→GGUF tensor name maps for **qwen3** and **qwen35** (qwen35's
+`q_proj` already carries the fused attention gate — zero-copy; `conv1d`
+`(c,1,k)` is a metadata-only squeeze). Tensors needing real math before they
+match the GGUF layout (`A_log → −exp(A_log)`, dtype-aware F16/F32 decode)
+materialize into a small in-memory **patch region** that sits in front of the
+file in the virtual address space (`PatchedReader` routes reads by offset).
+
+Two shim bugs found by the synthetic e2e tests: (1) a directly-constructed
+`Content` stores **candle** dims — `Content::read` is what reverses GGUF ne
+order, so the HF (out, in) layout passes through as-is; (2) zero-copy offsets
+bake in the patch length, so **transforms map first** (pass 0) and zero-copy
+tensors second — mapping interleaved shifted the file region by the patch
+size and corrupted exactly 4 bytes of the first F16 tensor (one NaN logit was
+the tell).
+
+**Plumbing:** `LoadedModel.file` became `ModelFile` (GGUF file or patched
+reader — adapters are generic over `Read+Seek`, so nothing else changed);
+`probe_arch` reads `model_type` from config.json (qwen3, qwen3_5_text →
+qwen35); engine catalog + Phoenix collect/delete accept `.safetensors`; the
+pull flow downloads the repo's `config.json` next to F16 weights and rejects
+sharded checkpoints for both formats (`-00001-of-000NN`).
+
+**Validated on the real thing:** Qwen3-0.6B `model.safetensors` (F16, 1.5 GB,
+310 tensors, zero copies) → coherent chat with proper `<think>` handling at
+**7.6 tok/s** CPU (release; the Q4_K_M GGUF of the same model is ~2× faster
+but 2.5× larger — the memory/speed trade you'd expect). Engine tests **86**
+×4 trees green; cuda check clean. Follow-ups: sharded repos (multi-region
+reader), more arch maps (llama/gemma3), quantize-on-load to recover Q4
+footprints, BF16 CUDA path.
+
+### 2026-09-05 (b) — sharded safetensors repos + download ETA on the Models nav
+
+**Multi-region `PatchedReader`.** The virtual address space became
+`[patch | shard 1 | … | shard N]`: `index.json`'s `weight_map` next to the
+entry file yields the sorted shard list, every shard's header is parsed, and
+tensor offsets bake in `patch.len() + shard base + data_start` — so a tensor
+in shard 7 is a plain `seek` into shard 7, no merging, no copies. Shards
+without an `index.json` still load as single files. `check_vram` sums sibling
+shards via the same weight map (the pre-flight was seeing only shard 1's size
+and under-refusing); the catalog registers only `-00001-of-` shards so the
+models list doesn't show every shard as a model.
+
+**Phoenix pull** (`shard_pull.rs`): F16/safetensors URLs no longer stop at
+"sharded checkpoints rejected" — the pull fetches `index.json`, HEADs every
+shard for a known total, then downloads each shard with one cumulative
+progress stream (per-pull bar + the nav ETA see one smooth total, not N
+restarts), then `config.json`, tokenizer, validation, and registration of the
+first shard. Honest limits: sibling fetches assume the repo's `main` revision
+(no rev pinning), and a missing `index.json` is a hard error for sharded
+repos rather than a blind filename sweep.
+
+**Validated on real weights:** the real Qwen3-0.6B safetensors split by layer
+parity into 2 shards (157 + 154 tensors) with a generated `index.json` →
+release CLI loads all 310 tensors across both files and chats coherently
+at 7.2 tok/s CPU. (First attempt "failed" because the release binary
+predated the code — timestamps before conclusions.) Synthetic 2-shard e2e
+test + reader-routing unit test in-tree.
+
+### 2026-09-05 (c) — the Qwen3.5-4B incident: three silent bugs, ACRoad §6b born
+
+User hit `sample: A weight is negative, too large or not a valid number`
+(rand_distr rejecting NaN softmax weights) running the pulled
+**Qwen3.5-4B-Q4_K_S** through the app on CUDA. Three separate defects, all
+invisible to the 0.8B validation and the synthetic tests:
+
+1. **Partial-rope `cat` corruption at decode (CUDA).** The
+   `narrow → rope → cat` in the full-attn layers returns a tensor with
+   head-interleaved strides (`[1,1,1,16]`) when seq == 1 — extent-1 dims
+   make `.contiguous()` a no-op and candle's CUDA `cat` doesn't sanitize.
+   CPU matmuls silently copy such views; CUDA either hard-errors
+   ("matmul is only supported for contiguous tensors" — the CLI repro) or
+   reads garbage into NaN logits (the app's sampler failure). Fix: force
+   `.contiguous()` on both halves and the cat result.
+2. **GDN k→v head grow scrambled (all devices).** The 4B is the first
+   qwen35 with `n_v_heads (32) ≠ n_k_heads (16)`; the grow did
+   `broadcast_as` through `(h, t, rep, d)`, interleaving the copy axis
+   with TIME instead of heads. Output: plausible for ~8 tokens, then
+   "The user is asking me to." loops forever. Found with the raw oracle
+   (`The capital of France is` → ` the, B, B is the:`; 0.8B → ` Paris`).
+3. **GGUF vs HF repeat conventions differ.** llama.cpp's converter
+   permutes v/z channels for `ggml_repeat`'s TILED layout (`[k0..kN,
+   k0..kN]`); HF safetensors pair via `repeat_interleave` BLOCKS
+   (`[k0, k0, k1, k1]`). Equal head counts — every model until the 4B —
+   make the two coincide. Fix: `GdnAttn.kv_repeat_tiled` set from the
+   weight source (`ModelFile::Gguf` → tiled, safetensors → block), the
+   grow branches on it (verified against `src/models/qwen35.cpp` +
+   transformers Qwen3_5 source, and codified in the new
+   `kv_head_grow_layouts` test).
+
+**After the fix:** 4B Q4_K_S on CUDA → ` Paris, not any other city` +
+coherent structured thinking at **23-25 tok/s** (CPU 5.8-6.6); 0.8B
+unaffected. Also while here: st_shim aliases `model.language_model.*`
+(official Qwen3.5-4B is a VL wrapper repo — its real sharded safetensors,
+2 × BF16 shards + nested `text_config`, now load through the multi-region
+reader: 427 tensors, A_log patch fires; full F32 run OOMs on 16 GB —
+the known F16-vs-RAM trade, noted not fixed). Engine **88 tests ×4
+trees**. New permanent section: **§6b Adapter Authoring Rules** — the
+broadcast-view/stride checklist every future adapter gets checked against
+(user-requested). Windows CUDA notes: build from a vcvars64 prompt, kill
+running `ambercore.exe` before linking, check exe-vs-source timestamps
+before trusting a repro.
+
+---
+
+## 2026-09-13 — the ~500-token NaN: ill-conditioned WY solve in the GDN prefill (Qwen3.5-4B, CUDA first)
+
+**Symptom.** The Phase C encapsulated build, first real session: pulled
+Qwen3.5-4B-Q4_K_M (into the exe-side `models/` folder — the new layout
+itself worked), warm-up fine, VRAM fine (~4.2/6.7 GiB), first chat died
+with `sample: A weight is negative, too large or not a valid number`.
+
+**The diagnosis ladder (each step killed a hypothesis):**
+1. Engine sources diffed IDENTICAL across all 4 trees — not stale-code.
+2. CPU CLI on the user's exact GGUF: clean at every length → not the file,
+   not the quant, not the adapter logic.
+3. CUDA CLI: clean ≤ ~390 tokens, **deterministic NaN ≥ ~480**, hard OOM at
+   ~2500 (separate, see below) → length-dependent, CUDA-surfaced.
+4. Primitive suspects tested exact CUDA-vs-CPU (eye→cumsum masks, the
+   (n_v, L, 1) batched cumsum, the nilpotent doubling at L ≤ 65) → NOT a
+   candle stride/cumsum bug (cumsum in candle = matmul against triu ones —
+   no dedicated CUDA kernel to be broken).
+5. Layer instrumentation (env-gated `AC_DEBUG_NAN`): layer 24, a GDN layer,
+   at prefill seq=480 — inputs finite, output NaN.
+6. Chunk instrumentation: `v_new` hit inf at chunk@192 with the state
+   running `0 → 8e4 → 4e11 → 2e18 → inf` **while every decay ≤ 1**. The
+   amplification lives in the WY solve: `(I + M)⁻¹ = Σ(−M)^k` entries
+   reach ~1e15 when a chunk's keys are strongly correlated, and `v_new =
+   (I+M)⁻¹v_β − (I+M)⁻¹(k_β e^g)·S` then destroys f32 cancellation. The
+   formulas were verified line-by-line against FLA's
+   `naive_chunk_gated_delta_rule` — identical; this is numerical
+   conditioning, not a transcription bug.
+
+**Why nobody saw it before:** every prior validation (0.8B chat, 4B
+short-prompt oracle, 4B " Paris" runs) prefilled < ~64 tokens. The
+full-attention layers upstream make a *long* context's deep-layer GDN
+inputs value-correlated in ways short prompts never produce; the chunked
+solve is exact in real arithmetic but catastrophically ill-conditioned in
+f32 on those. CUDA surfaced it before CPU only because cuBLAS rounding
+tips the borderline chunks sooner.
+
+**Fix (`model/qwen35.rs`, all 4 trees).** The chunk loop is factored into
+`chunked_delta_rule` (now returning `(o, final_state)` — the model forward
+calls it, deleting the duplicated inline copy) with a **conditioning
+guard**: after the doubling, `max|(I+M)⁻¹| > 1e4` (or non-finite) → that
+chunk is redone with `step_delta`, the token-recurrent form the decode
+path already uses — mathematically identical, unconditionally stable (and
+what llama.cpp uses exclusively for this architecture). Belt-and-braces:
+even a passing solve whose `o`/`S` came out non-finite is redone
+stepwise. Well-conditioned chunks keep the fast path; throughput is
+unchanged (~24 tok/s decode, prefill unaffected in the runs above).
+
+**§6b rule 8 (new):** chunked/WY forms of delta rules need a conditioning
+guard in f32 — check the solve's magnitude before trusting it, fall back
+to the stepwise form. Short-prompt oracles do not cover prefill numerics;
+validation prompts must exceed a full chunk×several.
+
+**Known limit (pre-existing, NOT this bug):** ~2.5k-token prefills OOM on
+8 GiB — the full-attention layers materialize (h, L, L) scores+probs
+(quadratic, no flash-attention path in candle). Long-context work needs
+chunked/masked attention or an SDPA-style kernel; documented, not fixed.
+
+Tests: +`ill_conditioned_chunks_stay_finite` (near-singular input stays
+finite; forced fallback is bitwise the chunk-1 path via the injectable
+`chunked_delta_rule_guarded`) — engine **91 ×2 trees** (dev + Encaps;
+mirror + ALPHA synced verbatim). All failing prompts now return coherent
+` Paris, and the capital of Germany is Berlin.` at 23-24 tok/s.

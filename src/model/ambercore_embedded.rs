@@ -105,6 +105,16 @@ impl EmbeddedAmberCore {
             .await
             .map_err(|e| PhoenixError::Model(format!("ambercore register: {e}")))
     }
+
+    /// Remove a model from the engine's catalog + manifest and unload any
+    /// pooled replica (releasing the GGUF mmap so the caller can delete the
+    /// file). File deletion itself is the caller's job.
+    pub async fn remove_model(&self, tag: &str) -> Result<()> {
+        self.state
+            .remove_model(tag)
+            .await
+            .map_err(|e| PhoenixError::Model(format!("ambercore remove: {e}")))
+    }
 }
 
 /// Map a Phoenix tool call onto AmberCore's (identical shape, distinct types).

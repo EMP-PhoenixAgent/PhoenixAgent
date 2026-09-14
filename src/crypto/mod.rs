@@ -148,14 +148,15 @@ pub fn derive_wrap_key(passphrase: &str, salt: &[u8; SALT_LEN]) -> Result<[u8; K
     Ok(out)
 }
 
-/// Seal a 32-byte key under a 32-byte wrap key. Returns `nonce(12) || ct+tag(48)`.
-pub fn wrap_key(plaintext: &DerivedKey, wrap_key: &[u8; KEY_LEN]) -> Result<Vec<u8>> {
+/// Seal raw key bytes under a 32-byte wrap key. Returns `nonce(12) || ct+tag`.
+/// Shared core of [`wrap_key`] and the capsule-key wraps.
+fn wrap_raw(plaintext: &[u8], wrap_key: &[u8; KEY_LEN]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(wrap_key));
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ct = cipher
-        .encrypt(nonce, plaintext.0.as_ref())
+        .encrypt(nonce, plaintext)
         .map_err(|e| PhoenixError::Crypto(format!("aes-gcm seal: {e}")))?;
     let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
     out.extend_from_slice(&nonce_bytes);
@@ -163,9 +164,10 @@ pub fn wrap_key(plaintext: &DerivedKey, wrap_key: &[u8; KEY_LEN]) -> Result<Vec<
     Ok(out)
 }
 
-/// Open a wrap blob under a 32-byte wrap key, returning the plaintext key.
-/// Fails on a wrong key or tampering (GCM tag mismatch) — never yields garbage.
-pub fn unwrap_key(blob: &[u8], wrap_key: &[u8; KEY_LEN]) -> Result<DerivedKey> {
+/// Open a wrap blob under a 32-byte wrap key, returning the plaintext bytes
+/// (exactly `KEY_LEN` long). Fails on a wrong key or tampering (GCM tag
+/// mismatch) — never yields garbage.
+fn unwrap_raw(blob: &[u8], wrap_key: &[u8; KEY_LEN]) -> Result<Vec<u8>> {
     if blob.len() < NONCE_LEN {
         return Err(PhoenixError::Crypto("key wrap blob too short".into()));
     }
@@ -180,9 +182,30 @@ pub fn unwrap_key(blob: &[u8], wrap_key: &[u8; KEY_LEN]) -> Result<DerivedKey> {
             pt.len()
         )));
     }
+    Ok(pt)
+}
+
+/// Seal a 32-byte key under a 32-byte wrap key. Returns `nonce(12) || ct+tag(48)`.
+pub fn wrap_key(plaintext: &DerivedKey, wrap_key: &[u8; KEY_LEN]) -> Result<Vec<u8>> {
+    wrap_raw(&plaintext.0, wrap_key)
+}
+
+/// Open a wrap blob under a 32-byte wrap key, returning the plaintext key.
+/// Fails on a wrong key or tampering (GCM tag mismatch) — never yields garbage.
+pub fn unwrap_key(blob: &[u8], wrap_key: &[u8; KEY_LEN]) -> Result<DerivedKey> {
+    let pt = unwrap_raw(blob, wrap_key)?;
     let mut arr = [0u8; KEY_LEN];
     arr.copy_from_slice(&pt);
     Ok(DerivedKey(arr))
+}
+
+/// Generate a fresh random 32-byte key (the capsule key). Unlike the derived
+/// keys above it has no password behind it — it is pure entropy, stored only
+/// inside the bundle's wraps, never on disk in the clear.
+pub fn random_key() -> [u8; KEY_LEN] {
+    let mut k = [0u8; KEY_LEN];
+    rand::thread_rng().fill_bytes(&mut k);
+    k
 }
 
 /// Generate a fresh random 16-byte salt (for wrap-key derivation). Does NOT
@@ -208,6 +231,12 @@ pub struct KeyBundle {
     pub primary_salt: [u8; SALT_LEN],
     /// DB key wrapped under the launch password's wrap key.
     pub primary_blob: Vec<u8>,
+    /// Capsule key (32 random bytes encrypting the exe's sealed-state tail —
+    /// see `capsule.rs`) wrapped under the SAME launch-password wrap key, so
+    /// one Argon2 pass at unlock opens both. `None` until the exe first seals
+    /// an encrypted capsule (fresh installs get one at setup; a v1-capsule
+    /// exe gets one at its first unlock — the migration).
+    pub capsule_blob: Option<Vec<u8>>,
     /// When 2FA is enabled: the TOTP seed (base32) used to (a) verify a typed
     /// recovery code and (b) derive the recovery wrap key. Stored unencrypted
     /// — it is a recovery secret, not the data key, and must be readable pre-DB.
@@ -216,21 +245,36 @@ pub struct KeyBundle {
     pub recovery_salt: Option<[u8; SALT_LEN]>,
     /// DB key wrapped under the recovery wrap key (present only with 2FA).
     pub recovery_blob: Option<Vec<u8>>,
+    /// Capsule key wrapped under the recovery wrap key (present only with 2FA
+    /// on an encrypted-capsule install) — recovery must open the capsule too,
+    /// or a recovered session would boot against an unreadable state tail.
+    pub capsule_recovery_blob: Option<Vec<u8>>,
 }
 
 impl KeyBundle {
-    /// Build a fresh bundle wrapping `db_key` under the launch password.
-    /// Generates a new primary salt. No recovery wrap (call `set_recovery`).
-    pub fn create(db_key: &DerivedKey, launch_password: &str) -> Result<Self> {
+    /// Build a fresh bundle wrapping `db_key` (and, when given, the capsule
+    /// key) under the launch password. Generates a new primary salt. No
+    /// recovery wrap (call `set_recovery`).
+    pub fn create(
+        db_key: &DerivedKey,
+        launch_password: &str,
+        capsule_key: Option<&[u8; KEY_LEN]>,
+    ) -> Result<Self> {
         let primary_salt = random_salt();
         let wk = derive_wrap_key(launch_password, &primary_salt)?;
         let primary_blob = wrap_key(db_key, &wk)?;
+        let capsule_blob = match capsule_key {
+            Some(k) => Some(wrap_raw(k, &wk)?),
+            None => None,
+        };
         Ok(Self {
             primary_salt,
             primary_blob,
+            capsule_blob,
             recovery_seed_b32: None,
             recovery_salt: None,
             recovery_blob: None,
+            capsule_recovery_blob: None,
         })
     }
 
@@ -240,12 +284,73 @@ impl KeyBundle {
         unwrap_key(&self.primary_blob, &wk)
     }
 
-    /// Add/replace the recovery wrap. The DB key is encrypted under a wrap key
-    /// derived from the TOTP **seed** (stable), and the seed is stored so a
-    /// typed recovery **code** can be verified before unwrapping. Requires the
-    /// plaintext DB key.
+    // -- capsule key wraps ----------------------------------------------------
+
+    /// Whether this bundle carries a capsule wrap (the exe's state tail is, or
+    /// is about to become, an encrypted v2 capsule).
+    pub fn has_capsule_key(&self) -> bool {
+        self.capsule_blob.is_some()
+    }
+
+    /// Add/replace the capsule-key wrap under the CURRENT launch password
+    /// (keeps the existing `primary_salt`, so the password keeps working).
+    /// Used by the v1→v2 migration at first unlock after the feature ships.
+    pub fn set_capsule_key(
+        &mut self,
+        capsule_key: &[u8; KEY_LEN],
+        launch_password: &str,
+    ) -> Result<()> {
+        let wk = derive_wrap_key(launch_password, &self.primary_salt)?;
+        self.capsule_blob = Some(wrap_raw(capsule_key, &wk)?);
+        Ok(())
+    }
+
+    /// Unwrap the capsule key using the launch password (same wrap key as the
+    /// DB key — one Argon2 pass serves both when callers reuse the result).
+    pub fn unwrap_capsule_key(&self, launch_password: &str) -> Result<[u8; KEY_LEN]> {
+        let blob = self
+            .capsule_blob
+            .as_ref()
+            .ok_or_else(|| PhoenixError::Crypto("no capsule wrap in this key bundle".into()))?;
+        let wk = derive_wrap_key(launch_password, &self.primary_salt)?;
+        let pt = unwrap_raw(blob, &wk)?;
+        let mut arr = [0u8; KEY_LEN];
+        arr.copy_from_slice(&pt);
+        Ok(arr)
+    }
+
+    /// Unwrap the capsule key via the 2FA recovery wrap (seed-derived wrap
+    /// key; the caller MUST have verified a current TOTP code first).
+    pub fn unwrap_capsule_recovery(&self) -> Result<[u8; KEY_LEN]> {
+        let salt = self
+            .recovery_salt
+            .ok_or_else(|| PhoenixError::Crypto("no recovery wrap (2FA not enabled)".into()))?;
+        let blob = self
+            .capsule_recovery_blob
+            .as_ref()
+            .ok_or_else(|| PhoenixError::Crypto("no capsule recovery wrap".into()))?;
+        let seed = self
+            .recovery_seed_b32
+            .as_ref()
+            .ok_or_else(|| PhoenixError::Crypto("no recovery wrap (2FA not enabled)".into()))?;
+        let wk = derive_wrap_key(seed, &salt)?;
+        let pt = unwrap_raw(blob, &wk)?;
+        let mut arr = [0u8; KEY_LEN];
+        arr.copy_from_slice(&pt);
+        Ok(arr)
+    }
+
+    // -- recovery wraps -------------------------------------------------------
+
+    /// Add/replace the **DB key** recovery wrap. The DB key is encrypted under
+    /// a wrap key derived from the TOTP **seed** (stable), and the seed is
+    /// stored so a typed recovery **code** can be verified before unwrapping.
+    /// Requires the plaintext DB key. The recovery salt is minted on first
+    /// enable and REUSED on refreshes (a DB rekey rewraps the DB blob; the
+    /// capsule recovery blob derives from the same salt and must stay valid).
+    /// (The capsule recovery wrap is separate — see [`Self::set_recovery_capsule`].)
     pub fn set_recovery(&mut self, db_key: &DerivedKey, totp_seed_b32: &str) -> Result<()> {
-        let salt = random_salt();
+        let salt = self.recovery_salt.unwrap_or_else(random_salt);
         let wk = derive_wrap_key(totp_seed_b32, &salt)?;
         let blob = wrap_key(db_key, &wk)?;
         self.recovery_seed_b32 = Some(totp_seed_b32.to_string());
@@ -254,11 +359,27 @@ impl KeyBundle {
         Ok(())
     }
 
-    /// Remove the recovery wrap (called when 2FA is disabled).
+    /// Add/replace the **capsule key** recovery wrap under the same TOTP seed
+    /// (reuses the recovery salt established by [`Self::set_recovery`]).
+    pub fn set_recovery_capsule(&mut self, capsule_key: &[u8; KEY_LEN]) -> Result<()> {
+        let salt = self
+            .recovery_salt
+            .ok_or_else(|| PhoenixError::Crypto("set_recovery must run first".into()))?;
+        let seed = self
+            .recovery_seed_b32
+            .as_ref()
+            .ok_or_else(|| PhoenixError::Crypto("set_recovery must run first".into()))?;
+        let wk = derive_wrap_key(seed, &salt)?;
+        self.capsule_recovery_blob = Some(wrap_raw(capsule_key, &wk)?);
+        Ok(())
+    }
+
+    /// Remove the recovery wraps (called when 2FA is disabled).
     pub fn clear_recovery(&mut self) {
         self.recovery_seed_b32 = None;
         self.recovery_salt = None;
         self.recovery_blob = None;
+        self.capsule_recovery_blob = None;
     }
 
     /// Whether a recovery wrap is present (2FA was enabled).
@@ -297,15 +418,27 @@ impl KeyBundle {
         unwrap_key(blob, &wk)
     }
 
-    /// Re-wrap the primary wrap under a new launch password (used to *change*
+    /// Re-wrap the primary wraps under a new launch password (used to *change*
     /// the launch password without rekeying the DB). Requires the plaintext DB
-    /// key, which the caller obtains by unwrapping with the old password first.
-    pub fn change_primary(&mut self, db_key: &DerivedKey, new_launch_password: &str) -> Result<()> {
+    /// key — and, when a capsule wrap exists, the plaintext capsule key — which
+    /// the caller obtains by unwrapping with the old password first. Rotates
+    /// the primary salt; the recovery wraps are seed-derived and stay valid.
+    pub fn change_primary(
+        &mut self,
+        db_key: &DerivedKey,
+        capsule_key: Option<&[u8; KEY_LEN]>,
+        new_launch_password: &str,
+    ) -> Result<()> {
         let primary_salt = random_salt();
         let wk = derive_wrap_key(new_launch_password, &primary_salt)?;
         let primary_blob = wrap_key(db_key, &wk)?;
+        let capsule_blob = match capsule_key {
+            Some(k) => Some(wrap_raw(k, &wk)?),
+            None => None,
+        };
         self.primary_salt = primary_salt;
         self.primary_blob = primary_blob;
+        self.capsule_blob = capsule_blob;
         Ok(())
     }
 
@@ -329,11 +462,26 @@ impl KeyBundle {
 
     /// Serialize to the on-disk text format (base64 lines).
     pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, self.to_text()?)?;
+        Ok(())
+    }
+
+    /// Serialize to the text format (base64 lines) without touching disk.
+    /// This exact text is also embedded as the v2 capsule tail header, so the
+    /// app can read its wrapped keys straight from the exe before any state
+    /// is decrypted or hydrated.
+    pub fn to_text(&self) -> Result<String> {
         let mut s = String::new();
         s.push_str(KEY_BUNDLE_MAGIC);
         s.push('\n');
         s.push_str(&format!("primary_salt={}\n", B64.encode(self.primary_salt)));
         s.push_str(&format!("primary_blob={}\n", B64.encode(&self.primary_blob)));
+        if let Some(blob) = &self.capsule_blob {
+            s.push_str(&format!("capsule_blob={}\n", B64.encode(blob)));
+        }
         if let Some(seed) = &self.recovery_seed_b32 {
             s.push_str(&format!("recovery_seed={seed}\n"));
         }
@@ -343,17 +491,21 @@ impl KeyBundle {
         if let Some(blob) = &self.recovery_blob {
             s.push_str(&format!("recovery_blob={}\n", B64.encode(blob)));
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        if let Some(blob) = &self.capsule_recovery_blob {
+            s.push_str(&format!("capsule_recovery_blob={}\n", B64.encode(blob)));
         }
-        std::fs::write(path, s)?;
-        Ok(())
+        Ok(s)
     }
 
     /// Load and parse a key bundle from disk. Errors if missing/corrupt.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| PhoenixError::Crypto(format!("read key bundle {}: {e}", path.display())))?;
+        Self::parse(&text)
+    }
+
+    /// Parse a key bundle from its text form (see [`Self::to_text`]).
+    pub fn parse(text: &str) -> Result<Self> {
         let mut lines = text.lines();
         let magic = lines
             .next()
@@ -411,12 +563,29 @@ impl KeyBundle {
             _ => (None, None),
         };
 
+        let capsule_blob = match kv.get("capsule_blob") {
+            Some(b) => Some(
+                B64.decode(b)
+                    .map_err(|e| PhoenixError::Crypto(format!("capsule_blob b64: {e}")))?,
+            ),
+            None => None,
+        };
+        let capsule_recovery_blob = match kv.get("capsule_recovery_blob") {
+            Some(b) => Some(
+                B64.decode(b)
+                    .map_err(|e| PhoenixError::Crypto(format!("capsule_recovery_blob b64: {e}")))?,
+            ),
+            None => None,
+        };
+
         Ok(Self {
             primary_salt,
             primary_blob,
+            capsule_blob,
             recovery_seed_b32,
             recovery_salt,
             recovery_blob,
+            capsule_recovery_blob,
         })
     }
 }

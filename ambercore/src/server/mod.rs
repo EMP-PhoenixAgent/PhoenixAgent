@@ -44,12 +44,25 @@ use std::sync::Arc;
 /// separately (by id, so models with unusual EOS strings still stop).
 fn arch_stop_markers(arch: &str) -> &'static [&'static str] {
     match arch {
-        "gemma" | "gemma2" | "gemma3" => &["<end_of_turn>", "<|endoftext|>"],
+        "gemma" | "gemma2" | "gemma3" | "gemma4" => &["<end_of_turn>", "<|endoftext|>"],
         "phi2" => &["<|endoftext|>"],
         "phi3" => &["<|end|>", "<|endoftext|>"],
         "glm4" => &["<|user|>", "<|observation|>", "<|endoftext|>"],
         "mixtral" => &["</s>", "<|end_of_text|>"],
-        "llama" => &["<|eot_id|>", "<|end_of_text|>", "</s>", "<|im_end|>"],
+        "llama" | "nemotron" => {
+            // `<|end_response|>` only exists on Nemotron-Hybrid/Super builds.
+            &["<|eot_id|>", "<|end_of_text|>", "</s>", "<|im_end|>", "<|end_response|>"]
+        }
+        "granite" | "granitemoe" | "granite_swa" => {
+            // `<|end_of_planning|>` only exists on Granite-4 thinking models.
+            &["<|end_of_text|>", "<|end_of_planning|>", "<|endoftext|>"]
+        }
+        // The deepseek2 arch covers DeepSeek V2/V3/R1 (full-width markers) and
+        // Kimi K2 (im_* markup); Kimi's [EOS] rides the GGUF eos_token_id.
+        "deepseek2" | "deepseek32" | "kimi_k2" => {
+            &["<｜end▁of▁sentence｜>", "<｜begin▁of▁sentence｜>", "<|im_end|>"]
+        }
+        "minimax-m2" => &["[e~[", "]~b]user", "]~b]tool", "<|end_of_text|>", "<|im_end|>"],
         // qwen2/qwen2_v2/qwen3/qwen3moe/starcoder2/internlm2/lfm2 + default
         _ => &["<|im_end|>", "<|endoftext|>", "<|end_of_text|>"],
     }
@@ -99,6 +112,13 @@ struct Inner {
     /// Hardware snapshot captured once at startup — CPU model/cores/RAM/OS +
     /// (cuda) GPU. Cached in an `Arc` so telemetry push tasks clone it cheaply.
     hardware: Arc<telemetry::Hardware>,
+    /// Low-VRAM refusal/warning from the most recent model build attempt
+    /// (None = fit or unknown). Stored so the UI can surface it after a
+    /// warm-up.
+    last_vram_warning: std::sync::Mutex<Option<String>>,
+    /// Positive "contained in VRAM" line from the most recent successful
+    /// pre-flight check (chat verdict for the fit case).
+    last_vram_info: std::sync::Mutex<Option<String>>,
 }
 
 impl ServerState {
@@ -122,8 +142,22 @@ impl ServerState {
                 backend,
                 last_tokens_per_sec: tokio::sync::Mutex::new(None),
                 hardware,
+                last_vram_warning: std::sync::Mutex::new(None),
+                last_vram_info: std::sync::Mutex::new(None),
             }),
         }
+    }
+
+    /// The low-VRAM refusal/warning from the most recent model build attempt,
+    /// if any (None = the model fit, or the check couldn't run).
+    pub fn last_vram_warning(&self) -> Option<String> {
+        self.inner.last_vram_warning.lock().unwrap().clone()
+    }
+
+    /// The "contained in VRAM" line from the most recent pre-flight check
+    /// that passed, if any.
+    pub fn last_vram_info(&self) -> Option<String> {
+        self.inner.last_vram_info.lock().unwrap().clone()
     }
 
     /// The cached hardware snapshot (for telemetry push + `/api/telemetry/status`).
@@ -148,6 +182,7 @@ impl ServerState {
             ram_total_mb: hw.ram_total_mb,
             os: hw.os.clone(),
             gpu: self.inner.backend.gpu_info(),
+            vram_warning: self.last_vram_warning(),
         }
     }
 
@@ -188,22 +223,82 @@ impl ServerState {
         Ok(inserted)
     }
 
+    /// The canonical catalog spelling of `tag` (see [`Catalog::resolve`]) —
+    /// bare-stem and `:latest` spellings of the same model collapse onto one
+    /// entry, and one replica pool.
+    async fn canonical_tag(&self, tag: &str) -> Result<String> {
+        self.inner
+            .catalog
+            .lock()
+            .await
+            .resolve(tag)
+            .map(|(_, canonical)| canonical)
+            .ok_or_else(|| Error::NotFound(format!("model tag '{tag}' not in catalog")))
+    }
+
     /// Resolve a tag to its GGUF and build a fresh [`LoadedEntry`] (load GGUF,
     /// build the model, load the tokenizer, resolve stop tokens). The candle
     /// parsing runs on a blocking thread. Factored out so the first replica and
     /// later pool-grown replicas share one build path.
     async fn build_loaded_entry(&self, tag: &str) -> Result<LoadedEntry> {
-        let (gguf_path, _arch_hint) = {
+        let (gguf_path, canonical_tag, _arch_hint) = {
             let cat = self.inner.catalog.lock().await;
-            let entry = cat
-                .get(tag)
-                .ok_or_else(|| Error::NotFound(format!("model tag '{tag}' not in catalog")))?;
-            (cat.resolve_path(entry), entry.arch.clone())
+            let (entry, canonical) = cat.resolve(tag).ok_or_else(|| {
+                let known = cat.tags();
+                let hint = if known.is_empty() {
+                    "the catalog is empty — pull or register a model first".to_string()
+                } else {
+                    let sample: Vec<&str> =
+                        known.iter().take(4).map(|s| s.as_str()).collect();
+                    format!("known tags: {}", sample.join(", "))
+                };
+                Error::NotFound(format!("model tag '{tag}' not in catalog ({hint})"))
+            })?;
+            (cat.resolve_path(entry), canonical, entry.arch.clone())
         };
         tracing::info!(tag, "building model replica from {}", gguf_path.display());
         let device = self.inner.backend.device()?;
         let backend_name = self.inner.backend.name().to_string();
-        let tag_owned = tag.to_string();
+        let tag_owned = canonical_tag;
+        // Pre-flight VRAM check, BEFORE the build takes its share (blocking
+        // thread — nvidia-smi subprocess). Hard refusal when the model would
+        // spill; see backend::check_vram for the estimate + rationale.
+        let check_path = gguf_path.clone();
+        let check = tokio::task::spawn_blocking(move || crate::backend::check_vram(&check_path))
+            .await
+            .map_err(|e| Error::Server(format!("vram check join: {e}")))?;
+        {
+            let mut warning_slot = self.inner.last_vram_warning.lock().unwrap();
+            let mut info_slot = self.inner.last_vram_info.lock().unwrap();
+            match check.fits {
+                Some(false) => {
+                    *warning_slot = check.message.clone();
+                    *info_slot = None;
+                }
+                Some(true) => {
+                    *warning_slot = None;
+                    *info_slot = check.message.clone();
+                }
+                None => {
+                    *warning_slot = None;
+                    *info_slot = None;
+                }
+            }
+        }
+        if let Some(msg) = &check.message {
+            match check.fits {
+                Some(true) => tracing::info!("{}", msg),
+                _ => tracing::warn!("{}", msg),
+            }
+        }
+        if check.fits == Some(false) {
+            return Err(Error::Backend(
+                check
+                    .message
+                    .unwrap_or_else(|| "model exceeds free VRAM; refusing to load".into()),
+            ));
+        }
+        let entry: LoadedEntry =
         tokio::task::spawn_blocking(move || -> Result<LoadedEntry> {
             let mut loaded = LoadedModel::load(&gguf_path)?;
             let arch = loaded.arch.clone();
@@ -249,7 +344,8 @@ impl ServerState {
             })
         })
         .await
-        .map_err(|e| Error::Server(format!("load task join: {e}")))?
+        .map_err(|e| Error::Server(format!("load task join: {e}")))??;
+        Ok(entry)
     }
 
     /// Acquire a model replica for `tag` for the duration of one generation.
@@ -264,7 +360,9 @@ impl ServerState {
     /// sufficient (release happens after the surrounding locks/guards drop, so
     /// the replica's mutex is already unlocked by then).
     pub async fn acquire_replica(&self, tag: &str) -> Result<ReplicaHandle<Replica>> {
-        let pool = self.pool_for(tag).await?;
+        // Canonical spelling first so `model` and `model:latest` share one pool.
+        let canonical = self.canonical_tag(tag).await?;
+        let pool = self.pool_for(&canonical).await?;
         loop {
             match pool.acquire() {
                 AcquireOutcome::Ready(r) => {
@@ -272,7 +370,7 @@ impl ServerState {
                 }
                 AcquireOutcome::Build => {
                     // Grow the pool. Build OUTSIDE the pool lock (expensive).
-                    let entry = match self.build_loaded_entry(tag).await {
+                    let entry = match self.build_loaded_entry(&canonical).await {
                         Ok(e) => e,
                         Err(e) => {
                             pool.build_failed();
@@ -306,6 +404,44 @@ impl ServerState {
     /// in-process pull flow — no `ambercore register` subprocess needed.
     pub async fn register_entry(&self, entry: CatalogEntry) -> Result<()> {
         self.inner.catalog.lock().await.register(entry)
+    }
+
+    /// Remove a model from the catalog (persisting to `manifest.json`) and drop
+    /// its replica pool so any loaded replica — and its GGUF mmap — is released
+    /// before the caller deletes the file (Windows refuses to delete
+    /// memory-mapped files). Called by Phoenix's delete-model UI action; file
+    /// deletion stays with the caller, who knows the layout. A generation
+    /// holding a replica handle keeps its `Arc` until it finishes — the pool
+    /// entry is gone either way, so no new generation can acquire it.
+    pub async fn remove_model(&self, tag: &str) -> Result<()> {
+        let stem = tag.split(':').next().unwrap_or(tag).to_string();
+        let canonical = {
+            let cat = self.inner.catalog.lock().await;
+            cat.resolve(tag).map(|(_, c)| c).unwrap_or_else(|| tag.to_string())
+        };
+        {
+            // Drop every spelling of the same model (canonical + requested +
+            // the stem / `:latest` twins) — only the canonical one is
+            // persisted-away from manifest.json; the rest are scan aliases.
+            let mut cat = self.inner.catalog.lock().await;
+            cat.remove(&canonical)?;
+            if canonical != tag {
+                let _ = cat.remove(tag);
+            }
+            let with_latest = format!("{stem}:latest");
+            if with_latest != canonical && with_latest != tag {
+                let _ = cat.remove(&with_latest);
+            }
+            if stem != canonical && stem != tag {
+                let _ = cat.remove(&stem);
+            }
+        }
+        let mut pools = self.inner.pools.lock().await;
+        pools.remove(&canonical);
+        if canonical != tag {
+            pools.remove(tag);
+        }
+        Ok(())
     }
 }
 
@@ -589,5 +725,43 @@ mod tests {
         let got2 = rx2.await.expect("waiter 2 woken");
         assert_eq!(*got1, 2); // first waiter ← first released (b)
         assert_eq!(*got2, 1); // second waiter ← second released (a)
+    }
+
+    /// `remove_model` drops every spelling of a tag (manifest bare stem +
+    /// scan-derived `:latest`), persists the removal to `manifest.json`, and
+    /// tolerates being handed either spelling.
+    #[tokio::test]
+    async fn remove_model_drops_all_spellings_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/mymodel-Q4.gguf"), b"x").unwrap();
+        let cat = Catalog::load(dir.path()).unwrap();
+        let backend =
+            crate::backend::resolve_backend(crate::backend::DeviceChoice::Cpu).unwrap();
+        let state = ServerState::new(cat, backend, 1);
+        // Manifest-registered under the bare stem — Phoenix's pull spelling —
+        // while the scan also derived `mymodel-Q4:latest` from the file.
+        state
+            .register_entry(CatalogEntry {
+                tag: "mymodel-Q4".into(),
+                file: "sub/mymodel-Q4.gguf".into(),
+                arch: None,
+            })
+            .await
+            .unwrap();
+        let tags = state.tags().await;
+        assert!(tags.contains(&"mymodel-Q4".to_string()));
+        assert!(tags.contains(&"mymodel-Q4:latest".to_string()));
+
+        // Remove via the :latest spelling → both spellings go.
+        state.remove_model("mymodel-Q4:latest").await.unwrap();
+        assert!(state.tags().await.is_empty());
+
+        // The manifest entry was persisted away.
+        let raw = std::fs::read_to_string(dir.path().join("manifest.json")).unwrap();
+        assert!(!raw.contains("mymodel-Q4"), "manifest should not mention the model: {raw}");
+
+        // Removing an unknown tag is a no-op success, not an error.
+        state.remove_model("never-existed").await.unwrap();
     }
 }

@@ -38,6 +38,9 @@ pub struct GpuInfo {
     pub vram_total_mb: Option<u64>,
     /// Used VRAM in MB (live reading at call time).
     pub vram_used_mb: Option<u64>,
+    /// Free VRAM in MB (live reading at call time) — powers the model-load
+    /// headroom warning (`check_vram_headroom`).
+    pub vram_free_mb: Option<u64>,
 }
 
 // ─────────────────────── CUDA error translation ────────────────────────────
@@ -122,6 +125,248 @@ pub fn translate_cuda_error(err: &str) -> String {
     format!(
         "{err}\n\nCUDA kernel mismatch: {cause} ({toolkit_note}; {driver_note}). To fix: {fix}."
     )
+}
+
+// ─────────────────────── VRAM headroom warning ─────────────────────────────
+//
+// Under WDDM (Windows; Linux behaves similarly with pageable device memory),
+// an oversized CUDA allocation never FAILS — the driver spills it to shared
+// system memory and pages it over PCIe on every step, collapsing throughput
+// ~12x (observed: qwen3-8b Q4_K_M went 26.6 → 2.2 tok/s when the 8 GiB card
+// also hosted the app's WebView + Discord + a browser). So we WARN at model
+// load, before the crawl can surprise anyone. Best-effort: `nvidia-smi` is
+// queried (no new dependency, context-free — NVML needs no current CUDA
+// context unlike mem_get_info); a missing answer just means no warning.
+
+/// Estimated resident size of a GGUF on the GPU: file × 1.5 + 300 MiB fixed
+/// (KV cache + activations + CUDA context + fragmentation). Calibrated on
+/// qwen3-8b Q4_K_M: 4.7 GiB file → 7.1 GiB resident on an RTX 3050. The
+/// factor deliberately overshoots slightly — borderline refusals err on the
+/// safe side.
+fn estimated_resident_mb(file_mb: u64) -> u64 {
+    file_mb * 3 / 2 + 300
+}
+
+/// Pre-flight verdict for a GGUF about to load.
+#[derive(Debug, Clone)]
+pub struct VramCheck {
+    /// `Some(true)`: fits. `Some(false)`: would spill — **the load is
+    /// REFUSED** (pre-flight refusal). `None`: free VRAM couldn't be queried
+    /// (CPU backend, no nvidia-smi, parse failure) — loads proceed unjudged.
+    pub fits: Option<bool>,
+    /// Estimated resident MB needed (weights + KV + activations + overhead).
+    pub needed_mb: u64,
+    /// Free VRAM MB at check time (`None` when unqueryable).
+    pub free_mb: Option<u64>,
+    /// Human line for the chat — "fits" or "refused, would spill" — when a
+    /// verdict could be reached.
+    pub message: Option<String>,
+}
+
+/// Live total + free VRAM (MiB) via nvidia-smi — context-free, so any thread
+/// (UI commands, search) can call it. The search modal displays the GPU's
+/// MAX (total) VRAM while the fit coloring compares against free.
+pub fn query_vram_mb() -> Option<(u64, u64)> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.total,memory.free",
+            "--format=csv,noheader,nounits",
+            "-i",
+            "0",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut nums = text
+        .lines()
+        .next()?
+        .split(',')
+        .filter_map(|n| n.trim().parse::<u64>().ok());
+    let total = nums.next()?;
+    let free = nums.next()?;
+    Some((total, free))
+}
+
+/// Live free-VRAM reading (MiB) via nvidia-smi — context-free, so any thread
+/// (UI commands, search) can call it. Powers the model-search cards' fit
+/// coloring alongside `check_vram`.
+pub fn query_free_vram_mb() -> Option<u64> {
+    query_vram_mb().map(|(_, free)| free)
+}
+
+/// Pre-flight VRAM check for a GGUF (BEFORE loading it). Callers refuse the
+/// load on `fits == Some(false)`: under WDDM an oversized CUDA allocation
+/// never fails — the driver spills it to system RAM and pages it over PCIe
+/// on every step (observed: 26.6 → 2.2 tok/s, ~12x). Best-effort via
+/// `nvidia-smi` (context-free — NVML-style queries need no current CUDA
+/// context, unlike `mem_get_info`, so async load threads can call it).
+pub fn check_vram(gguf_path: &std::path::Path) -> VramCheck {
+    let file_mb = match std::fs::metadata(gguf_path) {
+        Ok(m) => {
+            let mut bytes = m.len();
+            // Sharded safetensors: the entry is only the first shard — sum
+            // the siblings the index.json maps so the estimate covers the
+            // whole checkpoint (the F16 loader mmaps them all).
+            if gguf_path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("safetensors")).unwrap_or(false) {
+                if let Ok(index_raw) = std::fs::read_to_string(
+                    gguf_path.parent().unwrap_or(std::path::Path::new(".")).join("index.json"),
+                ) {
+                    if let Ok(idx) = serde_json::from_str::<serde_json::Value>(&index_raw) {
+                        if let Some(wm) = idx.get("weight_map").and_then(|v| v.as_object()) {
+                            let parent = gguf_path.parent().unwrap_or(std::path::Path::new("."));
+                            for shard in wm.values().filter_map(|v| v.as_str()) {
+                                if let Ok(sm) = std::fs::metadata(parent.join(shard)) {
+                                    bytes = bytes.saturating_add(sm.len());
+                                }
+                            }
+                            // The entry shard was counted twice (once as the
+                            // file itself, once via the map).
+                            bytes = bytes.saturating_sub(m.len());
+                        }
+                    }
+                }
+            }
+            bytes / (1024 * 1024)
+        }
+        Err(_) => {
+            return VramCheck { fits: None, needed_mb: 0, free_mb: None, message: None };
+        }
+    };
+    let needed_mb = estimated_resident_mb(file_mb);
+    let free_mb = query_free_vram_mb();
+    let name = gguf_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| gguf_path.display().to_string());
+    match free_mb {
+        Some(free) if needed_mb <= free => VramCheck {
+            fits: Some(true),
+            needed_mb,
+            free_mb: Some(free),
+            message: Some(format!(
+                "{name}: contained in VRAM — needs ~{needed_mb} MiB, {free} MiB free."
+            )),
+        },
+        Some(free) => VramCheck {
+            fits: Some(false),
+            needed_mb,
+            free_mb: Some(free),
+            message: Some(format!(
+                "{name}: load REFUSED — needs ~{needed_mb} MiB resident but only {free} MiB \
+                 free. Loading it anyway would spill to system RAM and run ~10x slower. \
+                 {}{}",
+                igpu_advice(),
+                format_args!(
+                    "Close GPU-heavy apps (top users now: {}) or pick a smaller model/quant.",
+                    top_gpu_processes(3)
+                )
+            )),
+        },
+        None => VramCheck { fits: None, needed_mb, free_mb: None, message: None },
+    }
+}
+
+/// Advice line for the spill refusal when a secondary (non-NVIDIA) GPU —
+/// typically the Intel/AMD iGPU on a hybrid system — is present.
+///
+/// It canNOT host the spill itself: CUDA allocations only live on NVIDIA
+/// devices (candle has no iGPU backend), and iGPU memory is system RAM on the
+/// far side of the same PCIe bus — no bandwidth to gain over the driver's own
+/// spill. What it CAN do is take display + app-rendering duty, freeing dGPU
+/// VRAM — often the difference between fit and spill for an 8B-class model.
+fn igpu_advice() -> String {
+    match detect_secondary_gpu() {
+        Some(igpu) => format!(
+            "An integrated GPU ({igpu}) is present: it cannot hold CUDA spill memory, but \
+             moving your display and GPU-heavy apps to it frees this GPU's VRAM (Windows \
+             Settings > System > Display > Graphics, or plug the monitor into the \
+             motherboard's output) — that often makes the model fit. "
+        ),
+        None => String::new(),
+    }
+}
+
+/// Best-effort detection of a secondary (non-NVIDIA) display adapter — the
+/// iGPU on hybrid systems. `None` when absent or unqueryable. Also used by
+/// Phoenix to pin the app's own rendering to the iGPU (freeing dGPU VRAM for
+/// the model — see main.rs `pin_rendering_to_igpu`).
+pub fn detect_secondary_gpu() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let out = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            // Skip the NVIDIA dGPU(s) and Windows' fallback render device.
+            .find(|l| !l.contains("NVIDIA") && !l.contains("Basic Display"))
+            .map(str::to_string)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let out = std::process::Command::new("lspci").output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines()
+            .filter(|l| l.contains("VGA ") || l.contains("Display controller"))
+            .find(|l| !l.contains("NVIDIA"))
+            .and_then(|l| l.split(':').next_back())
+            .map(|s| s.trim().to_string())
+    }
+}
+
+/// Top-N GPU-memory-consuming processes, best-effort (rows with unreadable
+/// memory, e.g. permission-limited "[N/A]", are skipped). "unknown" when the
+/// query itself fails.
+fn top_gpu_processes(n: usize) -> String {
+    let out = match std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid,process_name,used_memory",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return "unknown".to_string(),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut procs: Vec<(u64, String)> = text
+        .lines()
+        .filter_map(|line| {
+            let mut cols = line.split(',');
+            let _pid = cols.next()?;
+            let full_name = cols.next()?.trim().to_string();
+            // Bare executable name — full paths are noisy in a warning line.
+            let name = full_name.rsplit(['\\', '/']).next()?.to_string();
+            let mem_mib: u64 = cols.next()?.trim().parse().ok()?;
+            Some((mem_mib, name))
+        })
+        .collect();
+    if procs.is_empty() {
+        return "unknown".to_string();
+    }
+    procs.sort_by(|a, b| b.0.cmp(&a.0));
+    procs
+        .into_iter()
+        .take(n)
+        .map(|(mem, name)| format!("{name} ({mem} MiB)"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A compute target. Implementations hand out the candle [`Device`] that models
@@ -326,7 +571,14 @@ mod cuda {
         /// crashing a model load halfway through. Under `auto` the resolver
         /// catches this and falls back to CPU, so the app still runs.
         pub fn new(ordinal: usize) -> Result<Self> {
-            let device = Device::new_cuda(ordinal)
+            // `new_cuda_with_stream`: ONE cudarc-managed stream shared by every
+            // thread + cudarc's event tracking. `Device::new_cuda` instead hands
+            // each OS thread its own CUDA per-thread default stream — and
+            // AmberCore loads models and runs generation on different tokio
+            // blocking threads, so tensor alloc/free would cross streams with
+            // no ordering and the context dies mid-generation with
+            // CUDA_ERROR_INVALID_CONTEXT (seen on RTX 3050, v0.8.4 installers).
+            let device = Device::new_cuda_with_stream(ordinal)
                 .map_err(|e| Error::Backend(format!("CUDA init (ordinal {ordinal}): {e}")))?;
             warm_up_kernel(&device)
                 .map_err(|e| Error::Backend(super::translate_cuda_error(&e.to_string())))?;
@@ -373,15 +625,22 @@ mod cuda {
             }
             .ok()
             .map(|b| b as u64 / (1024 * 1024));
-            // Used VRAM needs a *current* context; UI threads don't have one,
-            // so this is best-effort and may read as "—".
-            let vram_used_mb = cudarc::driver::result::mem_get_info()
+            // Used/free VRAM needs a *current* context; UI threads don't have
+            // one, so this is best-effort and may read as "—".
+            let (vram_free_mb, vram_used_mb) = cudarc::driver::result::mem_get_info()
                 .ok()
-                .map(|(free, total)| (total - free) as u64 / (1024 * 1024));
+                .map(|(free, total)| {
+                    (
+                        Some(free as u64 / (1024 * 1024)),
+                        Some((total - free) as u64 / (1024 * 1024)),
+                    )
+                })
+                .unwrap_or((None, None));
             Some(super::GpuInfo {
                 name,
                 vram_total_mb,
                 vram_used_mb,
+                vram_free_mb,
             })
         }
     }

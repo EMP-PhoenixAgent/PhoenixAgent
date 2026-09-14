@@ -135,6 +135,7 @@ pub fn is_split_gguf(filename: &str) -> bool {
     let lower = filename.to_ascii_lowercase();
     let base = lower
         .strip_suffix(".gguf")
+        .or_else(|| lower.strip_suffix(".safetensors"))
         .unwrap_or(&lower);
     let Some(idx) = base.find("-of-") else {
         return false;
@@ -155,4 +156,21 @@ pub fn is_split_gguf(filename: &str) -> bool {
 fn strip_query_fragment(s: &str) -> &str {
     let cut = s.find(['?', '#']).unwrap_or(s.len());
     &s[..cut]
+}
+
+/// Strip the shard suffix from a checkpoint stem:
+/// `model-00001-of-00002` → `model`. Returns None when the stem isn't a
+/// `-NNNNN-of-NNNNN` shard name.
+pub fn shard_base_stem(stem: &str) -> Option<String> {
+    let idx = stem.to_ascii_lowercase().rfind("-of-")?;
+    let left = &stem[..idx];
+    let left_idx = left.rfind('-')?;
+    let n = &left[left_idx + 1..];
+    let total = &stem[idx + "-of-".len()..];
+    let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    if digits(n) && digits(total) {
+        Some(left[..left_idx].to_string())
+    } else {
+        None
+    }
 }

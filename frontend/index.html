@@ -57,6 +57,15 @@
             <div class="nav-item active" data-panel="models" title="Models">
               <span class="status-dot" id="dot-models"></span>
               <span class="nav-label">Models</span>
+              <!-- Thin circular progress ring with the pull percentage
+                   inside, shown while model(s) download — visible even with
+                   the panel closed. -->
+              <span class="nav-eta" id="nav-eta" hidden>
+                <span class="nav-eta-ring">
+                  <span class="nav-eta-sweep"></span>
+                  <span class="nav-eta-pct"></span>
+                </span>
+              </span>
             </div>
             <div class="nav-item active" data-panel="skills" title="Skills">
               <span class="status-dot" id="dot-skills"></span>
@@ -80,21 +89,39 @@
             </div>
           </div>
 
-          <!-- Working directory selector -->
+          <!-- Working directory (profile-scoped): blank until the user picks
+               one — the row itself opens the OS native directory picker. -->
           <div class="sidebar-section sidebar-workdir">
             <div class="sidebar-label">📁 Workdir</div>
-            <div id="workdir-row">
-              <span id="workdir-display" class="workdir-display" title="">—</span>
-              <button id="workdir-change-btn" class="btn-icon" title="Change working directory">✎</button>
+            <div id="workdir-row" title="Select a directory for this profile">
+              <span id="workdir-display" class="workdir-display placeholder">Please select a directory for this profile!</span>
             </div>
           </div>
 
-          <!-- Profile selector -->
-          <div class="sidebar-section sidebar-profile">
-            <div class="sidebar-label">Profile</div>
-            <div id="profile-row">
-              <select id="profile-select" title="Active profile"></select>
-              <button id="profile-new-btn" class="btn-icon" title="New profile">＋</button>
+          <!-- Bottom group (pinned to the sidebar's bottom): the PROFILE row
+               rides directly on top of the console's drag handle — resizing
+               the console moves the profile row with it. The handle behaves
+               like the sidebar's own resizer (drag + persisted height). -->
+          <div id="sidebar-bottom">
+            <div class="sidebar-section sidebar-profile">
+              <div class="sidebar-label">Profile</div>
+              <div id="profile-row">
+                <button id="profile-home-btn" class="btn-icon" title="Default profile (home)">🏠</button>
+                <button id="profile-new-btn" class="btn-icon" title="New profile">＋</button>
+              </div>
+            </div>
+            <div id="console-resizer" title="Drag to resize the console"></div>
+            <!-- User console (compact strip): every functional message +
+                 error lands here (workdir/profile changes, VRAM verdicts,
+                 failures…), and the user can run shell commands in the active
+                 workdir (Enter to run, ↑/↓ history, `clear`). No title label —
+                 the ❯ line says what it is. -->
+            <div class="sidebar-section sidebar-console" id="console-section">
+              <div id="console-output" aria-live="polite"></div>
+              <div id="console-input-row">
+                <span id="console-prompt">❯</span>
+                <input id="console-input" placeholder="Run a command…" spellcheck="false" autocomplete="off" />
+              </div>
             </div>
           </div>
         </aside>
@@ -112,6 +139,13 @@
           <!-- Chat messages -->
           <div id="chat-messages"></div>
 
+          <!-- Session history rail — one dash per past session, anchored to
+               the chat's left edge. Green = learned + compacted, orange =
+               learned only, red = wild (never learned). Click a dash to load
+               that session read-only into a collapsible container above the
+               current chat (chronological order). -->
+          <div id="session-rail" hidden></div>
+
           <!-- To-do list (the shared plan) — pinned to the top-right corner of
                the chat area. Display only: the agent maintains it via the
                update_todo tool, and the 📋 title opens the editor modal (Plan
@@ -125,12 +159,12 @@
             <div id="todo-body" class="todo-md"></div>
           </div>
 
-          <!-- Live phase indicator (shown while the agent is working) -->
-          <div id="agent-phase" class="agent-phase" hidden></div>
-
           <!-- Chatbox: ONE big container — text input (left) | invisible wall |
                controls column (right: model picker above, mode selector +
                Send at the corner). -->
+          <!-- (The live working indicator lives IN the chat now: a
+               .thinking-block.working element created at send time — see
+               app.js ensureWorkingBlock / setPhase.) -->
           <div id="input-row" class="glass">
             <textarea id="message-input" placeholder="Type a message... (Enter to send, Shift+Enter for newline)" rows="3"></textarea>
             <div id="input-controls">
@@ -187,6 +221,10 @@
         <span class="health-item" id="health-shell">
           <span class="health-dot unknown"></span> shell
         </span>
+        <!-- Live runtime metrics (T/s · TTFT · TBT · generating/idle) —
+             absolutely centered in the bar, white + bold: the numbers users
+             monitor first. Rendered by refreshHealthLabel(). -->
+        <span id="health-metrics-bar" class="health-metrics-center" hidden></span>
         <span class="health-summary" id="health-summary">0/5</span>
         <button id="config-menu-btn" class="btn-icon lock-menu-btn" title="Security & settings (password manager)">🔒</button>
       </div>
@@ -207,59 +245,71 @@
             entering your API key's.
           </p>
 
-          <!-- Top row: AmberCore + Ollama, centered in the available height -->
+          <!-- Top row: runner settings (tabbed: AmberCore | Ollama) + the
+               shared model list for whichever runner is selected. -->
           <div class="models-grid">
-            <!-- Blue side: AmberCore -->
-            <section class="provider-box" id="ambercore-box" data-kind="ambercore">
-              <h3 class="provider-box-title">AmberCore</h3>
-              <p class="provider-box-note">
-                If you are running Phoenix Agent on your personal computer, please select if
-                needed, a directory path for your models.
-              </p>
-              <div class="mp-dir-row">
-                <input type="text" id="ic-dir" placeholder="Path to your models directory (optional)…" autocomplete="off" />
-                <button id="ic-dir-clear" class="btn-secondary" title="Use AmberCore's native folder">Default</button>
+            <!-- Changeable settings container: the tab strip picks the runner
+                 whose options show below it. -->
+            <section class="provider-box" id="runner-box">
+              <div class="runner-tabs" id="runner-tabs">
+                <button class="runner-tab active" data-runner="ambercore">AmberCore</button>
+                <button class="runner-tab" data-runner="ollama">Ollama</button>
               </div>
-              <p class="provider-box-note">
-                If no custom path for models is added, AmberCore will use its native folder.
-                You can pull models by entering the URL of the model here:
-              </p>
-              <div class="mp-pull-row">
-                <input type="text" id="ic-url" placeholder="https://…/model.gguf" autocomplete="off" />
-                <button id="ic-pull-btn" class="btn-secondary">Pull</button>
+
+              <!-- AmberCore pane -->
+              <div class="runner-pane" id="pane-ambercore">
+                <p class="provider-box-note">
+                  If you are running Phoenix Agent on your personal computer, please select if
+                  needed, a directory path for your models.
+                </p>
+                <div class="mp-dir-row">
+                  <input type="text" id="ic-dir" placeholder="Path to your models directory (optional)…" autocomplete="off" />
+                  <button id="ic-dir-clear" class="btn-secondary" title="Use AmberCore's native folder">Default</button>
+                </div>
+                <hr class="mp-divider" />
+                <p class="provider-box-note">
+                  Or link a <b>remote AmberCore server</b> (e.g. an AmberCore-Server
+                  you installed on a private machine) instead of running one locally:
+                </p>
+                <div class="mp-pull-row">
+                  <input type="text" id="ic-remote-url" placeholder="http://your-server:42069" autocomplete="off" />
+                  <button id="ic-remote-btn" class="btn-secondary">Connect</button>
+                </div>
+                <button id="ic-local-btn" class="btn-secondary mp-remote-back" hidden>← Use local AmberCore</button>
               </div>
-              <input type="text" id="ic-tokenizer-url" class="mp-tokenizer-input" placeholder="Tokenizer URL (optional — auto-detected for Hugging Face links)" autocomplete="off" />
-              <div id="ic-progress" class="mp-progress" hidden><div class="mp-progress-bar"></div><span class="mp-progress-text"></span></div>
-              <ul class="mp-list" id="ic-list">
-                <li class="panel-loading">Loading AmberCore models…</li>
-              </ul>
-              <hr class="mp-divider" />
-              <p class="provider-box-note">
-                Or link a <b>remote AmberCore server</b> (e.g. an AmberCore-Server
-                you installed on a private machine) instead of running one locally:
-              </p>
-              <div class="mp-pull-row">
-                <input type="text" id="ic-remote-url" placeholder="http://your-server:42069" autocomplete="off" />
-                <button id="ic-remote-btn" class="btn-secondary">Connect</button>
+
+              <!-- Ollama pane -->
+              <div class="runner-pane" id="pane-ollama" hidden>
+                <p class="provider-box-note">
+                  If you already used Ollama to run models locally you can select the model you
+                  want Ollama to run. If you don't have Ollama you can auto install it by clicking
+                  on "Install Ollama".
+                </p>
+                <button id="ol-install-btn" class="btn-secondary mp-install">Install Ollama</button>
               </div>
-              <button id="ic-local-btn" class="btn-secondary mp-remote-back" hidden>← Use local AmberCore</button>
             </section>
 
-            <!-- Yellow side: Ollama -->
-            <section class="provider-box" id="ollama-box" data-kind="ollama">
-              <h3 class="provider-box-title">Ollama</h3>
-              <p class="provider-box-note">
-                If you already used Ollama to run models locally you can select the model you
-                want Ollama to run. If you don't have Ollama you can auto install it by clicking
-                on "Install Ollama".
-              </p>
-              <button id="ol-install-btn" class="btn-secondary mp-install">Install Ollama</button>
-              <div class="mp-pull-row">
+            <!-- Model list container: the acquire affordance (Find models for
+                 AmberCore, pull input for Ollama) sits on top, the selected
+                 runner's models load under it. -->
+            <section class="provider-box" id="models-list-box">
+              <h3 class="provider-box-title" id="ml-title">AmberCore models</h3>
+              <div class="mp-pull-row" id="ml-acquire-ambercore">
+                <button id="ic-search-btn" class="btn-secondary ms-open-btn">🔍 Find models…</button>
+              </div>
+              <div class="mp-pull-row" id="ml-acquire-ollama" hidden>
                 <input type="text" id="ol-pull" placeholder="e.g. qwen2.5-coder:7b" autocomplete="off" />
                 <button id="ol-pull-btn" class="btn-secondary">Pull model</button>
               </div>
-              <div id="ol-progress" class="mp-progress" hidden><span class="mp-progress-text"></span></div>
-              <ul class="mp-list" id="ol-list">
+              <!-- One download bar per concurrent pull (AmberCore and Ollama
+                   alike); rows are created/retired by the pull-progress
+                   events and live outside the lists so re-renders never
+                   clobber them. -->
+              <div id="ml-pull-bars" hidden></div>
+              <ul class="mp-list" id="ic-list">
+                <li class="panel-loading">Loading AmberCore models…</li>
+              </ul>
+              <ul class="mp-list" id="ol-list" hidden>
                 <li class="panel-loading">Loading Ollama models…</li>
               </ul>
             </section>
@@ -278,6 +328,46 @@
               <li class="panel-loading">Loading providers…</li>
             </ul>
           </section>
+        </div>
+      </div>
+    </div>
+
+    <!-- Model search modal (opened from the AmberCore box's "Find models…"
+         button): searches Hugging Face / Civitai, shows rectangular cards
+         (name + size · params + quant · Pull) colored by GPU fit —
+         glass-green when the model fits entirely, glass-orange when it would
+         spill. Auto-searches the most-downloaded GGUFs on open. -->
+    <div id="model-search-modal" class="panel-overlay" hidden>
+      <div class="ms-modal glass">
+        <div class="ms-header">
+          <span class="ms-title">Find models</span>
+          <div class="ms-sources">
+            <button class="ms-source active" data-source="huggingface">Hugging Face</button>
+            <button class="ms-source" data-source="civitai">Civitai</button>
+          </div>
+          <button id="ms-close-btn" class="btn-icon" title="Close">✕</button>
+        </div>
+        <div class="ms-search-row">
+          <input id="ms-query" placeholder="Search GGUF models (e.g. qwen3 8b)…" autocomplete="off" spellcheck="false" />
+          <button id="ms-search-btn" class="btn-secondary">Search</button>
+        </div>
+        <!-- Client-side filters over the current results (no re-fetch):
+             max size is fixed; quant + params options are built per search. -->
+        <div class="ms-filters">
+          <select id="ms-filter-size" title="Filter by maximum size">
+            <option value="">Any size</option>
+            <option value="2">≤ 2 GB</option>
+            <option value="4">≤ 4 GB</option>
+            <option value="8">≤ 8 GB</option>
+            <option value="16">≤ 16 GB</option>
+            <option value="32">≤ 32 GB</option>
+          </select>
+          <select id="ms-filter-quant" title="Filter by quantization"><option value="">Any quant</option></select>
+          <select id="ms-filter-params" title="Filter by parameters"><option value="">Any params</option></select>
+        </div>
+        <div id="ms-vram" class="ms-vram"></div>
+        <div id="ms-results" class="ms-results">
+          <div class="ms-empty">Searching…</div>
         </div>
       </div>
     </div>
@@ -788,6 +878,7 @@
             <button class="wiki-tab-btn" data-wiki-tab="features">Features</button>
             <button class="wiki-tab-btn" data-wiki-tab="security">Security</button>
             <button class="wiki-tab-btn" data-wiki-tab="amber">AmberCore</button>
+            <button class="wiki-tab-btn" data-wiki-tab="cli">CLI</button>
           </div>
 
           <!-- ============ Sub-tab: Phoenix Agent ============ -->
@@ -962,6 +1053,64 @@
             <div class="config-security-card">
               <div class="config-card-title">Using it with Phoenix Agent</div>
               <p class="security-note small">Start the server with <code>ambercore serve</code>, then point Phoenix at it — either from the <b>Models</b> panel, or by setting <code>ollama_url = "http://localhost:42069"</code> in <code>~/.phoenix/config.toml</code>. Registered models appear automatically in the AmberCore box of the Models panel.</p>
+            </div>
+          </div>
+
+          <!-- ============ Sub-tab: CLI ============ -->
+          <div class="wiki-sub" id="wiki-sub-cli" hidden>
+            <div class="config-card-title wiki-section-title">Command reference</div>
+            <p class="security-note small" style="margin-bottom:10px">
+              Every command Phoenix Agent and AmberCore understand — the two terminal
+              binaries, and the slash commands typed straight into the chatbox.
+            </p>
+
+            <div class="config-security-card">
+              <div class="config-card-title">phoenix — the app binary (terminal)</div>
+              <table class="tele-table">
+                <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+                <tbody>
+                  <tr><td><code>phoenix</code></td><td>Launch the desktop app (default command)</td></tr>
+                  <tr><td><code>phoenix doctor</code></td><td>Diagnose the install: Ollama reachability, database, toolchain</td></tr>
+                  <tr><td><code>phoenix --data-dir &lt;path&gt;</code></td><td>Override where the app stores its data (config, DB, models)</td></tr>
+                  <tr><td><code>phoenix --workdir &lt;path&gt;</code></td><td>Start with a specific working directory</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="config-security-card">
+              <div class="config-card-title">ambercore — the model engine (terminal)</div>
+              <table class="tele-table">
+                <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+                <tbody>
+                  <tr><td><code>ambercore serve</code></td><td>Start the Ollama-compatible server — <code>--port</code> (default 42069), <code>--models-dir</code>, <code>--device</code> (cpu/cuda/metal/auto), <code>--max-replicas</code></td></tr>
+                  <tr><td><code>ambercore run --model &lt;tag&gt; --prompt "…"</code></td><td>One-off generation in the terminal — <code>--temperature</code>, <code>--top-k</code>, <code>--top-p</code>, <code>--seed</code>, <code>--max-tokens</code>, <code>--raw</code>, <code>--device</code>, <code>--models-dir</code></td></tr>
+                  <tr><td><code>ambercore register --file &lt;path&gt; --tag &lt;tag&gt;</code></td><td>Add a local GGUF to the catalog — <code>--arch</code> hint, <code>--models-dir</code></td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="config-security-card">
+              <div class="config-card-title">Slash commands — typed in the chatbox</div>
+              <table class="tele-table">
+                <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+                <tbody>
+                  <tr><td><code>/model &lt;name&gt;</code></td><td>Switch model (no argument: show the current one)</td></tr>
+                  <tr><td><code>/new</code></td><td>Start a fresh session (chat cleared, history kept in the DB)</td></tr>
+                  <tr><td><code>/clear</code></td><td>Clear the chat display only — the session keeps its history</td></tr>
+                  <tr><td><code>/cc</code></td><td><b>Context Compacting</b> — compact the conversation into a new context file (what's done, what's coming next, the topics discussed), then start a fresh session with the compact loaded — frees the context window</td></tr>
+                  <tr><td><code>/learn</code></td><td><b>Project Memory</b> — update the agent's memory of the project: what has to be done and what has been done (one living note, updated in place; the session keeps running)</td></tr>
+                  <tr><td><code>/context-resume</code></td><td>Generate a project résumé from your profile's context files</td></tr>
+                  <tr><td><code>/help</code></td><td>List the slash commands</td></tr>
+                </tbody>
+              </table>
+              <p class="security-note small" style="margin-top:10px">
+                <b>/cc vs /learn:</b> /cc is a compacting tool — it snapshots the conversation
+                (what's done, what's gonna happen, the topics you're discussing with the agent)
+                into a context file and frees the context window by starting a new session;
+                /learn is the agent's memory management — it maintains one living project-memory
+                note (what he has to do + what he has done) that persists across sessions, and
+                the current session keeps running.
+              </p>
             </div>
           </div>
         </div>

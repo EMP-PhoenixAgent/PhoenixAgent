@@ -13,10 +13,11 @@ use super::SharedStore;
 use crate::agent::Command;
 use crate::backend::process::ProcessManager;
 use crate::config::{Config, Paths};
-use crate::crypto::DerivedKey;
+use crate::crypto::{DerivedKey, KEY_LEN};
 use crate::health::HealthState;
 use crate::model::dispatch::{ActiveRoute, DispatchProvider, LocalBackend};
 use crate::model::ModelProvider;
+use zeroize::Zeroizing;
 
 pub struct WebState {
     /// Channel to send commands to the agent runtime. `None` until unlock.
@@ -47,6 +48,11 @@ pub struct WebState {
     /// recovery wrap and DB-rekey re-wrap can be maintained without re-asking
     /// for the launch password. `None` until unlock. Zeroized on drop.
     pub db_key: Mutex<Option<DerivedKey>>,
+    /// The capsule key decrypting the exe's sealed-state tail, retained while
+    /// unlocked so auto-save/exit seals re-encrypt without re-asking for the
+    /// launch password (and so a v1 exe migrates to v2 at its first unlock).
+    /// `None` until setup/unlock/recover. Zeroized on drop.
+    pub capsule_key: Mutex<Option<Zeroizing<[u8; KEY_LEN]>>>,
     /// Current reasoning mode (Plan/Think/Auto) — drives the approval-policy
     /// preset selected from the chat mode bar. Readable from launch (default
     /// Think); the runtime applies it live via `Command::SetMode`.
@@ -77,7 +83,7 @@ impl WebState {
         // catalog so the app still boots.
         let models_dir = config
             .ambercore_models_dir_path()
-            .unwrap_or_else(|| crate::config::default_models_dir(&paths.data_dir));
+            .unwrap_or_else(|| crate::config::encaps_models_dir(&paths.data_dir));
         let embedded = crate::model::ambercore_embedded::EmbeddedAmberCore::new(Some(models_dir))
             .unwrap_or_else(|e| {
                 tracing::warn!("embedded AmberCore init failed; falling back to a temp catalog: {e}");
@@ -98,6 +104,7 @@ impl WebState {
             workdir: Mutex::new(workdir),
             model_tx: Mutex::new(None),
             db_key: Mutex::new(None),
+            capsule_key: Mutex::new(None),
             mode: Mutex::new(crate::config::Mode::default()),
         }
     }
