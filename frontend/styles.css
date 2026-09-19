@@ -1048,6 +1048,40 @@ select option {
 .message p { margin: 6px 0; }
 .message ul, .message ol { margin: 6px 0 6px 20px; }
 
+/* Markdown block elements inside chat messages */
+.message h1, .message h2, .message h3,
+.message h4, .message h5, .message h6 {
+  margin: 12px 0 6px;
+  line-height: 1.3;
+}
+.message h1 { font-size: 1.35em; }
+.message h2 { font-size: 1.22em; }
+.message h3 { font-size: 1.1em; }
+.message h4, .message h5, .message h6 { font-size: 1em; }
+.message :is(h1, h2, h3, h4, h5, h6):first-child { margin-top: 2px; }
+.message table {
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 13px;
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.message th, .message td {
+  border: 1px solid rgba(255,255,255,0.14);
+  padding: 4px 10px;
+  text-align: left;
+}
+.message th { background: rgba(255,255,255,0.06); font-weight: 600; }
+.message blockquote {
+  margin: 8px 0;
+  padding: 2px 12px;
+  border-left: 3px solid #E8A33D;
+  color: var(--text-muted);
+}
+.message a { color: #7EB8FF; }
+.message hr { border: none; border-top: 1px solid rgba(255,255,255,0.12); margin: 10px 0; }
+
 /* Approval banner */
 #approval-banner, .approval-banner {
   align-self: center;

@@ -33,40 +33,91 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 
-/// Map a Phoenix `role` string to our internal [`Role`].
+/// Map a Phoenix `role` string to our internal [`Role`]. `tool` has no first-class
+/// turn — it is folded into a user turn by [`to_chat_turns`].
 fn map_role(role: &str) -> Option<Role> {
     match role {
         "system" => Some(Role::System),
         "user" => Some(Role::User),
         "assistant" => Some(Role::Assistant),
-        // `tool` messages carry tool results; M2 renders them as a user-turn
-        // observation so the model can continue. M3 (tool-calling) will handle
-        // these explicitly.
         _ => None,
     }
 }
 
+/// Serialize an assistant turn's structured tool calls back into the text form
+/// the model was trained to emit, so multi-turn tool loops show the model its
+/// own previous requests: `<tool_call>{"name":…,"arguments":{…}}</tool_call>`.
+fn render_tool_calls_text(calls: &[ToolCall]) -> String {
+    let mut s = String::new();
+    for c in calls {
+        // `arguments` is a JSON string on the wire; re-embed it as an object so
+        // the call reads exactly like a fresh model emission. Unparseable
+        // arguments ride through verbatim (better a faithful odd call than a
+        // dropped one).
+        let args: serde_json::Value = serde_json::from_str(&c.function.arguments)
+            .unwrap_or_else(|_| serde_json::Value::String(c.function.arguments.clone()));
+        s.push_str(&format!(
+            "\n<tool_call>\n{{\"name\": \"{}\", \"arguments\": {}}}\n</tool_call>",
+            c.function.name, args
+        ));
+    }
+    s
+}
+
 /// Convert Phoenix chat messages into ChatML turns.
 ///
-/// `tool`-role messages (tool results) are folded into a synthetic user turn
-/// labelled with the tool name, so the model sees the result as context.
+/// - Assistant turns carrying `tool_calls` get them re-rendered into the text
+///   stream (the model must see its own past requests to continue a tool loop).
+/// - `tool`-role messages (tool results) are folded into a user turn wrapped in
+///   `<tool_response>` tags — the format Qwen3/Qwen3.5 are trained on for tool
+///   results.
 pub fn to_chat_turns(messages: &[crate::server::protocol::ChatMessage]) -> Vec<ChatTurn> {
     let mut turns = Vec::with_capacity(messages.len());
     for m in messages {
         match map_role(&m.role) {
-            Some(role) => turns.push(ChatTurn {
-                role,
-                content: m.content.clone(),
-            }),
+            Some(role) => {
+                let mut content = m.content.clone();
+                if let Some(tc) = &m.tool_calls {
+                    content.push_str(&render_tool_calls_text(tc));
+                }
+                turns.push(ChatTurn { role, content });
+            }
             None => {
-                // role == "tool": render as a user observation.
+                // role == "tool": render as a Qwen3-style tool response riding
+                // in a user turn.
                 let label = m.tool.as_deref().unwrap_or("tool");
                 turns.push(ChatTurn {
                     role: Role::User,
-                    content: format!("[tool result from {label}]\n{}", m.content),
+                    content: format!(
+                        "<tool_response>\n[{label}]\n{}\n</tool_response>",
+                        m.content
+                    ),
                 });
             }
         }
+    }
+    turns
+}
+
+/// Merge the rendered tools section into the conversation's first system turn
+/// (inserting one when no system turn exists). Passing it as `default_system`
+/// instead would silently drop it whenever the caller sends its own system
+/// prompt — which Phoenix always does, leaving the model with no idea how to
+/// format tool calls.
+pub fn merge_tools_into_turns(turns: Vec<ChatTurn>, tools_section: &str) -> Vec<ChatTurn> {
+    if tools_section.is_empty() {
+        return turns;
+    }
+    let mut turns = turns;
+    match turns.iter_mut().find(|t| matches!(t.role, Role::System)) {
+        Some(sys) => {
+            sys.content.push_str("\n\n");
+            sys.content.push_str(tools_section);
+        }
+        None => turns.insert(
+            0,
+            ChatTurn { role: Role::System, content: tools_section.to_string() },
+        ),
     }
     turns
 }
@@ -112,24 +163,25 @@ pub async fn generate_events(
     //    template the model's architecture was trained on (ChatML for Qwen,
     //    Gemma/Phi3/GLM4/Llama3/Mistral for their families — `llama` is
     //    disambiguated from the tokenizer's special tokens).
-    //    If tools were supplied, render them into the system prompt (Hermes
-    //    format) so the model knows how to emit calls.
-    let turns = to_chat_turns(&req.messages);
+    //    If tools were supplied, their section is MERGED INTO the first system
+    //    turn (or a system turn is inserted when none exists). Passing it as
+    //    `default_system` instead would silently drop it whenever the caller
+    //    sends its own system prompt — which Phoenix always does, leaving the
+    //    model with no idea how to format tool calls.
+    let mut turns = to_chat_turns(&req.messages);
     if turns.is_empty() {
         return Err(Error::InvalidInput("chat request has no messages".into()));
+    }
+    let has_tools = !req.tools.is_empty();
+    if has_tools {
+        let tools_section = crate::server::tools::render_tools_section(&req.tools);
+        turns = merge_tools_into_turns(turns, &tools_section);
     }
     let template = {
         let replica = handle.replica().lock().unwrap();
         pick_template(&replica.arch, &replica.tokenizer)
     };
-    let tools_section = crate::server::tools::render_tools_section(&req.tools);
-    let system = if tools_section.is_empty() {
-        None
-    } else {
-        Some(tools_section.leak() as &'static str)
-    };
-    let prompt = format_chat_prompt(template, &turns, system);
-    let has_tools = !req.tools.is_empty();
+    let prompt = format_chat_prompt(template, &turns, None);
 
     // 3. Sampler params + stop condition. No max-tokens cap — AmberCore is fully
     //    local, so generation runs until the model's natural EOS / `<|im_end|>`
@@ -555,8 +607,70 @@ mod tests {
         let turns = to_chat_turns(&msgs);
         assert_eq!(turns.len(), 1);
         assert!(matches!(turns[0].role, Role::User));
-        assert!(turns[0].content.contains("list_dir"));
+        // Qwen3-native tool-response wrapper (what the model was trained on).
+        assert!(turns[0].content.contains("<tool_response>"));
+        assert!(turns[0].content.contains("[list_dir]"));
         assert!(turns[0].content.contains("ls output here"));
+        assert!(turns[0].content.contains("</tool_response>"));
+    }
+
+    #[test]
+    fn to_chat_turns_renders_assistant_tool_calls() {
+        // A multi-turn tool loop must show the model its own past requests.
+        let msgs = vec![ChatMessage {
+            role: "assistant".into(),
+            content: "Let me check.".into(),
+            tool_calls: Some(vec![ToolCall {
+                id: None,
+                function: crate::server::protocol::FunctionRef {
+                    name: "run_command".into(),
+                    arguments: r#"{"command":"cargo test"}"#.into(),
+                },
+            }]),
+            tool: None,
+        }];
+        let turns = to_chat_turns(&msgs);
+        assert_eq!(turns.len(), 1);
+        assert!(matches!(turns[0].role, Role::Assistant));
+        assert!(turns[0].content.contains("Let me check."));
+        assert!(turns[0].content.contains("<tool_call>"));
+        // Arguments ride as a JSON object, exactly like a fresh emission.
+        assert!(turns[0].content.contains("\"name\": \"run_command\""));
+        assert!(turns[0].content.contains("\"arguments\": {\"command\":\"cargo test\"}"));
+        assert!(turns[0].content.contains("</tool_call>"));
+    }
+
+    #[test]
+    fn merge_tools_into_existing_system_turn() {
+        // Phoenix always sends a system prompt — the tools section must be
+        // APPENDED to it, not replace it and not get dropped.
+        let msgs = vec![ChatMessage {
+            role: "system".into(),
+            content: "You are Phoenix Agent.".into(),
+            tool_calls: None,
+            tool: None,
+        }];
+        let turns = merge_tools_into_turns(to_chat_turns(&msgs), "# Tools\n<tools>…</tools>");
+        assert_eq!(turns.len(), 1);
+        assert!(matches!(turns[0].role, Role::System));
+        assert!(turns[0].content.starts_with("You are Phoenix Agent."));
+        assert!(turns[0].content.contains("# Tools"));
+        assert!(turns[0].content.contains("<tools>"));
+    }
+
+    #[test]
+    fn merge_tools_inserts_system_when_none() {
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            tool_calls: None,
+            tool: None,
+        }];
+        let turns = merge_tools_into_turns(to_chat_turns(&msgs), "# Tools\n<tools>…</tools>");
+        assert_eq!(turns.len(), 2);
+        assert!(matches!(turns[0].role, Role::System));
+        assert!(turns[0].content.contains("# Tools"));
+        assert!(matches!(turns[1].role, Role::User));
     }
 
     #[test]

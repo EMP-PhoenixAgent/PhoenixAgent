@@ -3,10 +3,12 @@
 //! Phoenix sends OpenAI-style `tools` definitions and expects structured
 //! `tool_calls` back — it does NOT parse tool calls from text. Since candle
 //! gives us only raw forward passes (no native function-calling layer), AmberCore
-//! implements a **text-protocol shim** using the **Hermes format** that Qwen2.5
-//! and Qwen3 models are trained on:
+//! implements a **text-protocol shim** using the format the Qwen family is
+//! trained on (Qwen3/Qwen3.5's native tool template, which shares the Hermes
+//! `<tool_call>` emission with Qwen2.5):
 //!
-//! - Tools are described in the system prompt, including their JSON Schemas.
+//! - Tools are described in the system prompt with their full JSON Schemas,
+//!   inside `<tools></tools>` tags.
 //! - The model is told to emit any tool call as:
 //!   ```text
 //!   <tool_call>
@@ -17,9 +19,8 @@
 //!   into the structured [`ToolCall`] field Phoenix expects, leaving only the
 //!   non-tool-call text in the streamed content.
 //!
-//! This is the standard approach vLLM/Ollama use for Qwen models (the
-//! `--tool-call-parser hermes` flag), so Phoenix's existing Qwen2.5-Coder models
-//! will work with AmberCore unchanged.
+//! This is the same approach vLLM/Ollama use for Qwen models (the
+//! `--tool-call-parser hermes` flag).
 
 use crate::server::protocol::{FunctionRef, ToolCall, ToolDef};
 
@@ -28,46 +29,43 @@ const TOOL_CLOSE: &str = "</tool_call>";
 
 /// Render the tool-calling instructions + tool definitions for the system prompt.
 ///
-/// Produces a `## Tools` section that (a) describes the Hermes emit format and
-/// (b) lists each tool with its full JSON Schema so the model knows the exact
-/// argument shapes. Phoenix's own prompt renders only name/description (it
-/// carries schemas out-of-band via the API), but since AmberCore is the model
-/// server, we render the schema here.
+/// Produces the `# Tools` section the Qwen3/Qwen3.5 chat template injects when
+/// tools are present: each tool's full JSON Schema is listed inside
+/// `<tools></tools>` tags, and the `<tool_call>` emission format is spelled out.
+/// Qwen2.5 (Hermes-style) understands the same emission format, so this works
+/// for the whole Qwen fleet Phoenix ships.
 pub fn render_tools_section(tools: &[ToolDef]) -> String {
     if tools.is_empty() {
         return String::new();
     }
     let mut s = String::new();
-    s.push_str("## Tools\n");
+    s.push_str("# Tools\n\n");
     s.push_str(
-        "You have access to the following tools. To call one, emit ONLY a block wrapped in \
-         <tool_call></tool_call> tags containing a JSON object with \"name\" and \"arguments\" \
-         fields, and nothing else. Example:\n\
-         <tool_call>\n\
-         {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n\
-         </tool_call>\n\n",
+        "You may call one or more functions to assist with the user query.\n\n\
+         You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n",
     );
     for tool in tools {
         let f = &tool.function;
-        s.push_str(&format!("- {}:", f.name));
-        if !f.description.is_empty() {
-            s.push_str(&format!(" {}", f.description));
-        }
+        let schema = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": f.name,
+                "description": f.description,
+                "parameters": f.parameters,
+            }
+        });
+        s.push_str(&schema.to_string());
         s.push('\n');
-        // Render the parameters schema as pretty JSON so the model sees exact
-        // argument names + types.
-        if let Ok(pretty) = serde_json::to_string_pretty(&f.parameters) {
-            s.push_str(&format!("  parameters:\n{}\n", indent(&pretty, "  ")));
-        }
     }
+    s.push_str(
+        "</tools>\n\n\
+         For each function call, return a json object with function name and \
+         arguments within <tool_call></tool_call> XML tags:\n\
+         <tool_call>\n\
+         {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n\
+         </tool_call>\n",
+    );
     s
-}
-
-fn indent(text: &str, prefix: &str) -> String {
-    text.lines()
-        .map(|l| format!("{prefix}{l}"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// A tool call extracted from the model's generated text, plus the surrounding
@@ -127,8 +125,19 @@ pub fn parse_tool_calls(text: &str) -> ParsedOutput {
 }
 
 /// Parse one inner JSON object `{"name": ..., "arguments": ...}` into a [`ToolCall`].
+///
+/// Lenient about trailing commas (quantized models emit them occasionally):
+/// a strict parse is tried first, then a retry with every `,}` / `,]` collapsed
+/// to `}` / `]`.
 fn parse_one_call(inner: &str) -> Option<ToolCall> {
-    let v: serde_json::Value = serde_json::from_str(inner).ok()?;
+    let parsed: Option<serde_json::Value> = match serde_json::from_str(inner) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            let cleaned = inner.replace(",}", "}").replace(",]", "]");
+            serde_json::from_str(&cleaned).ok()
+        }
+    };
+    let v = parsed?;
     let name = v.get("name")?.as_str()?.to_string();
     // arguments may be an object or already a string; normalize to a JSON string.
     let arguments = match v.get("arguments") {
@@ -172,10 +181,25 @@ mod tests {
             json!({"type": "object", "properties": {"city": {"type": "string"}}}),
         )];
         let s = render_tools_section(&tools);
-        assert!(s.contains("## Tools"));
-        assert!(s.contains("- get_weather: Get the weather for a city."));
+        // Qwen3-native tool section shape.
+        assert!(s.contains("# Tools"));
+        assert!(s.contains("<tools>"));
+        assert!(s.contains("\"name\":\"get_weather\""));
+        assert!(s.contains("Get the weather for a city."));
         assert!(s.contains("\"city\""));
         assert!(s.contains("<tool_call>"));
+        assert!(s.contains("</tools>"));
+    }
+
+    #[test]
+    fn parse_trailing_comma_tool_call() {
+        // Quantized models occasionally emit trailing commas; the parser must
+        // recover the call instead of dropping it.
+        let text = "<tool_call>{\"name\":\"f\",\"arguments\":{\"x\":1,}}</tool_call>";
+        let out = parse_tool_calls(text);
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].function.name, "f");
+        assert_eq!(out.tool_calls[0].function.arguments, "{\"x\":1}");
     }
 
     #[test]
