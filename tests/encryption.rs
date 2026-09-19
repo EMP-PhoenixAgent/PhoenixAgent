@@ -334,7 +334,7 @@ fn launch_unlock_uses_wrapped_key() {
     } // DB created + closed.
 
     // Wrap the DB key under the launch password and persist the bundle.
-    let bundle = KeyBundle::create(&db_key, "user-launch-pw").expect("create bundle");
+    let bundle = KeyBundle::create(&db_key, "user-launch-pw", None).expect("create bundle");
     bundle.save(&bundle_path).expect("save bundle");
 
     // Reload the bundle and unwrap with the launch password → must open the DB.
@@ -359,9 +359,9 @@ fn change_launch_rewraps_not_rekeys() {
     let db_key: DerivedKey =
         derive_key("PhoenixAgent", &salt, None).expect("db key");
 
-    let mut bundle = KeyBundle::create(&db_key, "launch-old").expect("bundle");
+    let mut bundle = KeyBundle::create(&db_key, "launch-old", None).expect("bundle");
     // Change the launch password.
-    bundle.change_primary(&db_key, "launch-new").expect("change");
+    bundle.change_primary(&db_key, None, "launch-new").expect("change");
     // Old password no longer works.
     assert!(bundle.unwrap_primary("launch-old").is_err());
     // New password unwraps the SAME db key — no rekey happened.
@@ -620,3 +620,82 @@ async fn mcp_connect_failure_returns_error() {
 }
 
 
+
+/// Phase C: the capsule key wraps ride in the same bundle as the DB key —
+/// one launch password opens both, a password change re-wraps both, and the
+/// 2FA recovery path can open the capsule too.
+#[test]
+fn capsule_wrap_round_trip() {
+    let salt = phoenix_agent::crypto::random_salt();
+    let db_key: DerivedKey = derive_key("PhoenixAgent", &salt, None).expect("db key");
+    let capsule_key = phoenix_agent::crypto::random_key();
+
+    let mut bundle =
+        KeyBundle::create(&db_key, "launch-pw", Some(&capsule_key)).expect("bundle");
+    assert!(bundle.has_capsule_key());
+    // Same password unwraps the SAME capsule key.
+    let unwrapped = bundle.unwrap_capsule_key("launch-pw").expect("unwrap capsule");
+    assert_eq!(unwrapped, capsule_key);
+    // Wrong password fails cleanly (GCM tag), never yields garbage.
+    assert!(bundle.unwrap_capsule_key("wrong").is_err());
+    // No wrap → no unwrap.
+    let bare = KeyBundle::create(&db_key, "launch-pw", None).expect("bare");
+    assert!(!bare.has_capsule_key());
+    assert!(bare.unwrap_capsule_key("launch-pw").is_err());
+
+    // Password change re-wraps BOTH; old password opens neither.
+    bundle
+        .change_primary(&db_key, Some(&capsule_key), "launch-new")
+        .expect("change");
+    assert!(bundle.unwrap_primary("launch-pw").is_err());
+    assert!(bundle.unwrap_capsule_key("launch-pw").is_err());
+    assert_eq!(bundle.unwrap_capsule_key("launch-new").expect("new"), capsule_key);
+    assert_eq!(
+        bundle.unwrap_primary("launch-new").expect("db").to_hex(),
+        db_key.to_hex()
+    );
+
+    // Text round-trip (the v2 tail header IS this text).
+    let text = bundle.to_text().expect("text");
+    let parsed = KeyBundle::parse(&text).expect("parse");
+    assert_eq!(parsed.unwrap_capsule_key("launch-new").expect("p"), capsule_key);
+}
+
+/// 2FA recovery must open the capsule key as well as the DB key — and a DB
+/// rekey (which refreshes the DB recovery wrap) must NOT invalidate the
+/// capsule recovery wrap (shared recovery salt).
+#[test]
+fn capsule_recovery_wrap_and_rekey() {
+    let salt = phoenix_agent::crypto::random_salt();
+    let db_key: DerivedKey = derive_key("PhoenixAgent", &salt, None).expect("db key");
+    let new_db_key: DerivedKey = derive_key("rotated", &salt, None).expect("new db key");
+    let capsule_key = phoenix_agent::crypto::random_key();
+
+    let mut bundle =
+        KeyBundle::create(&db_key, "launch-pw", Some(&capsule_key)).expect("bundle");
+
+    // Enable 2FA: recovery wraps for both keys under the TOTP seed.
+    let seed = totp_lib::generate("tester").expect("totp").to_setup().secret_b32;
+    bundle.set_recovery(&db_key, &seed).expect("set recovery");
+    bundle.set_recovery_capsule(&capsule_key).expect("set capsule recovery");
+    assert_eq!(bundle.unwrap_capsule_recovery().expect("rec"), capsule_key);
+    assert_eq!(
+        bundle.unwrap_recovery().expect("rec db").to_hex(),
+        db_key.to_hex()
+    );
+
+    // DB rekey: rewrap the DB key under the launch password + refresh the DB
+    // recovery wrap — the capsule wraps must ride along untouched.
+    bundle
+        .rewrap_for_new_db_key(&new_db_key, "launch-pw")
+        .expect("rewrap");
+    assert_eq!(
+        bundle.unwrap_capsule_key("launch-pw").expect("primary capsule"),
+        capsule_key
+    );
+    assert_eq!(bundle.unwrap_capsule_recovery().expect("recovery capsule"), capsule_key);
+    assert_eq!(
+        bundle.unwrap_recovery().expect("recovery db").to_hex(),
+        new_db_key.to_hex()
+    );
+}
