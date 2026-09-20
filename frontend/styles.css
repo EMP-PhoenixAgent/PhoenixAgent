@@ -3146,6 +3146,15 @@ select option {
   transition: opacity 0.15s ease, width 0.15s ease, box-shadow 0.15s ease;
 }
 .session-dash:hover { opacity: 0.95; }
+/* The LIVE session's dash: amber, always lit, not clickable. */
+.session-dash.live {
+  background: #E8A33D;
+  opacity: 0.85;
+  cursor: default;
+  height: 4px;
+  margin-bottom: 4px;
+}
+.session-dash.live:hover { opacity: 0.85; }
 /* A dash whose session view is open stays lit and grows a little. */
 .session-dash.active {
   opacity: 1;

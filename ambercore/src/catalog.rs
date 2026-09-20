@@ -128,13 +128,17 @@ impl Catalog {
         self.entries.get(tag)
     }
 
-    /// Look up an entry tolerating the two spellings the ecosystem produces:
+    /// Look up an entry tolerating the spellings the ecosystem produces:
     /// Phoenix registers pulled models under the bare file stem
     /// (`gemma-4-E2B-it-Q4_K_M`) while the directory scan derives
-    /// `<stem>:latest`. Resolution tries the exact tag, then the stem before
-    /// the first `:`, then `tag:latest` (when the tag has no `:`). Returns the
-    /// entry and the canonical registered tag — used to key replica pools so
-    /// alias spellings share one pool.
+    /// size-suffixed tags (`Qwen3.5:4b`) or `<stem>:latest`. Resolution tries
+    /// the exact tag, then the stem before the first `:`, then `tag:latest`
+    /// (when the tag has no `:`), and finally a case-insensitive match on the
+    /// underlying FILE STEM — stable across pull-registered and scan-derived
+    /// spellings, so an emptied manifest (or a renamed file) still resolves
+    /// the model the config asks for. Returns the entry and the canonical
+    /// registered tag — used to key replica pools so alias spellings share
+    /// one pool.
     pub fn resolve(&self, tag: &str) -> Option<(&CatalogEntry, String)> {
         if let Some(entry) = self.entries.get(tag) {
             return Some((entry, tag.to_string()));
@@ -145,6 +149,14 @@ impl Catalog {
             }
         } else if let Some(entry) = self.entries.get(&format!("{tag}:latest")) {
             return Some((entry, format!("{tag}:latest")));
+        }
+        let wanted = normalize_stem(tag);
+        if !wanted.is_empty() {
+            for (key, entry) in &self.entries {
+                if normalize_stem(&entry.file) == wanted {
+                    return Some((entry, key.clone()));
+                }
+            }
         }
         None
     }
@@ -248,6 +260,19 @@ fn insert_scanned(
         None => filename.to_string(),
     };
     entries.insert(tag.clone(), CatalogEntry { tag, file, arch: None });
+}
+
+/// Lowercased GGUF file stem shared by a request name and a catalog entry's
+/// `file` path — the common denominator between pull-registered names
+/// (`Qwen3.5-4B-Q4_K_M`) and scan-derived tags (`Qwen3.5:4b`, whose `file` is
+/// `Qwen3.5-4B-Q4_K_M/Qwen3.5-4B-Q4_K_M.gguf`). Used by [`Catalog::resolve`]'s
+/// final fallback.
+fn normalize_stem(name_or_tag: &str) -> String {
+    // Strip a `:tag` suffix from the REQUEST side; the `file` side is a path.
+    let base = name_or_tag.split(':').next().unwrap_or(name_or_tag);
+    let file_name = base.rsplit(['/', '\\']).next().unwrap_or(base);
+    let stem = file_name.strip_suffix(".gguf").unwrap_or(file_name);
+    stem.trim().to_lowercase()
 }
 
 /// Derive an Ollama-style tag from a GGUF filename stem.

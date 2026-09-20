@@ -2224,7 +2224,17 @@ async function refreshSessionRail() {
   }
   const viewable = sessionSummaries.slice(1); // [0] is the live session
   sessionRail.innerHTML = "";
-  sessionRail.hidden = viewable.length === 0;
+  // The LIVE session rides at the top as an amber, non-clickable dash — the
+  // trail must be visible from the very first conversation (and the upcoming
+  // log system anchors on the rail), not only once past sessions exist.
+  const live = sessionSummaries[0];
+  if (live) {
+    const liveDash = document.createElement("div");
+    liveDash.className = "session-dash live";
+    liveDash.title = `${live.title} · current session`;
+    sessionRail.appendChild(liveDash);
+  }
+  sessionRail.hidden = !live && viewable.length === 0;
   for (const s of viewable) {
     const dash = document.createElement("div");
     dash.className = `session-dash ${sessionDashClass(s)}`.trim();

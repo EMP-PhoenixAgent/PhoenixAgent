@@ -93,9 +93,22 @@ fn driver_cuda_version() -> Option<String> {
     None
 }
 
+/// Whether an error string is a CUDA out-of-memory failure (the driver's
+/// exact marker, so host-RAM OOMs don't false-positive).
+pub fn is_cuda_oom(err: &str) -> bool {
+    err.contains("CUDA_ERROR_OUT_OF_MEMORY")
+}
+
 /// Expand a CUDA driver-mismatch error into an actionable message. Returns the
 /// original text unchanged for unrelated errors.
 pub fn translate_cuda_error(err: &str) -> String {
+    if is_cuda_oom(err) {
+        return format!(
+            "{err}\n\nNot enough GPU memory: another app (or a leftover model) may be \
+             holding VRAM. Close GPU-heavy apps or restart Phoenix Agent, then try \
+             again — or use a smaller quant of the model."
+        );
+    }
     let ptx = err.contains("UNSUPPORTED_PTX_VERSION") || err.contains("unsupported toolchain");
     let no_binary = err.contains("NO_BINARY_FOR_GPU") || err.contains("no kernel image");
     if !ptx && !no_binary {

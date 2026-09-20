@@ -9,6 +9,7 @@
 //! can reconstruct it from the GGUF's inline `tokenizer.ggml.*` metadata.
 
 use crate::error::{Error, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
@@ -18,12 +19,112 @@ pub struct Encoded {
     pub ids: Vec<u32>,
 }
 
-/// A loaded tokenizer. Owns the underlying HF tokenizer.
-#[derive(Debug)]
+/// The RWKV "world" tokenizer: a greedy longest-match byte trie over the
+/// GGUF's embedded `tokenizer.ggml.tokens` vocab (model `"rwkv"`). The HF
+/// `tokenizer.json` ports of this vocab segment text DIFFERENTLY (they are
+/// Unigram/BPE models, not the reference trie), which silently feeds the
+/// model foreign ids — so for rwkv models the embedded vocab is authoritative.
+pub struct RwkvWorldTokenizer {
+    /// Vocab bytes by id (id 0 is the unmatched-byte fallback).
+    vocab: Vec<Vec<u8>>,
+    /// Reverse lookup for special-token queries.
+    by_string: HashMap<String, u32>,
+    /// Trie nodes (arena). Node 0 is the root.
+    children: Vec<HashMap<u8, usize>>,
+    /// Token id terminating each node, if any.
+    terminal: Vec<Option<u32>>,
+}
+
+impl RwkvWorldTokenizer {
+    /// Build from the GGUF's `tokenizer.ggml.tokens` string array.
+    pub fn from_tokens(tokens: Vec<String>) -> Self {
+        let mut vocab: Vec<Vec<u8>> = Vec::with_capacity(tokens.len());
+        let mut by_string = HashMap::new();
+        let mut children: Vec<HashMap<u8, usize>> = vec![HashMap::new()];
+        let mut terminal: Vec<Option<u32>> = vec![None];
+        for (id, tok) in tokens.iter().enumerate() {
+            let bytes = tok.as_bytes().to_vec();
+            vocab.push(bytes.clone());
+            by_string.insert(tok.clone(), id as u32);
+            // Insert into the trie.
+            let mut node = 0usize;
+            for &b in &bytes {
+                let next = children[node].get(&b).copied();
+                let next = match next {
+                    Some(n) => n,
+                    None => {
+                        children.push(HashMap::new());
+                        terminal.push(None);
+                        let n = children.len() - 1;
+                        children[node].insert(b, n);
+                        n
+                    }
+                };
+                node = next;
+            }
+            terminal[node] = Some(id as u32);
+        }
+        Self { vocab, by_string, children, terminal }
+    }
+
+    /// Greedy longest-match encode (the reference RWKV_TOKENIZER algorithm):
+    /// at each byte position take the longest vocab entry that matches; an
+    /// unmatched byte falls back to id 0 (the vocab's byte token).
+    pub fn encode_bytes(&self, text: &[u8]) -> Vec<u32> {
+        let mut ids = Vec::new();
+        let mut i = 0usize;
+        while i < text.len() {
+            let mut node = 0usize;
+            let mut last_match: Option<(usize, u32)> = None; // (end offset, id)
+            let mut j = i;
+            while j < text.len() {
+                let Some(&next) = self.children[node].get(&text[j]) else {
+                    break;
+                };
+                node = next;
+                j += 1;
+                if let Some(id) = self.terminal[node] {
+                    last_match = Some((j, id));
+                }
+            }
+            match last_match {
+                Some((end, id)) => {
+                    ids.push(id);
+                    i = end;
+                }
+                None => {
+                    ids.push(0);
+                    i += 1;
+                }
+            }
+        }
+        ids
+    }
+}
+
+/// A loaded tokenizer: the HF `tokenizers` crate, or the RWKV world trie
+/// built from GGUF metadata.
 pub struct TokenizerWrapper {
-    pub inner: Tokenizer,
+    inner: TokenizerInner,
     /// Vocab size (best-effort; from the tokenizer's vocab).
     pub vocab_size: usize,
+}
+
+enum TokenizerInner {
+    Hf(Tokenizer),
+    Rwkv(RwkvWorldTokenizer),
+}
+
+impl std::fmt::Debug for TokenizerWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenizerWrapper")
+            .field("vocab_size", &self.vocab_size)
+            .field("kind", &match self.inner {
+                TokenizerInner::Hf(_) => "hf",
+                TokenizerInner::Rwkv(_) => "rwkv-world",
+            })
+            .finish()
+    }
 }
 
 impl TokenizerWrapper {
@@ -32,7 +133,50 @@ impl TokenizerWrapper {
         let inner = Tokenizer::from_file(path)
             .map_err(|e| Error::Tokenizer(format!("load {}: {e}", path.display())))?;
         let vocab_size = inner.get_vocab_size(false);
-        Ok(Self { inner, vocab_size })
+        Ok(Self { inner: TokenizerInner::Hf(inner), vocab_size })
+    }
+
+    /// Whether a GGUF metadata map names the embedded RWKV world tokenizer
+    /// (`tokenizer.ggml.model == "rwkv"`) — in which case the embedded vocab
+    /// is authoritative and no external tokenizer.json should be used.
+    pub fn is_rwkv_world(metadata: &HashMap<String, candle_core::quantized::gguf_file::Value>) -> bool {
+        metadata
+            .get("tokenizer.ggml.model")
+            .and_then(|v| match v {
+                candle_core::quantized::gguf_file::Value::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .map(|s| s == "rwkv")
+            .unwrap_or(false)
+    }
+
+    /// Build the RWKV world tokenizer from a GGUF metadata map.
+    pub fn from_rwkv_metadata(
+        metadata: &HashMap<String, candle_core::quantized::gguf_file::Value>,
+    ) -> Result<Self> {
+        let tokens = metadata
+            .get("tokenizer.ggml.tokens")
+            .and_then(|v| match v {
+                candle_core::quantized::gguf_file::Value::Array(a) => Some(a),
+                _ => None,
+            })
+            .ok_or_else(|| Error::Tokenizer("rwkv GGUF has no tokenizer.ggml.tokens".into()))?;
+        let tokens: Vec<String> = tokens
+            .iter()
+            .map(|v| {
+                match v {
+                    candle_core::quantized::gguf_file::Value::String(s) => Ok(s.clone()),
+                    _ => Err(Error::Tokenizer(
+                        "tokenizer.ggml.tokens contains a non-string".into(),
+                    )),
+                }
+            })
+            .collect::<Result<_>>()?;
+        let vocab_size = tokens.len();
+        Ok(Self {
+            inner: TokenizerInner::Rwkv(RwkvWorldTokenizer::from_tokens(tokens)),
+            vocab_size,
+        })
     }
 
     /// Resolve the tokenizer path for a given GGUF. Tries, in order:
@@ -59,7 +203,19 @@ impl TokenizerWrapper {
     }
 
     /// Load the tokenizer for a GGUF, using [`resolve_next_to`]'s lookup order.
+    /// RWKV world GGUFs embed the authoritative vocab (see
+    /// [`Self::is_rwkv_world`]) and are served from the GGUF header itself.
     pub fn load_next_to(gguf_path: &Path) -> Result<Self> {
+        // Embedded RWKV world vocab wins when present.
+        if gguf_path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("gguf")).unwrap_or(false) {
+            if let Ok(mut file) = std::fs::File::open(gguf_path) {
+                if let Ok(content) = candle_core::quantized::gguf_file::Content::read(&mut file) {
+                    if Self::is_rwkv_world(&content.metadata) {
+                        return Self::from_rwkv_metadata(&content.metadata);
+                    }
+                }
+            }
+        }
         let path = Self::resolve_next_to(gguf_path).ok_or_else(|| {
             Error::Tokenizer(format!(
                 "no tokenizer found for {} (place a `<stem>.tokenizer.json` or \
@@ -72,25 +228,44 @@ impl TokenizerWrapper {
 
     /// Encode a text prompt into token ids.
     pub fn encode(&self, text: &str) -> Result<Encoded> {
-        let enc = self
-            .inner
-            .encode(text, true)
-            .map_err(|e| Error::Tokenizer(format!("encode: {e}")))?;
-        Ok(Encoded {
-            ids: enc.get_ids().to_vec(),
-        })
+        let ids = match &self.inner {
+            TokenizerInner::Hf(t) => t
+                .encode(text, true)
+                .map_err(|e| Error::Tokenizer(format!("encode: {e}")))?
+                .get_ids()
+                .to_vec(),
+            TokenizerInner::Rwkv(t) => t.encode_bytes(text.as_bytes()),
+        };
+        Ok(Encoded { ids })
     }
 
     /// Decode a slice of token ids back to text.
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
-        self.inner
-            .decode(ids, true)
-            .map_err(|e| Error::Tokenizer(format!("decode: {e}")))
+        match &self.inner {
+            TokenizerInner::Hf(t) => t
+                .decode(ids, true)
+                .map_err(|e| Error::Tokenizer(format!("decode: {e}"))),
+            TokenizerInner::Rwkv(t) => {
+                let mut bytes = Vec::new();
+                for &id in ids {
+                    match t.vocab.get(id as usize) {
+                        Some(b) => bytes.extend_from_slice(b),
+                        None => {
+                            return Err(Error::Tokenizer(format!("decode: unknown id {id}")));
+                        }
+                    }
+                }
+                Ok(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        }
     }
 
     /// Look up a special-token id by string (e.g. `"<|endoftext|>"`).
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
-        self.inner.token_to_id(token)
+        match &self.inner {
+            TokenizerInner::Hf(t) => t.token_to_id(token),
+            TokenizerInner::Rwkv(t) => t.by_string.get(token).copied(),
+        }
     }
 }
 
@@ -281,6 +456,10 @@ pub enum ChatTemplate {
     /// `]~b]system/user/ai … [e~[` — MiniMax M2's punctuation-soup tokens
     /// (each is a single vocab entry, not a typo).
     MiniMax,
+    /// Plain-text turns (`User: …` / `Assistant: …`, blank-line separated) —
+    /// the RWKV world chat format (RWKV6/7 world + chat finetunes; no special
+    /// tokens).
+    RwkvWorld,
 }
 
 impl ChatTemplate {
@@ -298,6 +477,7 @@ impl ChatTemplate {
             // `<|im_middle|>`, DeepSeek does not (see [`pick_template`]).
             "deepseek2" | "deepseek32" | "kimi_k2" => ChatTemplate::DeepSeek,
             "minimax-m2" => ChatTemplate::MiniMax,
+            "rwkv7" => ChatTemplate::RwkvWorld,
             // qwen2/qwen2_v2/qwen3/qwen3moe/phi2/starcoder2/internlm2/lfm2/
             // nemotron + default — nemotron is disambiguated from the
             // tokenizer like `llama` (see [`pick_template`]).
@@ -357,6 +537,7 @@ pub fn format_chat_prompt(
         ChatTemplate::DeepSeek => format_deepseek_chat(turns, default_system),
         ChatTemplate::Kimi => format_kimi_chat(turns, default_system),
         ChatTemplate::MiniMax => format_minimax_chat(turns, default_system),
+        ChatTemplate::RwkvWorld => format_rwkv_world(turns, default_system),
     }
 }
 
@@ -612,9 +793,90 @@ fn format_minimax_chat(turns: &[ChatTurn], default_system: Option<&str>) -> Stri
     out
 }
 
+/// RWKV-7 "world" chat format: plain-text turns (`User: …\n\nAssistant: …\n\n`)
+/// with an optional plain-text system preamble. No special tokens — the
+/// model's eos (from the GGUF's `rwkv7.eos_token_id`) ends the turn.
+fn format_rwkv_world(turns: &[ChatTurn], default_system: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(sys) = system_text(turns, default_system) {
+        if !sys.trim().is_empty() {
+            out.push_str(sys.trim_end());
+            out.push_str("\n\n");
+        }
+    }
+    for turn in turns {
+        match turn.role {
+            Role::System => {}
+            Role::User => out.push_str(&format!("User: {}\n\n", turn.content)),
+            Role::Assistant => {
+                out.push_str(&format!("Assistant: {}\n\n", turn.content.trim_end()))
+            }
+        }
+    }
+    out.push_str("Assistant:");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rwkv_world_trie_greedy_longest_match() {
+        // Synthetic vocab: id 0 is the byte fallback, then progressively
+        // longer entries. Greedy longest-match must pick the longest.
+        let tok = RwkvWorldTokenizer::from_tokens(vec![
+            "<byte>".into(),  // 0: fallback
+            "a".into(),       // 1
+            "ab".into(),      // 2
+            "abc".into(),     // 3
+            " the".into(),    // 4
+            " th".into(),     // 5
+            "z".into(),       // 6
+        ]);
+        assert_eq!(tok.encode_bytes(b"abc"), vec![3]);
+        assert_eq!(tok.encode_bytes(b"abz"), vec![2, 6]);
+        assert_eq!(tok.encode_bytes(b"aab"), vec![1, 2]);
+        // Greedy takes " th" only when " the" doesn't extend further.
+        assert_eq!(tok.encode_bytes(b" the"), vec![4]);
+        // "i" is not in the vocab → unmatched-byte fallback (id 0).
+        assert_eq!(tok.encode_bytes(b" thi"), vec![5, 0]);
+        // Unmatched byte falls back to id 0.
+        assert_eq!(tok.encode_bytes(b"qz"), vec![0, 6]);
+        // Round-trip via the wrapper's decode path.
+        let wrapper = TokenizerWrapper {
+            inner: TokenizerInner::Rwkv(RwkvWorldTokenizer::from_tokens(vec![
+                "<byte>".into(),
+                "a".into(),
+                "b".into(),
+            ])),
+            vocab_size: 3,
+        };
+        assert_eq!(wrapper.decode(&[1, 2, 1]).unwrap(), "aba");
+    }
+
+    #[test]
+    fn rwkv_world_formats_plain_text_turns() {
+        let turns = vec![
+            ChatTurn { role: Role::System, content: "You are a helpful assistant.".into() },
+            ChatTurn { role: Role::User, content: "Hi".into() },
+            ChatTurn { role: Role::Assistant, content: "Hello!".into() },
+            ChatTurn { role: Role::User, content: "Bye".into() },
+        ];
+        let prompt = format_rwkv_world(&turns, None);
+        assert!(prompt.starts_with("You are a helpful assistant.
+
+User: Hi
+
+Assistant: Hello!
+
+User: Bye
+
+Assistant:"));
+        assert!(prompt.ends_with("Assistant:"));
+        // No special tokens anywhere.
+        assert!(!prompt.contains("<|"));
+    }
 
     #[test]
     fn chatml_formats_a_user_turn_with_default_system() {

@@ -46,6 +46,7 @@ pub mod qwen3;
 pub mod qwen3_moe;
 pub mod qwen35;
 pub mod registry;
+pub mod rwkv7;
 pub mod st_shim;
 
 pub use gguf::LoadedModel;

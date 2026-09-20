@@ -381,7 +381,8 @@ pub async fn generate_events(
             }
             Err(e) => {
                 tracing::warn!(error = %e, "generation failed mid-stream");
-                let _ = tx.blocking_send(GenEvent::Error(e.to_string()));
+                let friendly = crate::backend::translate_cuda_error(&e.to_string());
+                let _ = tx.blocking_send(GenEvent::Error(friendly));
             }
         }
     });

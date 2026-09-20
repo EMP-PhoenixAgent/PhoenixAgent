@@ -308,23 +308,83 @@ impl ServerState {
                 .meta_str(&format!("{arch}.context_length"))
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(4096);
-            let tokenizer = TokenizerWrapper::load_next_to(&gguf_path)?;
+            // RWKV world models embed their vocab in the GGUF and it is
+            // AUTHORITATIVE — the HF tokenizer.json ports segment text
+            // differently (foreign ids → word-salad output). Everyone else
+            // loads the sibling tokenizer.json as before.
+            let (tokenizer, eos_meta, eot_meta) = {
+                let metadata = &loaded
+                    .content
+                    .as_ref()
+                    .ok_or_else(|| Error::Model("GGUF content unavailable".into()))?
+                    .metadata;
+                let u32_of = |k: &str| {
+                    metadata.get(k).and_then(|v| match v {
+                        candle_core::quantized::gguf_file::Value::U32(n) => Some(*n),
+                        _ => None,
+                    })
+                };
+                let eot = u32_of("tokenizer.ggml.eot_token_id");
+                let eos = u32_of("tokenizer.ggml.eos_token_id");
+                if TokenizerWrapper::is_rwkv_world(metadata) {
+                    let t = TokenizerWrapper::from_rwkv_metadata(metadata)?;
+                    tracing::info!(
+                        "using the GGUF's embedded RWKV world tokenizer ({} tokens)",
+                        t.vocab_size
+                    );
+                    (t, eos, eot)
+                } else {
+                    (TokenizerWrapper::load_next_to(&gguf_path)?, eos, eot)
+                }
+            };
             let eos_meta = loaded
                 .meta_str(&format!("{arch}.eos_token_id"))
-                .and_then(|s| s.parse::<u32>().ok());
-            let model = build_model(&mut loaded, &device).map_err(|e| {
-                // Defense in depth: the backend constructor already warms up a
-                // kernel and rejects driver/toolkit skews with the translated
-                // message — this catches any CUDA error that still escapes a
-                // model build (e.g. arch-specific kernel gaps).
-                crate::error::Error::Model(crate::backend::translate_cuda_error(&e.to_string()))
-            })?;
+                .and_then(|s| s.parse::<u32>().ok())
+                .or(eos_meta);
+            // The pre-flight estimate said it fits, but the driver decides at
+            // allocation time — on a CUDA out-of-memory, fall back to CPU for
+            // THIS model (slower, but it runs) instead of failing the turn.
+            let mut device = device;
+            let model = match build_model(&mut loaded, &device) {
+                Ok(m) => m,
+                Err(e) => {
+                    let raw = e.to_string();
+                    if crate::backend::is_cuda_oom(&raw)
+                        && !matches!(device, candle_core::Device::Cpu)
+                    {
+                        tracing::warn!(
+                            tag = %tag_owned,
+                            "GPU build ran out of VRAM — retrying on CPU"
+                        );
+                        device = candle_core::Device::Cpu;
+                        build_model(&mut loaded, &device).map_err(|e| {
+                            crate::error::Error::Model(
+                                crate::backend::translate_cuda_error(&e.to_string()),
+                            )
+                        })?
+                    } else {
+                        // Defense in depth: the backend constructor already warms
+                        // up a kernel and rejects driver/toolkit skews with the
+                        // translated message — this catches any CUDA error that
+                        // still escapes a model build (e.g. arch-specific kernel
+                        // gaps).
+                        return Err(crate::error::Error::Model(
+                            crate::backend::translate_cuda_error(&raw),
+                        ));
+                    }
+                }
+            };
             // Stop tokens: the GGUF's own `<arch>.eos_token_id` plus the
             // per-architecture end-of-turn markers (absent tokens are skipped,
             // so a family's list can include markers only some models carry).
             let mut stop_tokens = Vec::new();
             if let Some(id) = eos_meta {
                 stop_tokens.push(id);
+            }
+            if let Some(id) = eot_meta {
+                if !stop_tokens.contains(&id) {
+                    stop_tokens.push(id);
+                }
             }
             for marker in arch_stop_markers(&arch) {
                 if let Some(id) = tokenizer.token_to_id(marker) {
@@ -440,6 +500,35 @@ impl ServerState {
         pools.remove(&canonical);
         if canonical != tag {
             pools.remove(tag);
+        }
+        Ok(())
+    }
+
+    /// Unload a model's pooled replicas WITHOUT touching the catalog or
+    /// `manifest.json` — the registration must survive restarts. Drops the
+    /// pool (releasing GGUF mmaps once in-flight generations finish); a later
+    /// acquire rebuilds it from the catalog. Phoenix's EXIT path uses this to
+    /// release file handles: calling [`Self::remove_model`] there instead
+    /// deregistered every model from the manifest on each exit, so the next
+    /// launch only saw scan-derived tags and the active model stopped
+    /// resolving.
+    pub async fn unload_model(&self, tag: &str) -> Result<()> {
+        let stem = tag.split(':').next().unwrap_or(tag).to_string();
+        let canonical = {
+            let cat = self.inner.catalog.lock().await;
+            cat.resolve(tag).map(|(_, c)| c).unwrap_or_else(|| tag.to_string())
+        };
+        let mut pools = self.inner.pools.lock().await;
+        pools.remove(&canonical);
+        if canonical != tag {
+            pools.remove(tag);
+        }
+        let with_latest = format!("{stem}:latest");
+        if with_latest != canonical && with_latest != tag {
+            pools.remove(&with_latest);
+        }
+        if stem != canonical && stem != tag {
+            pools.remove(&stem);
         }
         Ok(())
     }

@@ -85,6 +85,7 @@ pub const SUPPORTED_ARCHS: &[&str] = &[
     "qwen3",
     "qwen3moe",
     "qwen35",
+    "rwkv7",
     "llama",
     "mixtral",
     "gemma",
@@ -129,6 +130,9 @@ pub fn build(loaded: &mut LoadedModel, device: &Device) -> Result<Box<dyn DynMod
         // Qwen3.5 hybrid GDN — NOT qwen3-compatible (ssm_* tensors, fused
         // attn_qkv, post_attention_norm, no ffn_norm); own builder.
         "qwen35" => crate::model::qwen35::build(loaded, device),
+        // RWKV-7 "Goose" — pure-RNN linear attention (constant state per token;
+        // no KV cache at all). Hand-built from llama.cpp's rwkv7 reference.
+        "rwkv7" => crate::model::rwkv7::build(loaded, device),
         "llama" => crate::model::llama::build(loaded, device),
         "mixtral" => crate::model::mixtral::build(loaded, device),
         "gemma" | "gemma2" | "gemma3" => crate::model::gemma::build(loaded, device),

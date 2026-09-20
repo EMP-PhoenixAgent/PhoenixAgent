@@ -84,23 +84,16 @@ fn hydrate_capsule(state: &WebState, capsule_key: &[u8; KEY_LEN]) -> Result<usiz
     }
 }
 
-/// Whether the encrypted DB exists yet (controls setup vs. unlock screen).
-/// A sealed (v2) capsule carries the DB even when staging was wiped at the
-/// last exit — the unlock gate must still show.
+/// Whether the app has been set up (controls setup vs. unlock screen).
+/// A key bundle must exist SOMEWHERE — staging (`keys.phx`) or a sealed v2
+/// capsule in the exe's tail. The DB file alone does NOT count: a wiped v2
+/// exit leaves a locked `memory.db` behind while taking the bundle with it,
+/// and treating that orphan as "initialized" would show the unlock gate with
+/// no bundle to unlock against (a fresh exe over such a staging must be
+/// offered SETUP instead).
 #[tauri::command]
 pub async fn is_initialized(state: State<'_, WebState>) -> Result<bool, String> {
-    if state.paths.db_path.exists() {
-        return Ok(true);
-    }
-    if let Ok(exe) = current_exe() {
-        if matches!(
-            crate::capsule::probe(&exe),
-            Ok(Some(crate::capsule::CapsuleVer::V2))
-        ) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(load_bundle_anywhere(&state)?.is_some())
 }
 
 /// Whether the app was built in debug/dev mode. The frontend uses this to
@@ -150,6 +143,23 @@ pub async fn setup(
         let cfg_clone = cfg.clone();
         drop(cfg);
         save_config(&state.paths, &cfg_clone).map_err(|e| format!("Save config: {e}"))?;
+    }
+
+    // 2b. Sweep orphaned pre-wipe leftovers. A wiped v2 exit can leave a
+    // locked `memory.db` behind (it was open when the wipe ran) while the
+    // bundle is gone — that DB is cryptographically unreachable, and its
+    // presence would break the fresh create below (SQLCipher would open a
+    // foreign DB file). With no bundle anywhere, deleting it is safe.
+    if load_bundle_anywhere(&state)?.is_none() {
+        for orphan in ["memory.db", "memory.db-shm", "memory.db-wal", "2fa_enabled"] {
+            let p = state.paths.data_dir.join(orphan);
+            if p.exists() {
+                match std::fs::remove_file(&p) {
+                    Ok(()) => tracing::info!("setup: swept orphaned {orphan} from a wiped exit"),
+                    Err(e) => tracing::warn!("setup: orphan sweep {orphan}: {e}"),
+                }
+            }
+        }
     }
 
     // 3. Derive the DB key from the fixed default DB password + salt, and create
@@ -4002,7 +4012,10 @@ pub async fn seal_capsule_now(state: &WebState, final_seal: bool) -> Result<Stri
             *state.cmd_tx.lock().await = None;
             let engine = state.provider.embedded().state();
             for tag in engine.tags().await {
-                let _ = engine.remove_model(&tag).await;
+                // UNLOAD only (release the GGUF mmaps) — remove_model would
+                // deregister every model from manifest.json, and the next
+                // launch would stop recognizing the pulled models.
+                let _ = engine.unload_model(&tag).await;
             }
             // Wipe the staging copy — only after a SEALED swap that really
             // landed, never in the portable layout (the exe lives in that
