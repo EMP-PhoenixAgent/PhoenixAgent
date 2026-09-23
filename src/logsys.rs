@@ -421,6 +421,52 @@ pub fn tool_denied(index: usize, name: &str) {
     );
 }
 
+/// Mirror an AmberCore engine event into the session log. These are the
+/// SILENT happenings that never fail a request — above all the OOM CPU
+/// fallback — so nothing else in the app would ever see them. Drained from
+/// the engine's broadcast channel by the task spawned in `web::run`.
+pub fn engine_event(ev: &ambercore::server::EngineEvent) {
+    use ambercore::server::EngineEvent;
+    match ev {
+        EngineEvent::OomFallback { tag } => {
+            // An error that got recovered — logged AS an error (with its
+            // known-bug entry) so the run is preserved by clean-run deletion.
+            let (_, known) = classify_error("cuda_error_out_of_memory");
+            log(
+                By::AmberCore,
+                "OomFallback",
+                Some(tag.clone()),
+                None,
+                false,
+                Some(ErrBlock {
+                    message: "GPU build ran out of VRAM — the model was rebuilt on the CPU \
+                              (slower, the turn kept running)"
+                        .into(),
+                    known_bug: known.map(|(id, _)| id.to_string()),
+                    debug: known.map(|(_, d)| d.to_string()),
+                }),
+            );
+        }
+        EngineEvent::ModelLoaded { tag, device, dur_ms } => {
+            note_model(tag);
+            log(
+                By::AmberCore,
+                "ModelLoad",
+                Some(format!("{tag} · {device}")),
+                Some(Perfs { dur_ms: Some(*dur_ms), ..Default::default() }),
+                true,
+                None,
+            );
+        }
+        EngineEvent::ModelUnloaded { tag } => {
+            log(By::AmberCore, "ModelUnload", Some(tag.clone()), None, true, None);
+        }
+        EngineEvent::VramWarning { message } => {
+            log(By::AmberCore, "VramWarning", Some(head(message, ERROR_HEAD)), None, true, None);
+        }
+    }
+}
+
 // ─────────────────────────── classification ────────────────────────────
 
 /// The nomenclature's "Type" for a tool name (Message/Writing/Reading/
@@ -505,11 +551,17 @@ fn known_bug(msg: &str) -> Option<(&'static str, &'static str)> {
              (delete it in the Models panel first).",
         ));
     }
-    if m.contains("connection refused") || m.contains("dns") || m.contains("timed out") {
+    if m.contains("connection refused")
+        || m.contains("dns")
+        || m.contains("timed out")
+        || m.contains("error sending request")
+        || m.contains("request failed")
+    {
         return Some((
             "NET-CONN-01",
-            "A backend URL was unreachable. If Ollama: start it (`ollama serve`). \
-             If a remote AmberCore: check the machine and port.",
+            "A URL was unreachable (offline, DNS, or the host is down). Check the \
+             network; if Ollama: start it (`ollama serve`). If a remote AmberCore: \
+             check the machine and port.",
         ));
     }
     if m.contains("wrong launch password") || m.contains("unwrap") {
@@ -822,6 +874,12 @@ mod tests {
         assert_eq!(known_bug("candle error: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")").unwrap().0, "OOM-CUDA-01");
         assert_eq!(known_bug("Wrong launch password.").unwrap().0, "UNLOCK-01");
         assert_eq!(known_bug("connection refused (os error 10061)").map(|(id, _)| id), Some("NET-CONN-01"));
+        assert_eq!(
+            known_bug("request failed: error sending request for url (https://huggingface.co/…)")
+                .map(|(id, _)| id),
+            Some("NET-CONN-01"),
+            "the RWKV7 pull failure phrasing maps to the network bug"
+        );
         assert!(known_bug("model produced garbage").is_none());
         let (by, _) = classify_error("candle cuda boom");
         assert_eq!(by, By::AmberCore);
@@ -932,6 +990,18 @@ mod tests {
         note_model("rwkv7-2.9b");
         error_now("ModelLoad", Some("rwkv7".into()), "candle error: CUDA_ERROR_OUT_OF_MEMORY");
 
+        // ── engine events: the SILENT recoveries (OOM CPU fallback & co.) ──
+        engine_event(&ambercore::server::EngineEvent::OomFallback { tag: "rwkv7-2.9b".into() });
+        engine_event(&ambercore::server::EngineEvent::ModelLoaded {
+            tag: "rwkv7-2.9b".into(),
+            device: "cpu".into(),
+            dur_ms: 2100,
+        });
+        engine_event(&ambercore::server::EngineEvent::ModelUnloaded { tag: "qwen3.5".into() });
+        engine_event(&ambercore::server::EngineEvent::VramWarning {
+            message: "Low VRAM headroom (0.3 GB) — WDDM may spill to system RAM".into(),
+        });
+
         // ── crash simulation: a second run starts while the first is open ──
         *RUN.lock().unwrap() = None;
         let second = init(&dir, header(), false, 0);
@@ -964,6 +1034,20 @@ mod tests {
         assert!(crashed_rf.run.models.contains(&"rwkv7-2.9b".to_string()), "header collected the model");
         let oom = crashed_rf.events.iter().find(|e| !e.ok).expect("the OOM event is kept");
         assert_eq!(oom.error.as_ref().unwrap().known_bug.as_deref(), Some("OOM-CUDA-01"));
+
+        // The silent engine recoveries landed with their diagnostics.
+        let fb = crashed_rf.events.iter().find(|e| e.typ == "OomFallback").expect("fallback logged");
+        assert!(!fb.ok, "the fallback is an error-that-recovered");
+        assert_eq!(fb.error.as_ref().unwrap().known_bug.as_deref(), Some("OOM-CUDA-01"));
+        let ml = crashed_rf
+            .events
+            .iter()
+            .find(|e| e.typ == "ModelLoad" && e.using.as_deref().is_some_and(|u| u.ends_with("cpu")))
+            .expect("engine load logged");
+        assert_eq!(ml.using.as_deref(), Some("rwkv7-2.9b · cpu"));
+        assert_eq!(ml.perfs.as_ref().unwrap().dur_ms, Some(2100));
+        assert!(crashed_rf.events.iter().any(|e| e.typ == "ModelUnload"));
+        assert!(crashed_rf.events.iter().any(|e| e.typ == "VramWarning"));
 
         let catalog: serde_json::Value = serde_json::from_str(
             std::fs::read_to_string(dir.join("Logs/data.js"))

@@ -38,6 +38,25 @@ use axum::Router;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::broadcast;
+
+/// Engine-side lifecycle events, fanned out to any subscriber (the embedding
+/// host taps this for its session log; the standalone HTTP server simply has
+/// none). The reason it exists: **silent recoveries** — above all the OOM
+/// CPU fallback — never fail a request, so the host has no other way to learn
+/// they happened.
+#[derive(Debug, Clone)]
+pub enum EngineEvent {
+    /// A model build ran out of VRAM on the GPU and was rebuilt on the CPU.
+    /// The requesting turn still succeeds — slower.
+    OomFallback { tag: String },
+    /// A model replica finished building and entered its pool.
+    ModelLoaded { tag: String, device: String, dur_ms: u64 },
+    /// A model's replicas were unloaded (mmaps released).
+    ModelUnloaded { tag: String },
+    /// A pre-flight VRAM verdict worth surfacing (refusal / spill warning).
+    VramWarning { message: String },
+}
 
 /// End-of-turn token strings per architecture family. Tokens absent from the
 /// loaded tokenizer are skipped, and the GGUF's `<arch>.eos_token_id` is added
@@ -119,6 +138,9 @@ struct Inner {
     /// Positive "contained in VRAM" line from the most recent successful
     /// pre-flight check (chat verdict for the fit case).
     last_vram_info: std::sync::Mutex<Option<String>>,
+    /// Fan-out for [`EngineEvent`]s — the host's window onto silent
+    /// recoveries. No subscribers = sends are free no-ops.
+    events: broadcast::Sender<EngineEvent>,
 }
 
 impl ServerState {
@@ -144,8 +166,21 @@ impl ServerState {
                 hardware,
                 last_vram_warning: std::sync::Mutex::new(None),
                 last_vram_info: std::sync::Mutex::new(None),
+                events: broadcast::channel(128).0,
             }),
         }
+    }
+
+    /// Subscribe to the engine's lifecycle events (see [`EngineEvent`]).
+    /// Receivers that fall behind lose old events (broadcast semantics) —
+    /// fine for logs, never for control flow.
+    pub fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
+        self.inner.events.subscribe()
+    }
+
+    /// Fan one event out to every subscriber (no-op when nobody listens).
+    fn emit(&self, event: EngineEvent) {
+        let _ = self.inner.events.send(event);
     }
 
     /// The low-VRAM refusal/warning from the most recent model build attempt,
@@ -257,9 +292,11 @@ impl ServerState {
             (cat.resolve_path(entry), canonical, entry.arch.clone())
         };
         tracing::info!(tag, "building model replica from {}", gguf_path.display());
+        let build_started = std::time::Instant::now();
         let device = self.inner.backend.device()?;
         let backend_name = self.inner.backend.name().to_string();
-        let tag_owned = canonical_tag;
+        let backend_name_outer = backend_name.clone();
+        let tag_owned = canonical_tag.clone();
         // Pre-flight VRAM check, BEFORE the build takes its share (blocking
         // thread — nvidia-smi subprocess). Hard refusal when the model would
         // spill; see backend::check_vram for the estimate + rationale.
@@ -292,6 +329,7 @@ impl ServerState {
             }
         }
         if check.fits == Some(false) {
+            self.emit(EngineEvent::VramWarning { message: check.message.clone().unwrap_or_default() });
             return Err(Error::Backend(
                 check
                     .message
@@ -299,7 +337,11 @@ impl ServerState {
             ));
         }
         let entry: LoadedEntry =
-        tokio::task::spawn_blocking(move || -> Result<LoadedEntry> {
+        tokio::task::spawn_blocking({
+            // Cloned into the blocking closure so the silent OOM recovery can
+            // report itself (the host's log would otherwise never see it).
+            let events = self.inner.events.clone();
+            move || -> Result<LoadedEntry> {
             let mut loaded = LoadedModel::load(&gguf_path)?;
             let arch = loaded.arch.clone();
             // Surface the trained context length from the GGUF metadata
@@ -356,6 +398,7 @@ impl ServerState {
                             tag = %tag_owned,
                             "GPU build ran out of VRAM — retrying on CPU"
                         );
+                        let _ = events.send(EngineEvent::OomFallback { tag: tag_owned.clone() });
                         device = candle_core::Device::Cpu;
                         build_model(&mut loaded, &device).map_err(|e| {
                             crate::error::Error::Model(
@@ -402,9 +445,20 @@ impl ServerState {
                 device: device.clone(),
                 context_length,
             })
+            }
         })
         .await
         .map_err(|e| Error::Server(format!("load task join: {e}")))??;
+        let device_name = match &entry.device {
+            candle_core::Device::Cpu => "cpu".to_string(),
+            candle_core::Device::Cuda(_) => "cuda".to_string(),
+            _ => backend_name_outer,
+        };
+        self.emit(EngineEvent::ModelLoaded {
+            tag: canonical_tag,
+            device: device_name,
+            dur_ms: build_started.elapsed().as_millis() as u64,
+        });
         Ok(entry)
     }
 
@@ -530,6 +584,8 @@ impl ServerState {
         if stem != canonical && stem != tag {
             pools.remove(&stem);
         }
+        drop(pools);
+        self.emit(EngineEvent::ModelUnloaded { tag: canonical });
         Ok(())
     }
 }
@@ -737,6 +793,39 @@ mod tests {
 
     fn r(n: u32) -> TestReplica {
         Arc::new(n)
+    }
+
+    #[tokio::test]
+    async fn engine_events_reach_subscribers() {
+        // The channel is the host's window onto SILENT recoveries (OOM CPU
+        // fallback above all) — verify the fan-out works with a minimal state.
+        let dir = std::env::temp_dir().join(format!("pa-engine-ev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = ServerState::new(
+            Catalog::load(&dir).expect("catalog on an empty temp dir"),
+            Box::new(crate::backend::CpuBackend::default()),
+            1,
+        );
+        let mut rx = state.subscribe();
+        state.emit(EngineEvent::OomFallback { tag: "rwkv7".into() });
+        state.emit(EngineEvent::ModelLoaded {
+            tag: "rwkv7".into(),
+            device: "cpu".into(),
+            dur_ms: 12,
+        });
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(EngineEvent::OomFallback { ref tag }) if tag == "rwkv7"
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(EngineEvent::ModelLoaded { device: ref d, dur_ms: 12, .. }) if d == "cpu"
+        ));
+        // No subscriber = sends stay free no-ops (this must not panic).
+        let _ = state.subscribe();
+        state.emit(EngineEvent::ModelUnloaded { tag: "rwkv7".into() });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

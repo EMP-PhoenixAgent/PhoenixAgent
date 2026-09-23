@@ -111,6 +111,20 @@ pub fn probe_arch(path: &Path) -> Result<String> {
         .ok_or_else(|| Error::Model("GGUF missing general.architecture".into()))
 }
 
+/// Header-only probe: does this GGUF embed the RWKV **world** tokenizer
+/// (`tokenizer.ggml.model == "rwkv"`)? Such GGUFs are fully self-contained —
+/// a pull must SKIP the tokenizer.json download entirely (most RWKV repos
+/// don't ship one; and the HF tokenizer.json ports segment text differently
+/// anyway — foreign ids in, word-salad out. The embedded vocab is the only
+/// authoritative one).
+pub fn probe_rwkv_world(path: &Path) -> Result<bool> {
+    let mut file = File::open(path)
+        .map_err(|e| Error::Model(format!("open {}: {e}", path.display())))?;
+    let content = Content::read(&mut file)
+        .map_err(|e| Error::Model(format!("gguf read {}: {e}", path.display())))?;
+    Ok(crate::tokenizer::TokenizerWrapper::is_rwkv_world(&content.metadata))
+}
+
 impl LoadedModel {
     /// Open and parse a model file — GGUF, or `.safetensors` with a sibling
     /// `config.json` (native F16/BF16 via the content shim).

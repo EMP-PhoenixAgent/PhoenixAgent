@@ -2061,7 +2061,11 @@ pub async fn pull_ambercore_model(
 
     // The whole flow runs inside one block so every exit path (download
     // failure, unsupported arch, missing tokenizer, register error) can retire
-    // the pull's progress bar with a terminal done/error event.
+    // the pull's progress bar with a terminal done/error event. The session
+    // log sees the download too: a start row now, done/failed at the end —
+    // so a pull that died mid-flight leaves a trace.
+    let pull_started = std::time::Instant::now();
+    crate::logsys::simple(crate::logsys::By::Agent, "Download");
     let outcome: Result<String, String> = async {
         if let Some((base_stem, repo_name, repo_base)) = &shard_info {
             return super::shard_pull::pull_sharded_safetensors(
@@ -2141,6 +2145,11 @@ pub async fn pull_ambercore_model(
         //    generic `tokenizer.json`) next to the GGUF, i.e. inside the model's
         //    own folder. The model-specific name lets multiple quants of the same
         //    model share the folder without collisions.
+        //    EXCEPT RWKV world GGUFs: they embed their vocab
+        //    (`tokenizer.ggml.model == "rwkv"`) and are fully self-contained —
+        //    most RWKV repos don't even ship a tokenizer.json, and the HF port
+        //    segments text differently (foreign ids, word-salad). Probing the
+        //    downloaded header means the pull NEVER requires the download.
         let stem = dest
             .file_stem()
             .and_then(|s| s.to_str())
@@ -2148,7 +2157,14 @@ pub async fn pull_ambercore_model(
             .to_string();
         let tok_dest = model_dir.join(format!("{stem}.tokenizer.json"));
         let have_tokenizer = tok_dest.is_file() || model_dir.join("tokenizer.json").is_file();
-        if !have_tokenizer {
+        let self_tokenized =
+            ambercore::model::gguf::probe_rwkv_world(&dest).unwrap_or(false);
+        if !have_tokenizer && self_tokenized {
+            tracing::info!(
+                "GGUF embeds the RWKV world tokenizer — no tokenizer.json needed"
+            );
+        }
+        if !have_tokenizer && !self_tokenized {
             // Explicit URL first, then whatever the model URL implies.
             let mut candidates: Vec<String> = Vec::new();
             if let Some(explicit) = tokenizer_url
@@ -2215,6 +2231,29 @@ pub async fn pull_ambercore_model(
             Err(e) => serde_json::json!({ "id": pull_id, "phase": "error", "error": e }),
         };
         let _ = app.emit("ambercore-pull-progress", payload);
+        // Session log: the download's terminal row (size + duration on
+        // success; the error — with any known-bug match — on failure).
+        match &outcome {
+            Ok(tag) => {
+                let size = std::fs::metadata(
+                    dir.join(super::model_urls::model_folder_name(&filename)).join(&filename),
+                )
+                .map(|m| format!(" · {}", human_bytes(m.len())))
+                .unwrap_or_default();
+                crate::logsys::log(
+                    crate::logsys::By::Agent,
+                    "Download",
+                    Some(format!("{tag}{size}")),
+                    Some(crate::logsys::Perfs {
+                        dur_ms: Some(pull_started.elapsed().as_millis() as u64),
+                        ..Default::default()
+                    }),
+                    true,
+                    None,
+                );
+            }
+            Err(e) => crate::logsys::error_now("Download", Some(filename.clone()), e),
+        }
     }
     outcome
 }
@@ -2530,6 +2569,10 @@ pub async fn pull_ollama_model(
         });
     }
 
+    // Session log: the download's start + terminal rows (same treatment as
+    // AmberCore pulls — a pull that died mid-flight leaves a trace).
+    let pull_started = std::time::Instant::now();
+    crate::logsys::simple(crate::logsys::By::Agent, "Download");
     let outcome: Result<String, String> = async {
         let status = child
             .wait()
@@ -2548,6 +2591,20 @@ pub async fn pull_ollama_model(
             Err(e) => serde_json::json!({ "id": name, "phase": "error", "error": e }),
         };
         let _ = app.emit("ollama-pull-progress", payload);
+        match &outcome {
+            Ok(model) => crate::logsys::log(
+                crate::logsys::By::Agent,
+                "Download",
+                Some(format!("{model} · ollama")),
+                Some(crate::logsys::Perfs {
+                    dur_ms: Some(pull_started.elapsed().as_millis() as u64),
+                    ..Default::default()
+                }),
+                true,
+                None,
+            ),
+            Err(e) => crate::logsys::error_now("Download", Some(name.clone()), e),
+        }
     }
     outcome
 }
@@ -3226,6 +3283,21 @@ pub async fn console_run(
 
 // ---- Science Workbench: skills (Panel 2) ---------------------------------
 
+/// Session-log row for a sidebar-panel interaction (Skills / Tools / Context
+/// / Memory CRUD + installs): `by=User` (the click came from a panel),
+/// `type` = the panel, `using` = "action · name". The row records the
+/// interaction itself — the audit trail of what was touched and when.
+fn log_panel(kind: &'static str, action: &str, name: &str) {
+    crate::logsys::log(
+        crate::logsys::By::User,
+        kind,
+        Some(format!("{action} · {name}")),
+        None,
+        true,
+        None,
+    );
+}
+
 /// Resolve the active profile id from the store, or None if not unlocked.
 async fn active_profile_id(state: &State<'_, WebState>) -> Result<i64, String> {
     let store = state.store.lock().await;
@@ -3293,6 +3365,7 @@ pub async fn create_skill(
     description: String,
     body: String,
 ) -> Result<i64, String> {
+    log_panel("Skill", "create", &name);
     let id = {
         let store = state.store.lock().await;
         let store = store.as_ref().ok_or("Not unlocked yet")?;
@@ -3313,6 +3386,7 @@ pub async fn update_skill(
     description: String,
     body: String,
 ) -> Result<(), String> {
+    log_panel("Skill", "update", &name);
     {
         let store = state.store.lock().await;
         let store = store.as_ref().ok_or("Not unlocked yet")?;
@@ -3327,6 +3401,7 @@ pub async fn update_skill(
 /// Delete a skill, then reload the prompt.
 #[tauri::command]
 pub async fn delete_skill(state: State<'_, WebState>, id: i64) -> Result<(), String> {
+    log_panel("Skill", "delete", &format!("skill #{id}"));
     {
         let store = state.store.lock().await;
         let store = store.as_ref().ok_or("Not unlocked yet")?;
@@ -3344,6 +3419,11 @@ pub async fn set_skill_enabled(
     skill_id: i64,
     enabled: bool,
 ) -> Result<(), String> {
+    log_panel(
+        "Skill",
+        if enabled { "enable" } else { "disable" },
+        &format!("skill #{skill_id}"),
+    );
     let pid = active_profile_id(&state).await?;
     {
         let store = state.store.lock().await;
@@ -3373,6 +3453,7 @@ pub async fn install_github_skill(
     description: String,
     raw_url: String,
 ) -> Result<i64, String> {
+    log_panel("Skill", "install", &name);
     let body = skill_helpers::fetch_raw(&raw_url)
         .await
         .map_err(|e| e.to_string())?;
@@ -3455,6 +3536,7 @@ pub async fn create_tool(
     params_schema: String,
     tool_kind: String,
 ) -> Result<i64, String> {
+    log_panel("Tool", "create", &name);
     let id = {
         let store = state.store.lock().await;
         let store = store.as_ref().ok_or("Not unlocked yet")?;
@@ -3487,6 +3569,7 @@ pub async fn update_tool(
     params_schema: String,
     tool_kind: String,
 ) -> Result<(), String> {
+    log_panel("Tool", "update", &name);
     {
         let store = state.store.lock().await;
         let store = store.as_ref().ok_or("Not unlocked yet")?;
@@ -3509,6 +3592,7 @@ pub async fn update_tool(
 /// Delete a tool, then reload the registry.
 #[tauri::command]
 pub async fn delete_tool(state: State<'_, WebState>, id: i64) -> Result<(), String> {
+    log_panel("Tool", "delete", &format!("tool #{id}"));
     {
         let store = state.store.lock().await;
         let store = store.as_ref().ok_or("Not unlocked yet")?;
@@ -3526,6 +3610,11 @@ pub async fn set_tool_enabled(
     tool_id: i64,
     enabled: bool,
 ) -> Result<(), String> {
+    log_panel(
+        "Tool",
+        if enabled { "enable" } else { "disable" },
+        &format!("tool #{tool_id}"),
+    );
     let pid = active_profile_id(&state).await?;
     {
         let store = state.store.lock().await;
@@ -3620,6 +3709,7 @@ pub async fn create_context(
     description: String,
     body: String,
 ) -> Result<i64, String> {
+    log_panel("Context", "create", &name);
     let id = {
         let store = state.store.lock().await;
         let store = store.as_ref().ok_or("Not unlocked yet")?;
@@ -3640,6 +3730,7 @@ pub async fn update_context(
     description: String,
     body: String,
 ) -> Result<(), String> {
+    log_panel("Context", "update", &name);
     {
         let store = state.store.lock().await;
         let store = store.as_ref().ok_or("Not unlocked yet")?;
@@ -3654,6 +3745,7 @@ pub async fn update_context(
 /// Delete a context file, then reload the prompt.
 #[tauri::command]
 pub async fn delete_context(state: State<'_, WebState>, id: i64) -> Result<(), String> {
+    log_panel("Context", "delete", &format!("context #{id}"));
     {
         let store = state.store.lock().await;
         let store = store.as_ref().ok_or("Not unlocked yet")?;
@@ -3671,6 +3763,11 @@ pub async fn set_context_enabled(
     context_id: i64,
     enabled: bool,
 ) -> Result<(), String> {
+    log_panel(
+        "Context",
+        if enabled { "enable" } else { "disable" },
+        &format!("context #{context_id}"),
+    );
     let pid = active_profile_id(&state).await?;
     {
         let store = state.store.lock().await;
@@ -3758,6 +3855,7 @@ pub async fn create_memory(
     command: String,
     args_json: String,
 ) -> Result<i64, String> {
+    log_panel("Memory", "create", &name);
     let id = {
         let store = state.store.lock().await;
         let store = store.as_ref().ok_or("Not unlocked yet")?;
@@ -3780,6 +3878,7 @@ pub async fn update_memory(
     command: String,
     args_json: String,
 ) -> Result<(), String> {
+    log_panel("Memory", "update", &name);
     {
         let store = state.store.lock().await;
         let store = store.as_ref().ok_or("Not unlocked yet")?;
@@ -3794,6 +3893,7 @@ pub async fn update_memory(
 /// Delete an MCP connection, then reload the runtime.
 #[tauri::command]
 pub async fn delete_memory(state: State<'_, WebState>, id: i64) -> Result<(), String> {
+    log_panel("Memory", "delete", &format!("connection #{id}"));
     {
         let store = state.store.lock().await;
         let store = store.as_ref().ok_or("Not unlocked yet")?;
@@ -3811,6 +3911,11 @@ pub async fn set_memory_enabled(
     memory_id: i64,
     enabled: bool,
 ) -> Result<(), String> {
+    log_panel(
+        "Memory",
+        if enabled { "enable" } else { "disable" },
+        &format!("connection #{memory_id}"),
+    );
     let pid = active_profile_id(&state).await?;
     {
         let store = state.store.lock().await;
@@ -3832,6 +3937,7 @@ pub async fn test_memory_connection(
     command: String,
     args_json: String,
 ) -> Result<MemoryTestResult, String> {
+    log_panel("Memory", "test", &format!("{transport} · {command}"));
     let spec = McpConnectionSpec {
         id: 0,
         name: "<test>".into(),

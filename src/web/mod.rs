@@ -76,6 +76,27 @@ pub fn run(config: Config, paths: Paths, workdir: std::path::PathBuf) -> Result<
         }))
         .manage(state)
         .setup(|app| {
+            // Tap the AmberCore engine's lifecycle channel into the session
+            // log — the SILENT recoveries (OOM CPU fallback, model loads/
+            // unloads, VRAM verdicts) that never fail a request. The engine
+            // exists from launch, so this drains from the very first event.
+            {
+                let mut rx = {
+                    let ws = app.state::<state::WebState>();
+                    ws.provider.embedded().state().subscribe()
+                };
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(ev) => crate::logsys::engine_event(&ev),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("logsys: engine event channel lagged ({n} missed)");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
             // Spawn the background event/health forwarding tasks. They start
             // dormant (no agent runtime yet) and wake up after `unlock()`
             // stores the channels.
