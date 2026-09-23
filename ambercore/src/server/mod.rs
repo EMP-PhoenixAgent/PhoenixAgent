@@ -261,14 +261,40 @@ impl ServerState {
     /// The canonical catalog spelling of `tag` (see [`Catalog::resolve`]) —
     /// bare-stem and `:latest` spellings of the same model collapse onto one
     /// entry, and one replica pool.
+    ///
+    /// On a miss, the catalog is RESCANNED from the models dir once and the
+    /// lookup retried: the catalog is a launch-time snapshot, so anything
+    /// that landed on disk afterwards — a failed pull's leftover GGUF, a
+    /// manual copy, an external download — is invisible without this. That
+    /// heals "model tag not in catalog" for every model, no restart needed.
     async fn canonical_tag(&self, tag: &str) -> Result<String> {
-        self.inner
-            .catalog
-            .lock()
-            .await
-            .resolve(tag)
+        {
+            let cat = self.inner.catalog.lock().await;
+            if let Some((_, canonical)) = cat.resolve(tag) {
+                return Ok(canonical);
+            }
+        }
+        self.rescan_catalog().await;
+        let cat = self.inner.catalog.lock().await;
+        cat.resolve(tag)
             .map(|(_, canonical)| canonical)
             .ok_or_else(|| Error::NotFound(format!("model tag '{tag}' not in catalog")))
+    }
+
+    /// Rebuild the catalog from the models dir (manifest + directory scan),
+    /// replacing the snapshot. A failed rescan keeps the current catalog.
+    async fn rescan_catalog(&self) {
+        let dir = {
+            let cat = self.inner.catalog.lock().await;
+            cat.models_dir().to_path_buf()
+        };
+        match Catalog::load(&dir) {
+            Ok(fresh) => {
+                *self.inner.catalog.lock().await = fresh;
+                tracing::info!("catalog: rescanned {} after a tag miss", dir.display());
+            }
+            Err(e) => tracing::warn!("catalog: rescan of {} failed: {e}", dir.display()),
+        }
     }
 
     /// Resolve a tag to its GGUF and build a fresh [`LoadedEntry`] (load GGUF,
@@ -825,6 +851,53 @@ mod tests {
         // No subscriber = sends stay free no-ops (this must not panic).
         let _ = state.subscribe();
         state.emit(EngineEvent::ModelUnloaded { tag: "rwkv7".into() });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn tag_miss_triggers_a_rescan_and_heals() {
+        // THE "not in catalog" regression: the catalog is a launch-time
+        // snapshot — a GGUF that lands on disk afterwards (a failed pull's
+        // leftover, a manual copy) must become resolvable WITHOUT a restart.
+        // Real filenames from the field (rwkv7-g1j-7.2b, Sep 2026).
+        let dir = std::env::temp_dir().join(format!("pa-rescan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = ServerState::new(
+            Catalog::load(&dir).expect("catalog on an empty temp dir"),
+            Box::new(crate::backend::CpuBackend::default()),
+            1,
+        );
+        // Nothing there yet → miss.
+        assert!(state.canonical_tag("rwkv7-g1j-7.2b-Q4_K_M").await.is_err());
+
+        // The pull layout lands on disk (failed tokenizer fetch, GGUF kept).
+        let sub = dir.join("rwkv7-g1j-7.2b-Q4_K_M");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("rwkv7-g1j-7.2b-Q4_K_M.gguf"), b"x").unwrap();
+
+        // The bare-stem spelling the UI sends resolves after the rescan —
+        // to the scan-derived canonical tag (size + quant tail).
+        let canonical = state
+            .canonical_tag("rwkv7-g1j-7.2b-Q4_K_M")
+            .await
+            .expect("leftover GGUF resolves after the rescan");
+        assert_eq!(canonical, "rwkv7-g1j:7.2b-q4_k_m");
+
+        // The Q5 sibling lands too — distinct tag, no collision.
+        let q5 = dir.join("rwkv7-g1j-7.2b-Q5_K_M");
+        std::fs::create_dir_all(&q5).unwrap();
+        std::fs::write(q5.join("rwkv7-g1j-7.2b-Q5_K_M.gguf"), b"x").unwrap();
+        assert_eq!(
+            state.canonical_tag("rwkv7-g1j-7.2b-Q5_K_M").await.unwrap(),
+            "rwkv7-g1j:7.2b-q5_k_m"
+        );
+
+        // And the exact scan-derived spelling still works.
+        assert_eq!(
+            state.canonical_tag("rwkv7-g1j:7.2b-q4_k_m").await.unwrap(),
+            "rwkv7-g1j:7.2b-q4_k_m"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

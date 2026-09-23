@@ -118,6 +118,14 @@ impl Catalog {
         self.entries.keys().cloned().collect()
     }
 
+    /// The models dir this catalog was built from (entries' `file` paths
+    /// resolve against it). Lets the server RE-scan it when a tag misses —
+    /// the catalog is a snapshot, files that landed after it was built are
+    /// invisible until a rescan.
+    pub fn models_dir(&self) -> &Path {
+        &self.models_dir
+    }
+
     /// All entries, sorted by tag.
     pub fn entries(&self) -> Vec<&CatalogEntry> {
         self.entries.values().collect()
@@ -278,21 +286,34 @@ fn normalize_stem(name_or_tag: &str) -> String {
 /// Derive an Ollama-style tag from a GGUF filename stem.
 ///
 /// Converts `qwen2.5-coder-7b` → `qwen2.5-coder:7b` by turning the last
-/// `-N<size>`-shaped segment into `:tag`. Falls back to `<stem>:latest` when no
-/// recognizable size suffix is present. This is a heuristic for the directory
-/// scan path only — `manifest.json` entries use the tag verbatim.
+/// `-N<size>`-shaped segment into `:tag`, keeping any tail that FOLLOWS the
+/// size (quant suffixes: `rwkv7-g1j-7.2b-Q4_K_M` → `rwkv7-g1j:7.2b-q4_k_m`)
+/// so sibling quants of one model don't collide onto a single tag. Falls
+/// back to `<stem>:latest` when no recognizable size segment is present.
+/// This is a heuristic for the directory scan path only — `manifest.json`
+/// entries use the tag verbatim.
 fn derive_tag(stem: &str) -> String {
-    // Common size suffixes: 0.5b, 1b, 1.5b, 7b, 8b, 13b, 14b, 32b, 70b, etc.
-    // Also handle quantization tails like "-q4_k_m".
-    let lower = stem.to_lowercase();
-    for sep in lower.rsplit('-') {
-        if sep.ends_with('b') && sep[..sep.len() - 1].parse::<f64>().is_ok() {
-            let idx = lower.len() - sep.len() - 1; // position of the '-'
-            let (head, _) = stem.split_at(idx);
-            return format!("{}:{}", head, sep);
+    // Walk the ORIGINAL stem's segments with byte offsets. (The previous
+    // arithmetic — `lower.len() - sep.len() - 1` against the lowercased
+    // tail — was only right when the size was the FINAL segment; with a
+    // quant tail it produced garbage like `rwkv7-g1j-7.2b-Q:7.2b`.)
+    let mut pos = 0usize;
+    let mut found: Option<usize> = None; // byte index of the '-' before the size segment
+    for seg in stem.split('-') {
+        let seg_start = pos;
+        pos += seg.len() + 1; // +1 for the '-'
+        let lower = seg.to_ascii_lowercase();
+        if seg_start > 0
+            && lower.ends_with('b')
+            && lower[..lower.len() - 1].parse::<f64>().is_ok()
+        {
+            found = Some(seg_start - 1);
         }
     }
-    format!("{}:latest", stem)
+    match found {
+        Some(idx) => format!("{}:{}", &stem[..idx], stem[idx + 1..].to_ascii_lowercase()),
+        None => format!("{}:latest", stem),
+    }
 }
 
 /// Default location of the models directory on this platform:
@@ -311,6 +332,16 @@ mod tests {
         assert_eq!(derive_tag("qwen2.5-coder-7b"), "qwen2.5-coder:7b");
         assert_eq!(derive_tag("llama3-8b"), "llama3:8b");
         assert_eq!(derive_tag("phi-3.5-3.8b"), "phi-3.5:3.8b");
+    }
+
+    #[test]
+    fn derive_tag_keeps_quant_tails_and_offsets() {
+        // Field case (Sep 2026): the size is followed by a quant tail. The old
+        // index arithmetic produced `rwkv7-g1j-7.2b-Q:7.2b` — and Q4/Q5
+        // siblings collided onto one tag.
+        assert_eq!(derive_tag("rwkv7-g1j-7.2b-Q4_K_M"), "rwkv7-g1j:7.2b-q4_k_m");
+        assert_eq!(derive_tag("rwkv7-g1j-7.2b-Q5_K_M"), "rwkv7-g1j:7.2b-q5_k_m");
+        assert_eq!(derive_tag("Qwen3.5-4B-Q4_K_M"), "Qwen3.5:4b-q4_k_m");
     }
 
     #[test]
