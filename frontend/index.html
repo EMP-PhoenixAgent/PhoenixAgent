@@ -699,6 +699,7 @@
             <div class="panel-tabs">
               <button class="tab-btn active" data-config-tab="security">Security</button>
               <button class="tab-btn" data-config-tab="telemetry">Telemetry</button>
+              <button class="tab-btn" data-config-tab="logs">Logs</button>
               <button class="tab-btn" data-config-tab="about">About</button>
             </div>
             <button id="config-close-btn" class="btn-icon" title="Close">✕</button>
@@ -843,6 +844,60 @@
           <!-- Launch the Chronos test protocol -->
           <div class="config-security-card tele-launch-card">
             <button id="chronos-run-btn" class="btn-primary tele-launch-btn">Chronos Tests</button>
+          </div>
+        </div>
+
+        <!-- Tab: Logs (session-log maintenance + LogsExplorer) -->
+        <div id="config-tab-logs" class="panel-body security-tab" hidden>
+          <p class="security-note small">
+            Session logs live in a plain <b>Logs</b> folder next to the app — outside the
+            encrypted capsule, so they survive crashes and stay readable any time via
+            <b>LogsExplorer.html</b>. They contain strict metadata only (timestamps, tools
+            used, timings, error diagnostics) — never your conversations or file contents.
+            Logs can become a data storage problem over time — manage them below.
+          </p>
+
+          <div class="config-security-card">
+            <div class="config-card-title">Maintenance</div>
+            <div class="logs-maint-row">
+              <label class="toggle" title="Delete clean run files at launch">
+                <input type="checkbox" id="logs-auto-clean" />
+                <span class="toggle-slider"></span>
+              </label>
+              <span class="security-note small logs-maint-text">Delete <b>clean sessions</b> automatically at launch — runs that ended normally with zero errors. Error and crashed runs are never touched.</span>
+            </div>
+            <div class="logs-maint-row">
+              <select id="logs-keep-days" title="Retention window">
+                <option value="0">Keep forever</option>
+                <option value="90">Keep 90 days</option>
+                <option value="30">Keep 30 days</option>
+                <option value="7">Keep 7 days</option>
+              </select>
+              <span class="security-note small logs-maint-text">Retention window applied to ended sessions.</span>
+            </div>
+          </div>
+
+          <div class="config-security-card">
+            <div class="config-card-title">Storage</div>
+            <div class="tele-grid">
+              <div class="tele-field"><span class="tele-key">Sessions</span><span class="tele-val" id="logs-sessions">—</span></div>
+              <div class="tele-field"><span class="tele-key">Size</span><span class="tele-val" id="logs-size">—</span></div>
+              <div class="tele-field"><span class="tele-key">Location</span><span class="tele-val" id="logs-dir" style="word-break: break-all; white-space: normal;">—</span></div>
+            </div>
+            <div class="skill-form-actions">
+              <button id="logs-reveal-btn" class="btn-secondary">📁 Reveal folder</button>
+              <button id="logs-explorer-btn" class="btn-primary">Open LogsExplorer</button>
+            </div>
+          </div>
+
+          <div class="config-security-card">
+            <div class="config-card-title">Cleanup</div>
+            <p class="security-note small">Deletion is never silent — every button asks for a second confirming click.</p>
+            <div class="skill-form-actions">
+              <button id="logs-del-clean-btn" class="btn-secondary">Delete clean runs</button>
+              <button id="logs-del-all-btn" class="btn-secondary logs-danger-btn">Delete everything</button>
+            </div>
+            <div id="logs-cleanup-status" class="error-text"></div>
           </div>
         </div>
 

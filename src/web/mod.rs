@@ -6,6 +6,7 @@
 //! `emit()`.
 
 pub mod commands;
+mod logserver;
 mod shard_pull;
 pub mod events;
 pub mod model_urls;
@@ -27,6 +28,42 @@ use crate::error::Result;
 /// `unlock` command.
 pub fn run(config: Config, paths: Paths, workdir: std::path::PathBuf) -> Result<()> {
     let state = state::WebState::new(config, paths, workdir);
+
+    // Session log: one JSON run file beside the exe, written live from launch
+    // (pre-unlock lifecycle events included — Logs/ is outside the capsule).
+    // Retention settings ride config.toml (sealed with the rest).
+    {
+        let hw = state.provider.embedded().state().hardware_status();
+        let gpu = hw
+            .gpu
+            .as_ref()
+            .map(|g| match g.vram_total_mb {
+                Some(mb) => format!("{} · {} GB", g.name, mb / 1024),
+                None => g.name.clone(),
+            })
+            .unwrap_or_else(|| "no GPU".into());
+        let hardware = format!(
+            "{gpu} · {} GB RAM · {}",
+            hw.ram_total_mb.map(|mb| mb / 1024).unwrap_or(0),
+            hw.backend,
+        );
+        let (auto_clean, keep_days, model) = {
+            let c = state.config.blocking_lock();
+            (c.logs_auto_clean, c.logs_keep_days, c.model.clone())
+        };
+        let header = crate::logsys::RunHeader {
+            app: format!("Phoenix Agent {}", env!("CARGO_PKG_VERSION")),
+            profile: "home".into(),
+            workdir: state.workdir.blocking_lock().display().to_string(),
+            hardware,
+            models: vec![model],
+            ..Default::default()
+        };
+        let report = crate::logsys::init(&state.paths.data_dir, header, auto_clean, keep_days);
+        if report.first_creation {
+            tracing::info!("logs: created {} beside the app", report.logs_dir);
+        }
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -160,6 +197,13 @@ pub fn run(config: Config, paths: Paths, workdir: std::path::PathBuf) -> Result<
             commands::confirm_totp,
             commands::disable_totp,
             commands::change_passphrase,
+            // Session logs (Logs/ beside the exe + LogsExplorer)
+            commands::logs_settings_get,
+            commands::logs_settings_set,
+            commands::logs_stats,
+            commands::logs_delete,
+            commands::logs_open_explorer,
+            commands::logs_reveal_folder,
         ])
         // Encapsulated exit path: on Exit, checkpoint the DB, stop the
         // backend processes, and seal the staging dir back INTO the exe
@@ -169,6 +213,10 @@ pub fn run(config: Config, paths: Paths, workdir: std::path::PathBuf) -> Result<
         .map_err(|e| crate::error::PhoenixError::Other(format!("tauri: {e}")))?
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
+                // Finalize the session log BEFORE the seal: stamp `ended` and
+                // rename `…` to the end hour. A crash never reaches here — the
+                // open arrow left in the file name IS the crash marker.
+                crate::logsys::finalize();
                 let state = app.state::<crate::web::state::WebState>();
                 match tauri::async_runtime::block_on(commands::seal_capsule_now(&state, true)) {
                     Ok(note) => tracing::info!("capsule: exit seal — {note}"),

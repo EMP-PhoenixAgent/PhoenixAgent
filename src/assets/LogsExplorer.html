@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Phoenix Agent — Logs Explorer</title>
+<style>
+/* ── the app's dark-glass skin, standalone ─────────────────────────── */
+:root {
+  --bg: #0A0A0F;
+  --glass: rgba(15, 15, 25, 0.72);
+  --border: rgba(255, 255, 255, 0.08);
+  --phoenix: #E85D3C;
+  --phoenix-warm: #FF8C42;
+  --text: #C0C0C0;
+  --muted: #9A9A9A;
+  --dim: #787878;
+  --green: #4EC9B0;
+  --red: #E85D3C;
+  --amber: #D7BA7D;
+  --live: #E8A33D;
+  --r: 14px;
+  --rs: 8px;
+  color-scheme: dark;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  font-family: 'Exo 2', 'Segoe UI', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+}
+code, pre, .mono { font-family: 'Cascadia Code', 'Cascadia Mono', Consolas, monospace; }
+.glass {
+  background: var(--glass);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+}
+.gradient-text {
+  background: linear-gradient(135deg, var(--phoenix), var(--phoenix-warm));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* ── layout: trail (left) + display (right), per the mock-up ───────── */
+#main { flex: 1; display: flex; min-height: 0; }
+
+/* Trail — the vertical session rail */
+#trail {
+  width: 190px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: rgba(15, 15, 25, 0.5);
+}
+#trail-head {
+  padding: 16px 16px 12px;
+  border-bottom: 1px solid var(--border);
+}
+#trail-head .brand { font-size: 14px; font-weight: 700; }
+#trail-head .sub { font-size: 10px; color: var(--dim); margin-top: 3px; letter-spacing: .5px; text-transform: uppercase; }
+#dashes {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+#dashes::-webkit-scrollbar { width: 0; }
+#dashes:hover::-webkit-scrollbar { width: 6px; }
+#dashes::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 3px; }
+.dash {
+  width: 22px;
+  height: 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  opacity: .45;
+  transition: opacity .15s, width .15s, box-shadow .15s;
+}
+.dash:hover { opacity: 1; }
+.dash.sel { opacity: 1; width: 34px; box-shadow: 0 0 10px -1px currentColor; }
+.dash.clean { background: var(--green); color: var(--green); }
+.dash.errs { background: var(--amber); color: var(--amber); }
+.dash.crashed { background: var(--red); color: var(--red); }
+.dash.live { background: var(--live); color: var(--live); animation: pulse 1.8s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+#trail-foot {
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+  font-size: 10.5px;
+  color: var(--dim);
+  line-height: 1.5;
+}
+
+/* Display zone */
+#display { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 18px 20px; gap: 12px; overflow-y: auto; }
+#display::-webkit-scrollbar { width: 8px; }
+#display::-webkit-scrollbar-thumb { background: rgba(255,255,255,.1); border-radius: 4px; }
+
+/* Run header card */
+#run-card { padding: 16px 18px; }
+#run-title { font-size: 16px; font-weight: 700; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pill {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .6px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+}
+.pill.clean { color: var(--green); }
+.pill.errs { color: var(--amber); }
+.pill.crashed { color: var(--red); }
+.pill.live { color: var(--live); }
+#run-meta { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 10px; font-size: 12px; color: var(--muted); }
+#run-meta b { color: var(--text); font-weight: 600; }
+#stats { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+.stat {
+  padding: 7px 14px;
+  background: rgba(0,0,0,.35);
+  border: 1px solid var(--border);
+  border-radius: var(--rs);
+  font-size: 11px;
+  color: var(--dim);
+}
+.stat b { display: block; font-size: 15px; color: var(--text); font-variant-numeric: tabular-nums; }
+#run-actions { margin-left: auto; display: flex; gap: 8px; align-self: flex-start; }
+
+/* Toolbar: filters + search */
+#toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.chip {
+  padding: 5px 13px;
+  font-size: 12px;
+  color: var(--muted);
+  background: rgba(255,255,255,.05);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  user-select: none;
+}
+.chip:hover { color: var(--text); }
+.chip.on { background: rgba(232,93,60,.18); border-color: var(--phoenix); color: var(--text); }
+select {
+  background: rgba(0,0,0,.4);
+  border: 1px solid var(--border);
+  border-radius: var(--rs);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 5px 8px;
+  outline: none;
+  cursor: pointer;
+}
+select option { background: #1a1a25; }
+#search {
+  flex: 1;
+  min-width: 140px;
+  background: rgba(0,0,0,.4);
+  border: 1px solid var(--border);
+  border-radius: var(--rs);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  padding: 6px 10px;
+  outline: none;
+}
+#search:focus { border-color: var(--phoenix); }
+
+/* Events table */
+#events { display: flex; flex-direction: column; gap: 4px; }
+.ev {
+  display: grid;
+  grid-template-columns: 140px 86px 100px 1fr 175px 26px;
+  gap: 10px;
+  align-items: center;
+  padding: 7px 12px;
+  font-size: 12px;
+  background: rgba(255,255,255,.025);
+  border: 1px solid rgba(255,255,255,.05);
+  border-radius: var(--rs);
+}
+.ev.err { border-left: 3px solid var(--red); background: rgba(232,93,60,.06); cursor: pointer; }
+.ev.ok-row { border-left: 3px solid rgba(78,201,176,.35); }
+.ev .ts { color: var(--dim); font-family: 'Cascadia Code', Consolas, monospace; font-size: 11px; }
+.ev .by { font-weight: 600; }
+.by-user { color: #569CD6; } .by-agent { color: #4EC9B0; } .by-model { color: #9CDCFE; } .by-ambercore { color: #E8A33D; }
+.ev .type { color: var(--text); }
+.ev .using { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; }
+.ev .perfs { color: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+.ev .mark { text-align: center; font-weight: 700; }
+.ev .mark.good { color: var(--green); }
+.ev .mark.bad { color: var(--red); }
+.errdetail {
+  grid-column: 1 / -1;
+  margin-top: 7px;
+  padding: 10px 12px;
+  background: rgba(0,0,0,.4);
+  border: 1px solid var(--border);
+  border-radius: var(--rs);
+  font-size: 12px;
+  line-height: 1.6;
+  display: none;
+}
+.ev.open .errdetail { display: block; }
+.errdetail .msg { color: var(--text); font-family: 'Cascadia Code', Consolas, monospace; font-size: 11.5px; word-break: break-all; }
+.bugchip {
+  display: inline-block;
+  margin-right: 8px;
+  padding: 1px 8px;
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--phoenix-warm);
+  border: 1px solid rgba(255,140,66,.4);
+  border-radius: 999px;
+}
+.errdetail .debug { color: var(--muted); margin-top: 6px; }
+#empty { padding: 40px; text-align: center; color: var(--dim); font-size: 13px; }
+
+/* Footer */
+#footer {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 9px 20px;
+  border-top: 1px solid var(--border);
+  background: rgba(15,15,25,.6);
+  font-size: 12px;
+  color: var(--muted);
+}
+#footer .grow { flex: 1; }
+.btn {
+  padding: 6px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: inherit;
+  border-radius: var(--rs);
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,.07);
+  color: var(--text);
+}
+.btn:hover { background: rgba(255,255,255,.13); }
+.btn.primary { background: linear-gradient(135deg, var(--phoenix), var(--phoenix-warm)); border: none; color: #fff; }
+.btn.danger:hover { background: rgba(232,93,60,.2); border-color: var(--phoenix-warm); }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+#readonly-note { font-size: 11px; color: var(--dim); }
+button:focus { outline: none; }
+</style>
+</head>
+<body>
+
+<div id="main">
+  <aside id="trail">
+    <div id="trail-head">
+      <div class="brand gradient-text">🔥 Phoenix Agent</div>
+      <div class="sub">Logs Explorer</div>
+    </div>
+    <div id="dashes"></div>
+    <div id="trail-foot">green = clean run<br/>amber = errors · red = crashed<br/>lit = live session</div>
+  </aside>
+
+  <section id="display">
+    <div id="run-card" class="glass">
+      <div id="run-title"><span id="run-name">No session selected</span></div>
+      <div id="run-meta"></div>
+      <div style="display:flex; align-items:flex-start; gap:10px;">
+        <div id="stats"></div>
+        <div id="run-actions">
+          <button class="btn" id="copy-btn" title="Copy this run as text (metadata only)">⧉ Copy as text</button>
+          <button class="btn danger" id="del-run-btn" title="Delete this run file">🗑 Delete run</button>
+        </div>
+      </div>
+    </div>
+    <div id="toolbar">
+      <span class="chip" data-err>All</span>
+      <span class="chip" data-err="1">Errors</span>
+      <select id="by-sel">
+        <option value="">any by</option>
+        <option value="user">User</option>
+        <option value="agent">Agent</option>
+        <option value="model">Model</option>
+        <option value="ambercore">AmberCore</option>
+      </select>
+      <select id="type-sel"><option value="">any type</option></select>
+      <input id="search" placeholder="Search events…"/>
+    </div>
+    <div id="events"></div>
+    <div id="empty" hidden>No events match the filters.</div>
+  </section>
+</div>
+
+<div id="footer">
+  <span id="footer-stats">—</span>
+  <span class="grow"></span>
+  <span id="readonly-note" hidden>Read-only view — cleanup lives in the app → Main Menu → Settings → Logs</span>
+  <button class="btn" id="refresh-btn">↻ Refresh</button>
+  <button class="btn danger" id="del-clean-btn">Delete clean runs</button>
+  <button class="btn danger" id="del-all-btn">Delete everything</button>
+</div>
+
+<script src="data.js"></script>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const CAT = window.PA_LOGS || { runs: [] };
+const SERVED = !!window.PA_SERVED;
+let selected = null;   // file name of the selected run
+let filter = { errsOnly: false, by: "", type: "", q: "" };
+
+// ── outcome classification ──────────────────────────────────────────
+const LIVE_WINDOW_MS = 120000; // ended=null + mtime fresh → live, else crashed
+function outcome(entry) {
+  const run = entry.run;
+  if (!run) return { cls: "crashed", label: "unreadable" };
+  const ended = !!run.run.ended;
+  const hasErr = (run.events || []).some((e) => !e.ok);
+  if (!ended) {
+    const age = Date.now() / 1000 - (entry.mtime || 0);
+    return age < LIVE_WINDOW_MS
+      ? { cls: "live", label: "live" }
+      : { cls: "crashed", label: "crashed" };
+  }
+  return hasErr ? { cls: "errs", label: "errors" } : { cls: "clean", label: "clean" };
+}
+
+// ── trail ───────────────────────────────────────────────────────────
+function renderTrail() {
+  const dashes = $("dashes");
+  dashes.innerHTML = "";
+  for (const entry of CAT.runs) {
+    const o = outcome(entry);
+    const d = document.createElement("div");
+    d.className = "dash " + o.cls + (entry.file === selected ? " sel" : "");
+    const evCount = entry.run ? (entry.run.events || []).length : 0;
+    const errCount = entry.run ? (entry.run.events || []).filter((e) => !e.ok).length : 0;
+    d.title =
+      entry.file + "\n" +
+      (entry.run ? entry.run.run.started : "?") + " → " + (entry.run ? (entry.run.run.ended || "…") : "?") +
+      "\n" + evCount + " events · " + errCount + " errors · " + o.label;
+    d.addEventListener("click", () => select(entry.file));
+    dashes.appendChild(d);
+  }
+}
+
+// ── display zone ────────────────────────────────────────────────────
+function select(file) {
+  selected = file;
+  renderTrail();
+  renderRun();
+}
+function fmtBytes(n) {
+  if (n > 1048576) return (n / 1048576).toFixed(1) + " MB";
+  if (n > 1024) return (n / 1024).toFixed(0) + " KB";
+  return n + " B";
+}
+function entry() { return CAT.runs.find((r) => r.file === selected) || null; }
+
+function renderRun() {
+  const e = entry();
+  const title = $("run-name"), meta = $("run-meta"), stats = $("stats");
+  const events = $("events"), empty = $("empty");
+  events.innerHTML = ""; meta.innerHTML = ""; stats.innerHTML = "";
+  $("del-run-btn").disabled = !SERVED || !e;
+  $("copy-btn").disabled = !e;
+  if (!e) { title.textContent = "No session selected"; empty.hidden = false; return; }
+
+  const o = outcome(e);
+  title.innerHTML = "";
+  title.append(e.file.replace(/\.json$/, ""));
+  const pill = document.createElement("span");
+  pill.className = "pill " + o.cls;
+  pill.textContent = o.label;
+  title.appendChild(pill);
+
+  const r = e.run.run;
+  const chip = (label, value) => {
+    if (!value) return;
+    const s = document.createElement("span");
+    s.innerHTML = label + ": <b></b>";
+    s.querySelector("b").textContent = value;
+    meta.appendChild(s);
+  };
+  chip("app", r.app); chip("profile", r.profile); chip("workdir", r.workdir);
+  chip("hardware", r.hardware); chip("models", (r.models || []).join(", "));
+  chip("started", r.started); chip("ended", r.ended || "— (open)");
+
+  const evs = e.run.events || [];
+  const tools = evs.filter((x) => x.using).length;
+  const errs = evs.filter((x) => !x.ok).length;
+  const tps = evs.map((x) => x.perfs && x.perfs.tps).filter(Boolean);
+  const avgTps = tps.length ? (tps.reduce((a, b) => a + b, 0) / tps.length).toFixed(1) : "—";
+  const stat = (v, l) => {
+    const d = document.createElement("div");
+    d.className = "stat";
+    const b = document.createElement("b"); b.textContent = v;
+    d.appendChild(b); d.append(l);
+    stats.appendChild(d);
+  };
+  stat(evs.length, "events"); stat(tools, "tool calls"); stat(errs, "errors"); stat(avgTps, "avg T/s");
+
+  // type filter options from this run
+  const typeSel = $("type-sel");
+  const cur = typeSel.value;
+  typeSel.innerHTML = '<option value="">any type</option>';
+  [...new Set(evs.map((x) => x.typ))].sort().forEach((t) => {
+    const op = document.createElement("option");
+    op.value = t; op.textContent = t;
+    typeSel.appendChild(op);
+  });
+  typeSel.value = cur;
+
+  renderEvents(evs);
+}
+
+function perfsText(p) {
+  if (!p) return "";
+  const parts = [];
+  if (p.tps != null) parts.push(p.tps.toFixed(1) + " T/s");
+  if (p.ttft_ms != null) parts.push("TTFT " + Math.round(p.ttft_ms) + "ms");
+  if (p.tbt_ms != null) parts.push("TBT " + Math.round(p.tbt_ms) + "ms");
+  if (p.dur_ms != null) parts.push(p.dur_ms + "ms");
+  return parts.join(" · ");
+}
+
+function renderEvents(evs) {
+  const box = $("events"), empty = $("empty");
+  box.innerHTML = "";
+  const q = filter.q.toLowerCase();
+  const shown = evs.filter((e) =>
+    (!filter.errsOnly || !e.ok) &&
+    (!filter.by || e.by === filter.by) &&
+    (!filter.type || e.typ === filter.type) &&
+    (!q || (e.typ + " " + (e.using || "") + " " + (e.error ? e.error.message : "")).toLowerCase().includes(q))
+  );
+  empty.hidden = shown.length > 0;
+  for (const e of shown) {
+    const row = document.createElement("div");
+    row.className = "ev " + (e.ok ? "ok-row" : "err");
+    const esc = (s) => { const d = document.createElement("i"); d.textContent = s ?? ""; return d.innerHTML; };
+    let detail = "";
+    if (e.error) {
+      detail = '<div class="errdetail">' +
+        (e.error.known_bug ? '<span class="bugchip">' + esc(e.error.known_bug) + "</span>" : "") +
+        '<span class="label" style="color:var(--dim)">known bug</span>' +
+        '<div class="msg">' + esc(e.error.message) + "</div>" +
+        (e.error.debug ? '<div class="debug"><b style="color:var(--text)">Debug:</b> ' + esc(e.error.debug) + "</div>" : "") +
+        "</div>";
+    }
+    row.innerHTML =
+      '<span class="ts">' + esc(e.ts) + "</span>" +
+      '<span class="by by-' + esc(e.by) + '">' + esc(e.by) + "</span>" +
+      '<span class="type">' + esc(e.typ) + "</span>" +
+      '<span class="using" title="' + esc(e.using || "") + '">' + esc(e.using || "") + "</span>" +
+      '<span class="perfs">' + esc(perfsText(e.perfs)) + "</span>" +
+      '<span class="mark ' + (e.ok ? "good" : "bad") + '">' + (e.ok ? "✓" : "✗") + "</span>" +
+      detail;
+    if (e.error) row.addEventListener("click", () => row.classList.toggle("open"));
+    box.appendChild(row);
+  }
+}
+
+// ── toolbar wiring ──────────────────────────────────────────────────
+document.querySelectorAll(".chip").forEach((c) =>
+  c.addEventListener("click", () => {
+    document.querySelectorAll(".chip").forEach((x) => x.classList.remove("on"));
+    c.classList.add("on");
+    filter.errsOnly = c.dataset.err === "1";
+    const e = entry(); if (e) renderEvents(e.run.events || []);
+  })
+);
+document.querySelector(".chip").classList.add("on");
+$("by-sel").addEventListener("change", () => {
+  filter.by = $("by-sel").value;
+  const e = entry(); if (e) renderEvents(e.run.events || []);
+});
+$("type-sel").addEventListener("change", () => {
+  filter.type = $("type-sel").value;
+  const e = entry(); if (e) renderEvents(e.run.events || []);
+});
+$("search").addEventListener("input", () => {
+  filter.q = $("search").value;
+  const e = entry(); if (e) renderEvents(e.run.events || []);
+});
+
+// ── copy as text ────────────────────────────────────────────────────
+$("copy-btn").addEventListener("click", () => {
+  const e = entry(); if (!e) return;
+  const r = e.run.run;
+  const lines = [
+    "Phoenix Agent session log — " + e.file,
+    "app: " + r.app + " · profile: " + r.profile + " · workdir: " + r.workdir,
+    "hardware: " + r.hardware + " · models: " + (r.models || []).join(", "),
+    "started: " + r.started + " · ended: " + (r.ended || "— (open/crashed)"),
+    "",
+  ];
+  for (const ev of e.run.events || []) {
+    let line = [ev.ts, ev.by, ev.typ, ev.using || "", perfsText(ev.perfs), ev.ok ? "OK" : "ERROR"].join(" | ");
+    if (ev.error) {
+      line += "\n    error: " + ev.error.message;
+      if (ev.error.known_bug) line += "\n    known bug: " + ev.error.known_bug;
+      if (ev.error.debug) line += "\n    debug: " + ev.error.debug;
+    }
+    lines.push(line);
+  }
+  const text = lines.join("\n");
+  const done = () => { const b = $("copy-btn"); b.textContent = "✓ Copied"; setTimeout(() => (b.textContent = "⧉ Copy as text"), 1600); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+  } else fallbackCopy(text, done);
+});
+function fallbackCopy(text, done) {
+  const ta = document.createElement("textarea");
+  ta.value = text; document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); done(); } catch {}
+  ta.remove();
+}
+
+// ── cleanup (served mode only) ──────────────────────────────────────
+function apiDelete(body, btn) {
+  if (!SERVED) return;
+  const label = btn.textContent;
+  btn.textContent = "Really? Click again";
+  btn.disabled = false;
+  const reset = () => (btn.textContent = label);
+  const handler = () => {
+    btn.removeEventListener("click", handler);
+    fetch("/delete", { method: "POST", body: JSON.stringify(body) })
+      .then((r) => r.json())
+      .then((resp) => { if (resp.ok) location.reload(); else { reset(); alert(resp.error || "delete failed"); } })
+      .catch(() => reset());
+  };
+  btn.addEventListener("click", handler);
+  setTimeout(() => { btn.textContent = label; btn.removeEventListener("click", handler); }, 3500);
+}
+$("del-clean-btn").addEventListener("click", function () { apiDelete({ scope: "clean" }, this); });
+$("del-all-btn").addEventListener("click", function () { apiDelete({ scope: "all" }, this); });
+$("del-run-btn").addEventListener("click", function () {
+  if (!SERVED || !selected) return;
+  apiDelete({ files: [selected] }, this);
+});
+if (!SERVED) {
+  $("del-clean-btn").disabled = true;
+  $("del-all-btn").disabled = true;
+  $("readonly-note").hidden = false;
+}
+$("refresh-btn").addEventListener("click", () => location.reload());
+
+// ── footer ──────────────────────────────────────────────────────────
+(function footer() {
+  const approxBytes = JSON.stringify(CAT).length;
+  $("footer-stats").textContent =
+    CAT.runs.length + " session" + (CAT.runs.length === 1 ? "" : "s") +
+    " · ≈" + fmtBytes(approxBytes) +
+    (CAT.sessions_dir ? " · " + CAT.sessions_dir : "");
+})();
+
+// ── boot ────────────────────────────────────────────────────────────
+renderTrail();
+if (CAT.runs.length) select(CAT.runs[0].file);
+</script>
+</body>
+</html>

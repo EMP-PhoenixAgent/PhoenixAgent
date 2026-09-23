@@ -11,5 +11,6 @@ pub mod db;
 pub mod error;
 pub mod health;
 pub mod logging;
+pub mod logsys;
 pub mod model;
 pub mod web;

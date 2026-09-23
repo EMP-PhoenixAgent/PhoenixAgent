@@ -277,6 +277,7 @@ async function doSetup() {
     await loadTodo();
 
     addSystemMessage(`Welcome! Encrypted memory created. Working in: ${result.project_path}`);
+    logsNotices();
     messageInput.focus();
   } catch (e) {
     setupError.textContent = String(e);
@@ -313,6 +314,7 @@ async function doUnlock() {
 
     // Add welcome message.
     addSystemMessage(`Ready. Working in: ${result.project_path}`);
+    logsNotices();
     refreshSessionRail();
 
     messageInput.focus();
@@ -3671,7 +3673,7 @@ async function openConfigModal() {
   configModal.hidden = false;
 }
 
-/** Switch between Security / Telemetry / About tabs. */
+/** Switch between Security / Telemetry / Logs / About tabs. */
 function switchConfigTab(tab) {
   for (const btn of configModal.querySelectorAll(".tab-btn")) {
     if (btn.disabled) continue;
@@ -3679,9 +3681,103 @@ function switchConfigTab(tab) {
   }
   $("config-tab-security").hidden = tab !== "security";
   $("config-tab-telemetry").hidden = tab !== "telemetry";
+  $("config-tab-logs").hidden = tab !== "logs";
   $("config-tab-about").hidden = tab !== "about";
   if (tab === "telemetry") refreshTelemetryTab();
+  if (tab === "logs") refreshLogsTab();
 }
+
+// ----- Main menu: Logs tab (session-log maintenance) -----------------------
+
+/** Load retention settings + folder stats into the Logs tab. */
+async function refreshLogsTab() {
+  try {
+    const s = await invoke("logs_stats");
+    $("logs-sessions").textContent = s.sessions;
+    $("logs-size").textContent = s.size_text;
+    $("logs-dir").textContent = s.logs_dir;
+    $("logs-dir").title = s.logs_dir;
+  } catch { /* keep placeholders */ }
+  try {
+    const cfg = await invoke("logs_settings_get");
+    $("logs-auto-clean").checked = !!cfg.auto_clean;
+    $("logs-keep-days").value = String(cfg.keep_days || 0);
+  } catch { /* defaults */ }
+}
+
+/** Persist the maintenance toggles (config.toml — sealed with the capsule). */
+async function saveLogsSettings() {
+  try {
+    await invoke("logs_settings_set", {
+      autoClean: $("logs-auto-clean").checked,
+      keepDays: Number($("logs-keep-days").value) || 0,
+    });
+    addSystemMessage("Logs: maintenance settings saved.");
+  } catch (e) { addSystemMessage(`Error: ${e}`); }
+}
+
+/** Two-click confirmation for destructive buttons (the webview has no native
+ *  confirm): first click arms the button for 3.5 s, second click fires. */
+function armConfirm(btn, action) {
+  if (btn.dataset.armed === "1") {
+    btn.dataset.armed = "";
+    btn.textContent = btn.dataset.label;
+    action();
+    return;
+  }
+  btn.dataset.label = btn.textContent;
+  btn.dataset.armed = "1";
+  btn.textContent = "Really? Click again";
+  setTimeout(() => {
+    if (btn.dataset.armed === "1") {
+      btn.dataset.armed = "";
+      btn.textContent = btn.dataset.label;
+    }
+  }, 3500);
+}
+
+/** Delete run files per scope, then refresh the readout. */
+async function logsDelete(scope) {
+  try {
+    const removed = await invoke("logs_delete", { scope, files: null });
+    $("logs-cleanup-status").textContent = "";
+    addSystemMessage(`Logs: removed ${removed} session file${removed === 1 ? "" : "s"}.`);
+    refreshLogsTab();
+  } catch (e) {
+    $("logs-cleanup-status").textContent = String(e);
+  }
+}
+
+/** One-shot notices from the session-log system (first creation + size nudge). */
+async function logsNotices() {
+  try {
+    const s = await invoke("logs_stats");
+    if (s.first_creation) {
+      addSystemMessage(
+        `Logs: session logs now live in ${s.logs_dir} — open LogsExplorer.html any time ` +
+        "(strict metadata only, never your conversations)."
+      );
+    }
+    if (s.nudge && !sessionStorage.getItem("pa-logs-nudge")) {
+      sessionStorage.setItem("pa-logs-nudge", "1");
+      addSystemMessage("Logs: the folder passed 100 MB — clean it from Main Menu → Logs.");
+    }
+  } catch { /* pre-init — ignore */ }
+}
+
+function wireLogsTab() {
+  $("logs-auto-clean")?.addEventListener("change", saveLogsSettings);
+  $("logs-keep-days")?.addEventListener("change", saveLogsSettings);
+  $("logs-reveal-btn")?.addEventListener("click", () => {
+    invoke("logs_reveal_folder").catch((e) => addSystemMessage(`Error: ${e}`));
+  });
+  $("logs-explorer-btn")?.addEventListener("click", () => {
+    invoke("logs_open_explorer").catch((e) => addSystemMessage(`Error: ${e}`));
+  });
+  $("logs-del-clean-btn")?.addEventListener("click", function () { armConfirm(this, () => logsDelete("clean")); });
+  $("logs-del-all-btn")?.addEventListener("click", function () { armConfirm(this, () => logsDelete("all")); });
+}
+wireLogsTab();
 
 /**
  * Populate the Telemetry tab's environment baseline from the launch hardware

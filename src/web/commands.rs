@@ -128,6 +128,22 @@ pub async fn setup(
     confirm_launch_password: String,
     model: Option<String>,
 ) -> Result<UnlockResult, String> {
+    crate::logsys::simple(crate::logsys::By::Agent, "Setup");
+    setup_inner(app, state, launch_password, confirm_launch_password, model)
+        .await
+        .map_err(|e| {
+            crate::logsys::error_now("Setup", None, &e);
+            e
+        })
+}
+
+async fn setup_inner(
+    app: AppHandle,
+    state: State<'_, WebState>,
+    launch_password: String,
+    confirm_launch_password: String,
+    model: Option<String>,
+) -> Result<UnlockResult, String> {
     // 1. Validate the launch password.
     if launch_password.len() < 8 {
         return Err("Launch password must be at least 8 characters.".into());
@@ -199,6 +215,20 @@ pub async fn setup(
 /// this turn re-encrypts the whole tail.
 #[tauri::command]
 pub async fn unlock(
+    app: AppHandle,
+    state: State<'_, WebState>,
+    launch_password: String,
+) -> Result<UnlockResult, String> {
+    crate::logsys::simple(crate::logsys::By::User, "Unlock");
+    unlock_inner(app, state, launch_password)
+        .await
+        .map_err(|e| {
+            crate::logsys::error_now("Unlock", None, &e);
+            e
+        })
+}
+
+async fn unlock_inner(
     app: AppHandle,
     state: State<'_, WebState>,
     launch_password: String,
@@ -633,6 +663,8 @@ fn parse_approval_policy(s: &str) -> ApprovalPolicy {
 /// Send a user message to the agent.
 #[tauri::command]
 pub async fn send_message(state: State<'_, WebState>, text: String) -> Result<(), String> {
+    // Session log: metadata only — the message text never leaves the capsule.
+    crate::logsys::simple(crate::logsys::By::User, "Message");
     let tx = state.cmd_tx.lock().await;
     match tx.as_ref() {
         Some(sender) => sender
@@ -715,6 +747,7 @@ pub async fn context_resume(state: State<'_, WebState>) -> Result<(), String> {
 /// running. Uses Phoenix's native context-file memory (no external MCP).
 #[tauri::command]
 pub async fn learn(state: State<'_, WebState>) -> Result<String, String> {
+    crate::logsys::simple(crate::logsys::By::Agent, "Learn");
     // Fixed name so the memory file is found and updated in place every run.
     const MEMORY_NAME: &str = "Project Memory";
     const MEMORY_DESC: &str = "Auto-maintained by /learn — the agent's project memory: \
@@ -854,6 +887,7 @@ pub async fn learn(state: State<'_, WebState>) -> Result<String, String> {
 /// keeps the session running.
 #[tauri::command]
 pub async fn compact_context(state: State<'_, WebState>) -> Result<String, String> {
+    crate::logsys::simple(crate::logsys::By::Agent, "Compact");
     let model = state.config.lock().await.model.clone();
     let session_id = {
         let store = state.store.lock().await;
@@ -1128,6 +1162,7 @@ pub async fn deny(state: State<'_, WebState>, index: usize) -> Result<(), String
 /// Start a fresh session.
 #[tauri::command]
 pub async fn new_session(state: State<'_, WebState>) -> Result<(), String> {
+    crate::logsys::simple(crate::logsys::By::Agent, "NewSession");
     let tx = state.cmd_tx.lock().await;
     match tx.as_ref() {
         Some(sender) => sender
@@ -2821,6 +2856,103 @@ pub async fn get_runtime_metrics(
     Ok(state.provider.merged_stats().await)
 }
 
+// ---- Session logs (Logs/ beside the exe) ------------------------------
+
+/// Retention settings for the Settings → Logs tab.
+#[derive(Debug, Clone, Serialize)]
+pub struct LogsSettings {
+    pub auto_clean: bool,
+    pub keep_days: u32,
+}
+
+#[tauri::command]
+pub async fn logs_settings_get(state: State<'_, WebState>) -> Result<LogsSettings, String> {
+    let c = state.config.lock().await;
+    Ok(LogsSettings { auto_clean: c.logs_auto_clean, keep_days: c.logs_keep_days })
+}
+
+#[tauri::command]
+pub async fn logs_settings_set(
+    state: State<'_, WebState>,
+    auto_clean: bool,
+    keep_days: u32,
+) -> Result<(), String> {
+    let mut c = state.config.lock().await;
+    c.logs_auto_clean = auto_clean;
+    c.logs_keep_days = keep_days;
+    let clone = c.clone();
+    drop(c);
+    save_config(&state.paths, &clone).map_err(|e| e.to_string())
+}
+
+/// Folder stats for the Settings tab + the first-creation notice + the
+/// >100 MB nudge flag.
+#[derive(Debug, Clone, Serialize)]
+pub struct LogsStats {
+    pub sessions: usize,
+    pub size_bytes: u64,
+    pub size_text: String,
+    pub logs_dir: String,
+    pub first_creation: bool,
+    pub nudge: bool,
+}
+
+#[tauri::command]
+pub async fn logs_stats(state: State<'_, WebState>) -> Result<LogsStats, String> {
+    let dir = crate::logsys::encaps_logs_dir(&state.paths.data_dir);
+    let s = crate::logsys::stats(&dir);
+    let first = crate::logsys::report().map(|r| r.first_creation).unwrap_or(false);
+    Ok(LogsStats {
+        sessions: s.sessions,
+        size_bytes: s.size_bytes,
+        size_text: human_bytes(s.size_bytes),
+        logs_dir: s.logs_dir,
+        first_creation: first,
+        nudge: s.size_bytes > crate::logsys::NUDGE_BYTES,
+    })
+}
+
+/// Delete run files — `scope` = "clean" | "all", or a `files` list. Error and
+/// crashed runs survive "clean"; "all" is explicit user intent.
+#[tauri::command]
+pub async fn logs_delete(
+    state: State<'_, WebState>,
+    scope: String,
+    files: Option<Vec<String>>,
+) -> Result<usize, String> {
+    let dir = crate::logsys::encaps_logs_dir(&state.paths.data_dir);
+    let scope = match (scope.as_str(), files) {
+        ("clean", _) => crate::logsys::DeleteScope::Clean,
+        ("all", _) => crate::logsys::DeleteScope::All,
+        (_, Some(files)) => crate::logsys::DeleteScope::Files(files),
+        _ => return Err("unknown delete scope".into()),
+    };
+    Ok(crate::logsys::delete(&dir, scope))
+}
+
+/// Serve LogsExplorer locally (full cleanup powers) and open it in the
+/// default browser. Returns the URL.
+#[tauri::command]
+pub async fn logs_open_explorer(state: State<'_, WebState>) -> Result<String, String> {
+    let dir = crate::logsys::encaps_logs_dir(&state.paths.data_dir);
+    super::logserver::start(&dir).map_err(|e| e.to_string())
+}
+
+/// Open the Logs folder in the file explorer.
+#[tauri::command]
+pub async fn logs_reveal_folder(state: State<'_, WebState>) -> Result<(), String> {
+    let dir = crate::logsys::encaps_logs_dir(&state.paths.data_dir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 // ---- Science Workbench: models, profiles, workdir ---------------------
 
 /// Switch the active model live. Persists the choice to `config.toml` so it
@@ -2846,6 +2978,21 @@ async fn apply_model(app: &AppHandle, state: &WebState, model: String) -> Result
         let cfg_clone = cfg.clone();
         drop(cfg);
         save_config(&state.paths, &cfg_clone).map_err(|e| format!("Save config: {e}"))?;
+    }
+
+    // 1b. Session log: the run header collects every model used, and the event
+    // stream records the switch (model + backend).
+    {
+        let backend = state.config.lock().await.active_backend.clone();
+        crate::logsys::note_model(&model);
+        crate::logsys::log(
+            crate::logsys::By::Agent,
+            "ModelLoad",
+            Some(format!("{model} · {backend}")),
+            None,
+            true,
+            None,
+        );
     }
 
     // 2. Update the health monitor's view of the active model.
@@ -2917,6 +3064,7 @@ pub async fn switch_profile(
         s.set_active_profile_id(id).map_err(|e| e.to_string())?;
         p
     };
+    crate::logsys::set_profile(&profile.name);
 
     // Push the profile's behavior to the runtime.
     let tx = state.cmd_tx.lock().await;
@@ -3947,6 +4095,11 @@ static SEAL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// closes the DB, and — after a SEALED swap — wipes the staging copy (the
 /// exe carries everything; the temp folder keeps only the webview cache).
 pub async fn seal_capsule_now(state: &WebState, final_seal: bool) -> Result<String, String> {
+    // Session log (auto-saves during the run; the exit-path call lands after
+    // logsys::finalize and is a no-op — the run is already sealed shut).
+    if !final_seal {
+        crate::logsys::simple(crate::logsys::By::Agent, "Seal");
+    }
     if SEAL_IN_FLIGHT.swap(true, Ordering::SeqCst) {
         return Ok("seal already in flight".into());
     }

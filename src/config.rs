@@ -94,6 +94,17 @@ pub struct Config {
     /// Number of past messages (per session) to load into context on resume.
     #[serde(default = "default_context_window")]
     pub context_window: u32,
+
+    /// Session-log maintenance: when true, run files that ended cleanly and
+    /// contain zero error events are deleted at the next launch. Error runs
+    /// and crashed runs are never touched. Default off — nothing is ever
+    /// deleted silently.
+    #[serde(default)]
+    pub logs_auto_clean: bool,
+
+    /// Session-log retention in days; `0` keeps files forever.
+    #[serde(default)]
+    pub logs_keep_days: u32,
 }
 
 impl Config {
@@ -167,6 +178,8 @@ impl Default for Config {
             approval_policy: ApprovalPolicy::default(),
             max_iterations: default_max_iterations(),
             context_window: default_context_window(),
+            logs_auto_clean: false,
+            logs_keep_days: 0,
         }
     }
 }
@@ -402,9 +415,9 @@ pub fn encaps_models_dir(data_dir: &Path) -> PathBuf {
 }
 
 /// Ensure `dir` exists and is writable (probe write). Used by
-/// [`encaps_models_dir`] — a models dir the app cannot write to would make
-/// every pull fail, so we check once and fall back instead.
-fn dir_writable(dir: &Path) -> bool {
+/// [`encaps_models_dir`] and [`crate::logsys::encaps_logs_dir`] — a folder the
+/// app cannot write to must fall back, not fail every write later.
+pub(crate) fn dir_writable(dir: &Path) -> bool {
     if std::fs::create_dir_all(dir).is_err() {
         return false;
     }

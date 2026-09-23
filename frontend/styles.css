@@ -2253,6 +2253,24 @@ select option {
   flex-shrink: 0;
 }
 
+/* Maintenance rows on the Settings → Logs tab: control on the left, its
+   explanation riding beside it. */
+.logs-maint-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 10px 0;
+}
+.logs-maint-row .toggle { flex-shrink: 0; }
+.logs-maint-row select { flex-shrink: 0; min-width: 150px; }
+.logs-maint-text { margin: 0; flex: 1; }
+/* The "Delete everything" button reads as danger even at rest. */
+.btn-secondary.logs-danger-btn {
+  border-color: var(--health-red);
+  color: var(--health-red);
+}
+.btn-secondary.logs-danger-btn:hover { background: rgba(232, 93, 60, 0.18); }
+
 /* Toggle switch */
 .toggle {
   position: relative;
